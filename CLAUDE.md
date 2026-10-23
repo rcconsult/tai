@@ -21,6 +21,25 @@ tai is built from pieces of two sibling checkouts, taken as needed:
 When you bring code over from either project, record where it came from: the repo, the path, and the commit **subject** as well as the sha. ppxai rebases its long-lived branches, so its shas don't stay valid.
 - **ppxai runtime data:** `~/.ppxai/` holds sessions, logs, runs, checkpoints and similar data, shared with the other ppxai clients.
 
+## Coding Discipline
+
+These rules come from `../ppxai/CLAUDE.md` and the owner's global `~/.claude/CLAUDE.md`. The global rules on model tiering for subagents and on `rtk` still apply here.
+
+- **Verify, don't assume.** Before you call an anomaly "pre-existing", "unrelated" or "expected", run the check that proves it: `git stash` and rerun, `git blame`, parse just the section you edited, or run `<binary> --version` after a build. If you can't verify, say so: "I'm assuming X because Y, but haven't confirmed." The same standard of evidence applies both to "this is broken" and to "no, it's fine".
+- **Make sure an empty result really ran.** A check that never ran prints the same nothing as a check that found nothing. Don't add `2>/dev/null` to a verification command. Print the exit status when "found nothing" is the finding. `grep` exits 1 for no match and 2 for an error.
+- **Don't expand scope.** Do what was asked. If you spot something else worth doing, mention it and wait for a yes.
+- **Read the source, not summaries.** Commit subjects, ADR titles and subagent reports point you somewhere. They don't prove anything. Open the files that matter, especially when a change in ppxai might affect tai.
+- **No release actions without explicit permission each time.** That covers tagging, creating releases, force-pushing, rewriting pushed history and merging to the default branch.
+- **Python code taken from ppxai keeps ppxai's rules:**
+  - Python 3.10+ with type hints, dataclasses, `async` for I/O, and pytest.
+  - No function-level internal imports and no `if TYPE_CHECKING:`. Break import cycles with a `Protocol` in a leaf module instead (see ppxai's `docs/patterns/protocol-dependency-inversion.md`).
+- **Write down hazards in the repo.** When you find a hazard that's true on any machine, can be confirmed with grep, and changes what someone does, propose recording it in the repo, for example under `docs/lessons/`. Don't commit it without asking. Per-host AI memory doesn't sync between machines.
+
+## Commit Guidelines
+
+- Don't add Claude credits, `Co-Authored-By` lines, `Claude-Session:` lines or "Generated with Claude Code" lines to commits or PRs. This is ppxai's rule, applied here too.
+- Never commit secrets, hostnames, usernames, file paths containing usernames or environment-specific details. In docs and PRs, use placeholders such as `/path/to/project`.
+
 ## Repo Conventions
 
 - `.local/` is gitignored scratch space for local-only files.
