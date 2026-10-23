@@ -6,7 +6,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **tai** is a terminal app that runs the **ppxai engine harness** behind a UI built on **libghostty** (Ghostty's embeddable terminal library).
 
-**Status:** the project is just starting. The repo has no source code, build system or tests yet. Once the stack and toolchain are chosen, add the build, lint and test commands here, including how to run a single test. Don't guess them.
+**Status:** the stack is chosen, but the repo has no source code, build system or tests yet. Once the Rust project is scaffolded, add the build, lint and test commands here, including how to run a single test. Don't guess them.
+
+## Stack
+
+[ADR 0001](docs/decisions/0001-stack-rust-libghostty-vt-ppxai-server.md) records the decision. In short:
+
+- **Rust**, using **libghostty-vt** through the crates.io `libghostty-vt` crate. Pin the Ghostty commit with `GHOSTTY_SOURCE_DIR`. Full libghostty (`ghostty.h`) supports Apple platforms only, and Ghostty says it's not for outside embedders.
+- libghostty-vt has no renderer and no PTY. tai draws the screen and spawns the child process itself.
+- **Milestone (a):** a PTY running `$SHELL` or ppxai's TUI, rendered with macroquad (from `ghostling_rs`, with audio off). **Milestone (b):** a native chat UI built on winit + wgpu.
+- **Engine:** tai launches `ppxai-server --uds --announce` as its own child process. Don't run the engine in-process, which would force a Python host. Don't use stdio JSON-RPC either: it has no interrupt or consent handling.
+- All of ppxai's wire format lives in **one Rust client module**, covering one-shot (`/v1/oneshot`, stable, no streaming), chat (`/chat` SSE + `/interrupt` + `/consent`, internal) and tasks (`/v1/agent/*` SSE, not yet sealed). Pin the ppxai version and keep a tai-side contract test for the unstable routes.
+- Ghostty's macOS build stamps a minimum of macOS 13.0. Check how herdr gets around that before pinning Ghostty.
+
+Record new architecture decisions in `docs/decisions/`, following its README.
 
 ## Sister Projects
 
@@ -15,7 +28,7 @@ tai is built from pieces of two sibling checkouts, taken as needed:
 - **`../ppxai`** is the source of the engine. Read its `CLAUDE.md` before using the engine. Its key facts change from release to release, so check them there rather than copying them here.
   - The in-process entry point is `from ppxai.engine import EngineClient`. Since ADR 0016, `from ppxai import EngineClient` no longer works.
   - ppxai pins the import surface that outside consumers rely on in `tests/test_consumer_import_surface.py`. If tai imports new engine modules, that test may need updating in ppxai.
-  - The engine also has an HTTP/SSE server mode (`ppxai-server`). Choose deliberately between in-process and server.
+  - The engine also has an HTTP/SSE server mode (`ppxai-server`), which is the one tai uses (ADR 0001). ppxai's `docs/api-gateway.md` is the authority on which routes are stable. The import-surface test above doesn't cover the HTTP routes. tai's own contract test does.
 - **`../ppxai-sre`** is the source of the agentic code. Look in `agents/`, `libs/` and `mcp-servers/`. It already embeds the engine in-process, so use it as the reference for doing that. Read its `AGENTS.md`, which `CLAUDE.md` links to, before reusing code from it.
 
 When you bring code over from either project, record where it came from: the repo, the path, and the commit **subject** as well as the sha. ppxai rebases its long-lived branches, so its shas don't stay valid.
