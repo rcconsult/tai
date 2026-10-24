@@ -37,6 +37,35 @@ which is what makes ConPTY ask.
 test or tool that drives ConPTY without a libghostty-vt terminal must
 answer the query itself.
 
+## Ctrl+letter arrives as a control character
+
+On Windows, miniquad's `WM_CHAR` handler passes the character Windows
+produced, and for Ctrl+letter that is a control character: Ctrl+C gives
+U+0003 (Enter, Tab and Backspace likewise give `\r`, `\t`, `\x08`). If
+that reaches libghostty-vt's key encoder as the event's text
+(`set_utf8`), the encoder emits CSI u, `ESC[3;5u` for Ctrl+C, instead of
+the control byte. ConPTY doesn't treat that as Ctrl+C, so nothing gets
+interrupted.
+
+**What tai does:** `handle_keyboard_input` drops control characters
+from `get_char_pressed()` before building the text
+(`grep -n 'is_control' src/main.rs`). The encoder derives control bytes
+from the key and modifiers itself.
+
+## The "ignore Ctrl+C" flag is inherited
+
+A Windows process inherits its parent's "ignore Ctrl+C" flag, and ConPTY's
+child inherits it from the process that creates the pseudo console. If
+whatever launched tai had set it, ConPTY never turns the 0x03 tai writes
+into a `CTRL_C_EVENT`: a probe writing 0x03 into ConPTY left `ping -t`
+running, and stopped it once the parent had called
+`SetConsoleCtrlHandler(NULL, FALSE)`. This is the Windows counterpart of
+an ignored `SIGINT` surviving `exec` on Unix.
+
+**What tai does:** `allow_ctrl_c` in `src/pty_windows.rs` clears the flag
+before spawning the shell (`grep -n SetConsoleCtrlHandler
+src/pty_windows.rs`). Keep it for any child that should get Ctrl+C.
+
 ## Clone Ghostty with `core.autocrlf=false`
 
 `scripts/fetch-ghostty.sh` refuses to move a checkout whose tracked files
