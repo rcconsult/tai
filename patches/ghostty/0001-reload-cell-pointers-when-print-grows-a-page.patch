@@ -1,0 +1,96 @@
+Backport of ghostty-org/ghostty 33cda4dc5 "terminal: reload cell pointers
+when print grows a page" (2026-08-22, fixes ghostty-org/ghostty#11261) onto
+tai's pin a887df42. Only the code hunks: the commit's new tests use Zig
+0.16's testing.io and don't build with the pinned Zig 0.15.
+
+At the pin, Terminal.print and printCell keep cell pointers across calls
+that can grow, and so replace, the cursor's page. Output with many
+hyperlinks (OSC 8) then reads or writes freed memory: a ReleaseSafe build
+crashed in Terminal.print on macOS, and the grapheme path writes through
+the stale pointer in any build mode.
+
+scripts/fetch-ghostty.sh applies this file. Drop it when the Ghostty pin
+moves past 33cda4dc5.
+
+diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
+index 21c087446..b7176bba2 100644
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -1323,14 +1323,21 @@ pub fn print(self: *Terminal, c: u21) !void {
+                                 const old_rac = old_pin.rowAndCell();
+ 
+                                 if (new_pin.node == old_pin.node) {
+-                                    new_pin.node.page().moveGrapheme(prev.cell, new_rac.cell);
+-                                    prev.cell.content_tag = .codepoint;
++                                    new_pin.node.page().moveGrapheme(old_rac.cell, new_rac.cell);
++                                    old_rac.cell.content_tag = .codepoint;
+                                     new_rac.cell.content_tag = .codepoint_grapheme;
+                                     new_rac.row.grapheme = true;
+                                 } else {
+                                     const cps = old_pin.node.page().lookupGrapheme(old_rac.cell).?;
+                                     for (cps) |cp| {
+-                                        try self.screens.active.appendGrapheme(new_rac.cell, cp);
++                                        // appendGrapheme can grow the cursor
++                                        // page, so read the destination from
++                                        // the cursor each time rather than
++                                        // holding a pointer across the call.
++                                        try self.screens.active.appendGrapheme(
++                                            self.screens.active.cursor.page_cell,
++                                            cp,
++                                        );
+                                     }
+                                     old_pin.node.page().clearGrapheme(old_rac.cell);
+                                 }
+@@ -1340,7 +1347,7 @@ pub fn print(self: *Terminal, c: u21) !void {
+ 
+                             // Point prev.cell to our new previous cell that
+                             // we'll be appending graphemes to
+-                            prev.cell = new_rac.cell;
++                            prev.cell = self.screens.active.cursor.page_cell;
+                         } else {
+                             self.printCell(
+                                 0,
+@@ -1359,8 +1366,30 @@ pub fn print(self: *Terminal, c: u21) !void {
+ 
+                     // Write our spacer, since prev.cell is now wide
+                     self.screens.active.cursorRight(1);
++
++                    // Writing the spacer can grow the page to make room for
++                    // the cursor hyperlink. Growing replaces the page, which
++                    // invalidates `prev.cell`. Record the page identity first
++                    // so the common case where nothing grows stays free.
++                    //
++                    // A pointer comparison alone isn't enough: pages are
++                    // pooled, so a replacement can reuse the same address.
++                    // The serial makes the pair a unique identity.
++                    const spacer_node = self.screens.active.cursor.page_pin.node;
++                    const spacer_serial = spacer_node.serial;
++
+                     self.printCell(0, .spacer_tail);
+ 
++                    if (self.screens.active.cursor.page_pin.node != spacer_node or
++                        self.screens.active.cursor.page_pin.node.serial != spacer_serial)
++                    {
++                        @branchHint(.unlikely);
++
++                        // The cursor is on the spacer tail we just wrote, so
++                        // the wide cell we append to is the one to its left.
++                        prev.cell = self.screens.active.cursorCellLeft(1);
++                    }
++
+                     // Move the cursor again so we're beyond our spacer
+                     if (self.screens.active.cursor.x == right_limit - 1) {
+                         self.screens.active.cursor.pending_wrap = true;
+@@ -1704,7 +1733,11 @@ fn printCell(
+         self.screens.active.cursorSetHyperlink() catch |err| {
+             @branchHint(.unlikely);
+             log.warn("error reallocating for more hyperlink space, ignoring hyperlink err={}", .{err});
+-            assert(!cell.hyperlink);
++
++            // A partially successful grow can replace the page even when the
++            // call fails, so `cell` may be stale here. The cursor pointers are
++            // always reloaded, so read the cell through the cursor.
++            assert(!self.screens.active.cursor.page_cell.hyperlink);
+         };
+     } else if (had_hyperlink) {
+         // If the previous cell had a hyperlink then we need to clear it.

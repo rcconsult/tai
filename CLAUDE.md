@@ -20,7 +20,7 @@ Always build through `scripts/cargo.sh`, never plain `cargo`. libghostty-vt's bu
 
 `vendor/macroquad` is macroquad 0.4.16 with a clipboard fix, used through `[patch.crates-io]`. Without the fix, macroquad's built-in UI empties the system clipboard on every Ctrl+C. `vendor/macroquad/TAI-PATCHES.md` lists the patches. When bumping macroquad, check whether upstream has fixed issue #546 before dropping the vendored copy.
 
-Three pins move together: the `libghostty-vt` version in `Cargo.toml`, `GHOSTTY_COMMIT` in `scripts/fetch-ghostty.sh` (it must equal the crate's `crates/libghostty-vt-sys/build.rs` pin), and `ZIG_VERSION` in `scripts/fetch-zig.sh` (it must match that Ghostty commit's `build.zig.zon` `minimum_zig_version`).
+Three pins move together: the `libghostty-vt` version in `Cargo.toml`, `GHOSTTY_COMMIT` in `scripts/fetch-ghostty.sh` (it must equal the crate's `crates/libghostty-vt-sys/build.rs` pin), and `ZIG_VERSION` in `scripts/fetch-zig.sh` (it must match that Ghostty commit's `build.zig.zon` `minimum_zig_version`). `patches/ghostty/` holds upstream fixes backported onto the pin, which `fetch-ghostty.sh` applies; when the pin moves, drop each patch the new pin already contains.
 
 ## Stack
 

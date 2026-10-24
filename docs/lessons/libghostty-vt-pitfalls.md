@@ -31,3 +31,26 @@ tai logs the mode at startup: `tai | simd: enabled, optimize: ReleaseSafe`.
 To debug libghostty-vt itself, override it for one build:
 `LIBGHOSTTY_VT_SYS_OPTIMIZE=Debug scripts/cargo.sh build`, and expect
 heavy output to be slow.
+
+## Output with many hyperlinks crashes the pinned Ghostty
+
+At the pin (a887df42), `Terminal.print` and `printCell`
+(`src/terminal/Terminal.zig`) keep cell pointers across calls that can grow,
+and so replace, the cursor's page. When a page runs out of hyperlink space,
+they read or write freed memory. On 2026-10-25 a ReleaseSafe tai on macOS
+crashed in `Terminal.print` within seconds of
+`ls -R --hyperlink=always /usr/share`, right after the log line "error
+reallocating for more hyperlink space". Upstream fixed it in 33cda4dc5
+"terminal: reload cell pointers when print grows a page", which needs Zig
+0.16. `patches/ghostty/0001-reload-cell-pointers-when-print-grows-a-page.patch`
+backports its code hunks, and `scripts/fetch-ghostty.sh` applies it.
+
+## Changing the Ghostty source doesn't rebuild libghostty-vt
+
+`libghostty-vt-sys`'s build script reruns only when its environment
+variables change (`rerun-if-env-changed`), not when files under
+`GHOSTTY_SOURCE_DIR` change. A new pin or patch would leave the old library
+in `target/`. `scripts/cargo.sh` therefore keeps the Ghostty checkout's
+HEAD in `<target dir>/.tai-ghostty-head` and runs
+`cargo clean -p libghostty-vt-sys` when it differs. Plain `cargo` skips
+that check.

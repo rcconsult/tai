@@ -32,4 +32,19 @@ if [ "$release" = false ] && [ -z "${LIBGHOSTTY_VT_SYS_OPTIMIZE:-}" ]; then
     export LIBGHOSTTY_VT_SYS_OPTIMIZE
 fi
 
+# libghostty-vt-sys's build script doesn't watch the Ghostty source, so a
+# new pin or patch would leave the old library in the target directory.
+# Rebuild it once whenever the checkout's HEAD changes.
+# The stamp lives in the target directory, since each one holds its own build.
+ghostty_head=$(git -C "${GHOSTTY_SOURCE_DIR:-$root/.local/ghostty}" rev-parse HEAD)
+target_dir=${CARGO_TARGET_DIR:-$root/target}
+built="$target_dir/.tai-ghostty-head"
+if [ "$(cat "$built" 2>/dev/null || true)" != "$ghostty_head" ]; then
+    # `cargo clean -p` cleans only the dev profile unless told otherwise.
+    PATH="$root/.local/zig:$PATH" cargo clean -q -p libghostty-vt-sys
+    PATH="$root/.local/zig:$PATH" cargo clean -q -p libghostty-vt-sys --release
+    mkdir -p "$target_dir"
+    echo "$ghostty_head" >"$built"
+fi
+
 PATH="$root/.local/zig:$PATH" exec cargo "$@"
