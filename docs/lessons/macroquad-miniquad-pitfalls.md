@@ -49,7 +49,8 @@ build, Retina) with a minimal macroquad 0.4.16 loop
 After 60 s on Metal, `heap` showed 273 live `MTLIGAccelCommandBuffer` and
 819 each of `MTLRenderPassDescriptorInternal` and
 `MTLIGAccelRenderCommandEncoder`. In tai, which draws far more per frame,
-the growth was about 1.2 MB/s and showed up as GPU regions.
+the growth was about 1.2 MB/s and showed up as GPU regions. Reported
+upstream as not-fl3/miniquad#697.
 
 **What tai does:** OpenGL is the macOS default, and `TAI_APPLE_GFX=metal`
 is opt-in (`macroquad_conf` in `src/main.rs`). Before making Metal the
