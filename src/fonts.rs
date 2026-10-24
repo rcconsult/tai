@@ -209,9 +209,10 @@ mod tests {
     #[test]
     fn general_symbols_use_iosevka() {
         let c = Coverage::new().unwrap();
-        // U+2388 ⎈ kube-ps1's prompt symbol, U+23F5 ⏵ used by Claude Code,
-        // U+28FF a braille spinner frame.
-        for ch in ['\u{2388}', '\u{23f5}', '\u{28ff}'] {
+        // U+2388 ⎈ kube-ps1's prompt symbol; ⏵ ⏸ ⏺ ⎿ ✲ from Claude Code's
+        // status lines; U+28FF a braille spinner frame.
+        let claude_code = ['\u{23f5}', '\u{23f8}', '\u{23fa}', '\u{23bf}', '\u{2732}'];
+        for ch in ['\u{2388}', '\u{28ff}'].into_iter().chain(claude_code) {
             assert_eq!(c.face_for(ch), Face::Iosevka, "U+{:04X}", ch as u32);
         }
     }
