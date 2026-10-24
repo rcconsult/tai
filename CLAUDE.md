@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **tai** is a terminal app that runs the **ppxai engine harness** behind a UI built on **libghostty** (Ghostty's embeddable terminal library).
 
-**Status:** milestone (a) is scaffolded. `src/main.rs` is `ghostling_rs` from libghostty-rs v0.2.2 with tai changes, and its header records the provenance. Unit tests cover the shortcut mapping, font-size steps and paste encoding (`src/shortcuts.rs`). Font fallback to the bundled Symbols Nerd Font Mono is in `src/fonts.rs`, and `fonts/README.md` records where each font comes from.
+**Status:** milestone (a) is scaffolded. `src/main.rs` is `ghostling_rs` from libghostty-rs v0.2.2 with tai changes, and its header records the provenance. Unit tests cover the shortcut mapping, font-size steps and paste encoding (`src/shortcuts.rs`). Font fallback to the bundled Symbols Nerd Font Mono and Iosevka Fixed is in `src/fonts.rs`, and `fonts/README.md` records where each font comes from.
 
 ## Build
 

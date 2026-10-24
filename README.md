@@ -43,7 +43,7 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
 
 ## Known gaps
 
-- Font fallback covers Nerd Font icons only. Emoji and CJK show as boxes.
+- Font fallback covers Nerd Font icons and general symbols. Emoji and CJK show as boxes.
 - macroquad is vendored with a clipboard fix (`vendor/macroquad/TAI-PATCHES.md`).
 
 ## Licence notes
@@ -52,4 +52,5 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
 Apache-2.0). The bundled JetBrains Mono font is under the SIL Open Font
 License (`fonts/OFL.txt`). The bundled Symbols Nerd Font Mono, used as the
 fallback for icons, is MIT, and its icon sets carry their own licences
-(`fonts/README.md`).
+(`fonts/README.md`). The bundled Iosevka Fixed, the fallback for general
+symbols, is under the SIL Open Font License (`fonts/Iosevka-LICENSE.md`).

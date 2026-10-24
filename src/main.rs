@@ -52,7 +52,7 @@ use libghostty_vt::{
     },
 };
 
-use crate::fonts::{Coverage, Face, Fonts};
+use crate::fonts::{Coverage, Face, Fonts, is_space};
 use crate::pty::{Child, Pty, PtyError};
 use crate::shortcuts::Action;
 
@@ -469,7 +469,7 @@ impl<'alloc> Renderer<'alloc> {
                     cell.graphemes_utf8(&mut text)?;
                 }
                 if std::mem::take(&mut icon_open)
-                    && (graphemes == 0 || text == " ")
+                    && (graphemes == 0 || text.chars().next().is_some_and(is_space))
                     && let Some(icon) = icons.last_mut()
                 {
                     icon.cells = 2;
@@ -524,16 +524,17 @@ impl<'alloc> Renderer<'alloc> {
                         draw_rectangle(x, y, dims.cell_width, dims.cell_height, color(bg));
                     }
 
-                    // Draw the text for the cell, in the fallback font when the
+                    // Draw the text for the cell, in a fallback font when the
                     // primary lacks the glyph (e.g. Nerd Font icons). The first
                     // codepoint decides for the whole grapheme.
                     let face = text
                         .chars()
                         .next()
                         .map_or(Face::Primary, |ch| coverage.face_for(ch));
-                    if face == Face::Fallback {
+                    if face == Face::Symbols || face == Face::Iosevka {
                         icons.push(Icon {
                             text: text.clone(),
+                            face,
                             x,
                             y,
                             fg: color(fg),
@@ -541,7 +542,7 @@ impl<'alloc> Renderer<'alloc> {
                             cells: 1,
                         });
                         icon_open = true;
-                    } else {
+                    } else if face == Face::Primary {
                         let baseline = y + dims.baseline;
                         draw_glyph(
                             &text,
@@ -560,13 +561,13 @@ impl<'alloc> Renderer<'alloc> {
             }
 
             for icon in icons.drain(..) {
-                let place = coverage.place(Face::Fallback, dims.font_size, icon.cells);
+                let place = coverage.place(icon.face, dims.font_size, icon.cells);
                 let baseline = icon.y + dims.baseline - place.rise;
                 draw_glyph(
                     &icon.text,
                     icon.x,
                     baseline,
-                    &fonts.fallback,
+                    fonts.get(icon.face),
                     place.font_size,
                     icon.fg,
                     icon.bold,
@@ -706,6 +707,7 @@ impl<'alloc> Renderer<'alloc> {
 /// A fallback-font glyph waiting to be drawn at the end of its row.
 struct Icon {
     text: String,
+    face: Face,
     x: f32,
     y: f32,
     fg: Color,
