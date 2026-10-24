@@ -2,3 +2,9 @@
 # fetched by scripts/fetch-ghostty.sh. An exported GHOSTTY_SOURCE_DIR wins.
 [env]
 GHOSTTY_SOURCE_DIR = { value = ".local/ghostty", relative = true }
+# Without this, a cargo dev build compiles libghostty-vt in Zig Debug mode,
+# which turns on Ghostty's slow_runtime_safety: every new scrollback page
+# re-verifies the whole page, so heavy output can stall tai for minutes.
+# ReleaseSafe keeps Zig's safety checks without those page checks. See
+# docs/lessons/libghostty-vt-pitfalls.md.
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseSafe"
