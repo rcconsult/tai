@@ -3,7 +3,9 @@
 //! Taken from uzaaft/libghostty-rs `example/ghostling_rs/src/main.rs` at tag
 //! v0.2.2 (a3a9676, "release: 0.2.2"), licensed MIT OR Apache-2.0. tai's
 //! changes: window title, XTVERSION and log name, `TAI_APPLE_GFX` (gl|metal),
-//! `COLORTERM`, and a login shell on macOS.
+//! `COLORTERM`, a login shell on macOS, default signal handling for the
+//! shell, HiDPI and baseline fixes, and the copy/paste/font-size shortcuts
+//! in `shortcuts.rs`.
 //!
 //! Original description follows.
 //!
@@ -24,7 +26,7 @@ use std::{
 use macroquad::{
     miniquad::{
         CursorIcon, conf,
-        window::{order_quit, set_mouse_cursor},
+        window::{clipboard_get, clipboard_set, order_quit, set_mouse_cursor},
     },
     prelude::*,
 };
@@ -34,20 +36,27 @@ use libghostty_vt::{
     Terminal, TerminalOptions,
     alloc::Bytes,
     build_info,
+    fmt::Format,
     key::{self, Key},
     kitty::graphics::{self, DecodePng, DecodedImage, Graphics, Layer, PlacementIterator},
     mouse,
     render::{CellIterator, Dirty, RenderState, RowIterator},
-    selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
+    selection::{
+        FormatOptions,
+        gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
+    },
     style::RgbColor,
     terminal::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Point,
+        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
         PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
         SizeReportSize,
     },
 };
 
 use crate::pty::{Child, Pty, PtyError};
+use crate::shortcuts::Action;
+
+mod shortcuts;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -56,10 +65,10 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 // so feel free to tweak and tune these settings to your liking :)
 // ---------------------------------------------------------------------------
 
-/// Desired font size in logical (screen) points. macroquad rasterizes
-/// glyphs at font_size * dpi_scale itself, so they stay crisp on HiDPI /
-/// Retina displays without scaling here.
-const FONT_SIZE: u16 = 10;
+/// The bundled font. Font sizes are in logical (screen) points; macroquad
+/// rasterizes glyphs at font_size * dpi_scale itself, so they stay crisp on
+/// HiDPI / Retina displays without scaling here.
+const FONT_BYTES: &[u8] = include_bytes!("../fonts/JetBrainsMono-Medium.ttf");
 
 /// Small padding from window edges
 const PADDING: f32 = 6.0;
@@ -85,11 +94,11 @@ async fn main() -> Result<()> {
     // Make libghostty-vt emit through the same tracing subscriber.
     libghostty_vt::set_logger(Some(Box::new(libghostty_vt::log::TracingLogger)))?;
 
-    let font = load_ttf_font_from_bytes(include_bytes!("../fonts/JetBrainsMono-Medium.ttf"))?;
+    let mut font = load_ttf_font_from_bytes(FONT_BYTES)?;
 
     // Compute the initial grid from the window size
     // and measured cell metrics.
-    let mut dims = Dimensions::new(Some(&font));
+    let mut dims = Dimensions::new(Some(&font), shortcuts::DEFAULT_FONT_SIZE);
     let (cols, rows) = dims.grid_size();
 
     // Track window size so we only recalculate the grid on actual changes.
@@ -229,14 +238,7 @@ async fn main() -> Result<()> {
         // pty's winsize (so the child shell knows about the new size and
         // can send SIGWINCH to its foreground process group).
         if dims.update(Some(&font)) {
-            let (cols, rows) = dims.grid_size();
-            grid_size.set((cols, rows));
-            cell_pixels.set(dims.cell_pixels());
-            {
-                let (cell_w, cell_h) = dims.cell_pixels();
-                terminal.resize(cols, rows, cell_w, cell_h)?;
-            }
-            pty.resize(dims);
+            apply_dims(dims, &grid_size, &cell_pixels, &mut terminal, &pty)?;
         }
 
         // Do different things based on whether the child process
@@ -252,6 +254,31 @@ async fn main() -> Result<()> {
                 // Forward keyboard/mouse input only while the child is alive.
                 input.handle_keyboard_input(&terminal)?;
                 input.handle_mouse_input(&mut terminal, dims)?;
+
+                // Run the app shortcuts the keyboard handler picked out.
+                for action in std::mem::take(&mut input.actions) {
+                    match action {
+                        Action::Copy => copy_selection(&terminal)?,
+                        Action::Paste => {
+                            if let Some(text) = clipboard_get() {
+                                let bracketed = terminal.mode(Mode::BRACKETED_PASTE)?;
+                                input
+                                    .response
+                                    .extend(shortcuts::encode_paste(&text, bracketed)?);
+                            }
+                        }
+                        Action::FontBigger | Action::FontSmaller | Action::FontReset => {
+                            let size = shortcuts::next_font_size(dims.font_size, action);
+                            if size != dims.font_size {
+                                // Reload the font so the glyph atlas of the old
+                                // size is dropped instead of growing per size.
+                                font = load_ttf_font_from_bytes(FONT_BYTES)?;
+                                dims = Dimensions::new(Some(&font), size);
+                                apply_dims(dims, &grid_size, &cell_pixels, &mut terminal, &pty)?;
+                            }
+                        }
+                    }
+                }
 
                 // Write the composed response back to the PTY,
                 // and clear it in preparation of the next frame.
@@ -294,6 +321,40 @@ async fn main() -> Result<()> {
         renderer.render_terminal(&terminal, dims, Some(&font))?;
         next_frame().await
     }
+}
+
+/// Push new grid dimensions to the terminal (so it reflows text) and to the
+/// pty's winsize (so the child shell gets SIGWINCH).
+fn apply_dims(
+    dims: Dimensions,
+    grid_size: &Cell<(u16, u16)>,
+    cell_pixels: &Cell<(u32, u32)>,
+    terminal: &mut Terminal<'_, '_>,
+    pty: &Pty,
+) -> Result<()> {
+    let (cols, rows) = dims.grid_size();
+    grid_size.set((cols, rows));
+    cell_pixels.set(dims.cell_pixels());
+    let (cell_w, cell_h) = dims.cell_pixels();
+    terminal.resize(cols, rows, cell_w, cell_h)?;
+    pty.resize(dims);
+    Ok(())
+}
+
+/// Copy the selection to the clipboard as plain text, the way Ghostty does:
+/// soft-wrapped lines joined and trailing blanks trimmed. Does nothing
+/// without a selection.
+fn copy_selection(terminal: &Terminal<'_, '_>) -> Result<()> {
+    let options = FormatOptions::new()
+        .with_emit_format(Format::Plain)
+        .with_unwrap(true)
+        .with_trim(true);
+    if let Some(text) = terminal.format_selection_alloc(None, options)?
+        && !text.is_empty()
+    {
+        clipboard_set(&String::from_utf8_lossy(&text));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +513,7 @@ impl<'alloc> Renderer<'alloc> {
                         y + dims.baseline,
                         TextParams {
                             font,
-                            font_size: FONT_SIZE,
+                            font_size: dims.font_size,
                             color: color(fg),
                             ..Default::default()
                         },
@@ -471,7 +532,7 @@ impl<'alloc> Renderer<'alloc> {
                             y + dims.baseline,
                             TextParams {
                                 font,
-                                font_size: FONT_SIZE,
+                                font_size: dims.font_size,
                                 color: color(fg),
                                 ..Default::default()
                             },
@@ -625,6 +686,8 @@ struct Dimensions {
     window_height: f32,
     cell_width: f32,
     cell_height: f32,
+    /// Font size in logical points.
+    font_size: u16,
     /// Offset from a cell's top edge to the text baseline.
     baseline: f32,
     /// DPI scale the cell metrics were measured at.
@@ -632,11 +695,11 @@ struct Dimensions {
 }
 
 impl Dimensions {
-    fn new(font: Option<&Font>) -> Self {
+    fn new(font: Option<&Font>, font_size: u16) -> Self {
         // Measure a representative glyph to derive the monospace cell size.
         // measure_text applies the DPI scale itself and returns logical
         // units, the same units we draw in.
-        let glyph_size = measure_text("M", font, FONT_SIZE, 1.0);
+        let glyph_size = measure_text("M", font, font_size, 1.0);
 
         // Guard against zero cell dimensions — these would cause division
         // by zero when computing the terminal grid.
@@ -646,6 +709,7 @@ impl Dimensions {
             cell_height: glyph_size.height.max(1.0) + ROW_GAP,
             // Center the glyph vertically: half the row gap above it, then
             // its ascent (offset_y) down to the baseline.
+            font_size,
             baseline: ROW_GAP / 2.0 + glyph_size.offset_y,
             dpi_scale: screen_dpi_scale(),
             window_width: screen_width(),
@@ -670,7 +734,7 @@ impl Dimensions {
         // The DPI scale may not be final on the first frame, or may change
         // when the window moves between displays; re-measure the cells then.
         if screen_dpi_scale() != self.dpi_scale {
-            *self = Self::new(font);
+            *self = Self::new(font, self.font_size);
             return true;
         }
         if screen_width() == self.window_width && screen_height() == self.window_height {
@@ -702,6 +766,10 @@ struct Input<'alloc> {
     mouse_event: mouse::Event<'alloc>,
     response: Vec<u8>,
     selection: SelectionState<'alloc>,
+    /// App shortcuts pressed this frame, run by the main loop.
+    actions: Vec<Action>,
+    /// Keys whose press was a shortcut, so their release is swallowed too.
+    swallowed: Vec<KeyCode>,
 }
 impl<'alloc> Input<'alloc> {
     fn new() -> Result<Self> {
@@ -712,6 +780,8 @@ impl<'alloc> Input<'alloc> {
             mouse_event: mouse::Event::new()?,
             response: Vec::with_capacity(64),
             selection: SelectionState::new()?,
+            actions: Vec::new(),
+            swallowed: Vec::new(),
         })
     }
 
@@ -750,6 +820,22 @@ impl<'alloc> Input<'alloc> {
             };
 
             let mods = Self::keyboard_mods();
+
+            // App shortcuts never reach the pty: not the press, not any text
+            // the platform produced for it, and not the matching release.
+            if action == key::Action::Release {
+                if let Some(i) = self.swallowed.iter().position(|&k| k == kc) {
+                    self.swallowed.swap_remove(i);
+                    continue;
+                }
+            } else if let Some(shortcut) =
+                shortcuts::action_for(kc, mods, cfg!(target_os = "macos"))
+            {
+                self.actions.push(shortcut);
+                self.swallowed.push(kc);
+                text.clear();
+                continue;
+            }
 
             // Consumed mods are modifiers the platform's text input
             // already accounted for when producing the UTF-8 text.
@@ -1228,6 +1314,8 @@ impl SelectionState<'_> {
 /// By default the window is resizable and DPI-aware,
 /// while prioritizing Wayland over X11 on Linux.
 /// On Apple platforms, `TAI_APPLE_GFX=metal` selects Metal instead of OpenGL.
+/// Metal stays opt-in: on the macOS dev host it leaked GPU memory steadily
+/// (about 1.2 MB/s while htop redrew) where OpenGL stayed flat.
 fn macroquad_conf() -> Conf {
     let apple_gfx_api = match std::env::var("TAI_APPLE_GFX").as_deref() {
         Ok("metal") => conf::AppleGfxApi::Metal,
@@ -1329,6 +1417,27 @@ mod pty {
                 // Child process -- replace ourselves with the shell.
                 // TERM tells programs what escape sequences we understand.
                 ForkptyResult::Child => {
+                    // Give the shell default signal handling. Ignored signals
+                    // survive exec, so if whatever launched tai ignored SIGINT
+                    // (a background job does), Ctrl+C would never interrupt
+                    // anything in the shell.
+                    for sig in [
+                        signal::Signal::SIGINT,
+                        signal::Signal::SIGQUIT,
+                        signal::Signal::SIGTSTP,
+                        signal::Signal::SIGTTIN,
+                        signal::Signal::SIGTTOU,
+                        signal::Signal::SIGPIPE,
+                        signal::Signal::SIGCHLD,
+                    ] {
+                        _ = unsafe { signal::signal(sig, signal::SigHandler::SigDfl) };
+                    }
+                    _ = signal::sigprocmask(
+                        signal::SigmaskHow::SIG_SETMASK,
+                        Some(&signal::SigSet::empty()),
+                        None,
+                    );
+
                     // Determine the user's preferred shell. We try $SHELL first (the
                     // standard convention), then fall back to the passwd entry, and
                     // finally to /bin/sh if nothing else is available.

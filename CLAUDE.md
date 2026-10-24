@@ -6,16 +6,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **tai** is a terminal app that runs the **ppxai engine harness** behind a UI built on **libghostty** (Ghostty's embeddable terminal library).
 
-**Status:** milestone (a) is scaffolded. `src/main.rs` is `ghostling_rs` from libghostty-rs v0.2.2 with small tai changes, and its header records the provenance. There are no tests yet.
+**Status:** milestone (a) is scaffolded. `src/main.rs` is `ghostling_rs` from libghostty-rs v0.2.2 with tai changes, and its header records the provenance. Unit tests cover the shortcut mapping, font-size steps and paste encoding (`src/shortcuts.rs`).
 
 ## Build
 
 Always build through `scripts/cargo.sh`, never plain `cargo`. libghostty-vt's build script runs whichever `zig` is on `PATH`. The pinned Ghostty needs an exact Zig major.minor, 0.15.x, and that's not the system Zig. On first use, the wrapper fetches Zig into `.local/zig/` (`scripts/fetch-zig.sh`, checked against ziglang.org's sha256) and Ghostty into `.local/ghostty/` (`scripts/fetch-ghostty.sh`). `.cargo/config.toml` points `GHOSTTY_SOURCE_DIR` at that checkout.
 
 - Build: `scripts/cargo.sh build` (the first build fetches Zig and Ghostty and compiles libghostty-vt, a few minutes)
-- Run: `scripts/cargo.sh run` (opens a window running `$SHELL`). On macOS, `TAI_APPLE_GFX=metal` selects Metal instead of OpenGL.
+- Run: `scripts/cargo.sh run` (opens a window running `$SHELL`). On macOS, `TAI_APPLE_GFX=metal` selects Metal instead of OpenGL. Keep it opt-in: Metal leaked GPU memory on the macOS dev host.
+- Shortcuts (`src/shortcuts.rs`, following Ghostty's defaults): on macOS, Cmd+C/V copy and paste and Cmd+= / Cmd+- / Cmd+0 change the font size. On Linux, it's Ctrl+Shift+C/V and Ctrl+= / Ctrl+- / Ctrl+0. Plain Ctrl+C and Ctrl+V go to the shell.
 - Lint: `scripts/cargo.sh fmt --check` and `scripts/cargo.sh clippy`
 - Test: `scripts/cargo.sh test`, or `scripts/cargo.sh test <name>` for a single test
+
+`vendor/macroquad` is macroquad 0.4.16 with a clipboard fix, used through `[patch.crates-io]`. Without the fix, macroquad's built-in UI empties the system clipboard on every Ctrl+C. `vendor/macroquad/TAI-PATCHES.md` lists the patches. When bumping macroquad, check whether upstream has fixed issue #546 before dropping the vendored copy.
 
 Three pins move together: the `libghostty-vt` version in `Cargo.toml`, `GHOSTTY_COMMIT` in `scripts/fetch-ghostty.sh` (it must equal the crate's `crates/libghostty-vt-sys/build.rs` pin), and `ZIG_VERSION` in `scripts/fetch-zig.sh` (it must match that Ghostty commit's `build.zig.zon` `minimum_zig_version`).
 
