@@ -45,6 +45,15 @@ reallocating for more hyperlink space". Upstream fixed it in 33cda4dc5
 0.16. `patches/ghostty/0001-reload-cell-pointers-when-print-grows-a-page.patch`
 backports its code hunks, and `scripts/fetch-ghostty.sh` applies it.
 
+`scripts/repro-hyperlink-ls.sh target/debug/tai` reproduces it. It runs
+the listing inside tai and prints whether tai finished, froze or crashed,
+the Ghostty optimize mode, and how many "OutOfSpace" warnings were logged.
+Thousands of warnings with no crash mean the patch works. Run it on dev and
+release builds after moving the pin or dropping the patch. On 2026-10-25,
+on macOS with 16,950 lines: the unpatched ReleaseSafe build crashed in
+about 4 s, Zig Debug froze for 300 s, and the patched builds finished in
+about 15 s (ReleaseSafe) and 9 s (ReleaseFast).
+
 ## Changing the Ghostty source doesn't rebuild libghostty-vt
 
 `libghostty-vt-sys`'s build script reruns only when its environment
