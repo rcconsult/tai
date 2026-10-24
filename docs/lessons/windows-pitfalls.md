@@ -73,3 +73,42 @@ are modified (`git status --porcelain --untracked-files=no`). With
 `core.autocrlf=true`, which is common on Windows, line-ending conversion
 makes the whole tree look modified. Set `core.autocrlf=false` in
 `.local/ghostty` before the first checkout.
+
+## tai may run another app's ConPTY, chosen by DLL search
+
+`portable-pty` 0.9 (`src/win/psuedocon.rs`, `load_conpty`) prefers a
+sideloaded ConPTY: it calls `LoadLibraryW("conpty.dll")` with a bare name
+and falls back to the ConPTY in `kernel32.dll` only if that fails. The
+standard DLL search order covers tai's folder, the system folders, the
+current directory and every `PATH` entry. On 2026-10-25, with WezTerm
+20240203 installed and on `PATH`, tai's shell ran under
+`C:\Program Files\WezTerm\OpenConsole.exe` (loaded through WezTerm's
+`conpty.dll`); with WezTerm removed from `PATH` it ran under
+`C:\WINDOWS\system32\conhost.exe --headless`. Which ConPTY tai gets
+therefore depends on what else is installed, and a `conpty.dll` in the
+directory tai starts from would be loaded into tai.
+
+That matters for resizing. ConPTY was rewritten in mid-2024
+(microsoft/terminal 450eec48d, "A minor ConPTY refactoring: Goodbye
+VtEngine Edition"): before it, ConPTY re-rendered the console's screen
+itself; since, it passes the program's output through. WezTerm 20240203
+bundles the older kind. `portable-pty` always passes
+`PSEUDOCONSOLE_RESIZE_QUIRK`, which in the older ConPTY means "don't
+repaint the viewport on resize; the terminal handles its own buffer
+specifically for ConPTY" (old `src/host/VtIo.cpp`,
+`IsResizeQuirkEnabled`, citing GH#3490, #4354, #4741). That was written
+for Windows Terminal. libghostty-vt reflows its own way, so after a large
+resize (a big font-size step, then Ctrl+0) tai's screen and ConPTY's
+disagree: lines appear out of order until the shell repaints (Ctrl+L or
+`clear`). The rewritten ConPTY dropped the flag: the system conhost was
+started without `--resizeQuirk`, while WezTerm's OpenConsole got it.
+
+To see which ConPTY a running tai uses, list its child processes
+(`Get-CimInstance Win32_Process -Filter "ParentProcessId=<tai pid>"`) or
+its loaded modules (`conpty.dll`).
+
+**Open:** whether tai should always use the system ConPTY (load it from
+`kernel32.dll` explicitly) or ship a known OpenConsole, as Windows
+Terminal and WezTerm do. Either way, loading `conpty.dll` by bare name
+should stop. With the system ConPTY on this host the screen redrew after
+a resize; a full check of the garbling case is still to do.
