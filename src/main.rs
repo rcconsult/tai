@@ -1199,7 +1199,10 @@ impl<'alloc> Input<'alloc> {
                 .is_some_and(|c| c.eq_ignore_ascii_case(&pending.ucp))
                 && chars.next().is_none()
         };
-        let text = if ctrl_only && text.is_some_and(own_char) {
+        // Only for keys with a C0 form: Ctrl+; and the like keep their text,
+        // or they would send nothing.
+        let has_c0 = Self::c0_control(pending.ucp).is_some();
+        let text = if ctrl_only && has_c0 && text.is_some_and(own_char) {
             None
         } else {
             text
