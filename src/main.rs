@@ -1200,6 +1200,27 @@ impl<'alloc> Input<'alloc> {
         #[cfg(not(windows))]
         let mods = pending.mods;
 
+        // A Ctrl chord's own character as text ('[' for Ctrl+[ on X11) makes
+        // the encoder send CSI u. Not with Alt as well, which is AltGr on
+        // Windows and has real text.
+        let ctrl_only =
+            mods.contains(key::Mods::CTRL) && !mods.intersects(key::Mods::ALT | key::Mods::SUPER);
+        let own_char = |t: &str| {
+            let mut chars = t.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&pending.ucp))
+                && chars.next().is_none()
+        };
+        // Only for keys with a C0 form: Ctrl+; and the like keep their text,
+        // or they would send nothing.
+        let has_c0 = Self::c0_control(pending.ucp).is_some();
+        let text = if ctrl_only && has_c0 && text.is_some_and(own_char) {
+            None
+        } else {
+            text
+        };
+
         let before = self.response.len();
         self.encode_key(
             terminal,
@@ -1209,13 +1230,24 @@ impl<'alloc> Input<'alloc> {
             mods,
             text,
         )?;
-        // A key the encoder has no sequence for still typed its text.
-        if self.response.len() == before
-            && let Some(text) = text
-        {
-            self.response.extend_from_slice(text.as_bytes());
+        if self.response.len() == before {
+            if let Some(text) = text {
+                // A key the encoder has no sequence for still typed its text.
+                self.response.extend_from_slice(text.as_bytes());
+            } else if ctrl_only && let Some(byte) = Self::c0_control(pending.ucp) {
+                // The encoder sends nothing for Ctrl+[ (it does for Ctrl+]
+                // and Ctrl+\). Send the classic control byte: ESC for Ctrl+[.
+                self.response.push(byte);
+            }
         }
         Ok(())
+    }
+
+    /// The C0 control byte a Ctrl chord has always sent in terminals:
+    /// Ctrl+@ through Ctrl+_ (letters in either case) map to 0x00-0x1F.
+    fn c0_control(ucp: char) -> Option<u8> {
+        let upper = ucp.to_ascii_uppercase();
+        ('@'..='_').contains(&upper).then_some(upper as u8 & 0x1F)
     }
 
     fn encode_key(
@@ -1497,7 +1529,7 @@ impl<'alloc> Input<'alloc> {
     /// i.e. character the key produces with no modifiers on a US layout. The
     /// Kitty keyboard protocol requires this to identify keys. Returns NUL
     /// for keys that don't have a natural codepoint (arrows, F-keys, etc.).
-    const ALL_KEYS: [(KeyCode, Key, char); 74] = [
+    const ALL_KEYS: [(KeyCode, Key, char); 75] = [
         (KeyCode::A, Key::A, 'a'),
         (KeyCode::B, Key::B, 'b'),
         (KeyCode::C, Key::C, 'c'),
@@ -1572,6 +1604,7 @@ impl<'alloc> Input<'alloc> {
         (KeyCode::F10, Key::F10, '\0'),
         (KeyCode::F11, Key::F11, '\0'),
         (KeyCode::F12, Key::F12, '\0'),
+        (KeyCode::KpEnter, Key::NumpadEnter, '\0'),
     ];
 }
 
@@ -2003,5 +2036,20 @@ mod pty {
     pub enum PtyError {
         EndOfStream,
         OtherError(nix::errno::Errno),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Input;
+
+    #[test]
+    fn ctrl_chords_map_to_c0_controls() {
+        assert_eq!(Input::c0_control('['), Some(0x1B));
+        assert_eq!(Input::c0_control('c'), Some(0x03));
+        assert_eq!(Input::c0_control('@'), Some(0x00));
+        assert_eq!(Input::c0_control('_'), Some(0x1F));
+        assert_eq!(Input::c0_control('1'), None);
+        assert_eq!(Input::c0_control('='), None);
     }
 }
