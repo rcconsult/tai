@@ -5,6 +5,8 @@
 //! the shell. A chord that maps to an [`Action`] is handled by tai and is
 //! never sent to the PTY.
 
+use std::time::{Duration, Instant};
+
 use libghostty_vt::{key::Mods, paste};
 use macroquad::input::KeyCode;
 
@@ -57,6 +59,52 @@ pub fn next_font_size(current: u16, action: Action) -> u16 {
         Action::FontSmaller => current.saturating_sub(1).max(MIN_FONT_SIZE),
         Action::FontReset => DEFAULT_FONT_SIZE,
         Action::Copy | Action::Paste => current,
+    }
+}
+
+/// How long a font-size chord must be held before it repeats, and how often
+/// it repeats after that. macroquad reports a held key as one press, so tai
+/// times the repeat itself rather than following the OS key repeat.
+pub const REPEAT_DELAY: Duration = Duration::from_millis(400);
+pub const REPEAT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long after the last font-size step tai waits before resizing the
+/// grid, so a run of steps (held or tapped) reflows and redraws once.
+pub const RESIZE_SETTLE: Duration = Duration::from_millis(300);
+
+/// Whether holding the action's chord repeats it, as in Ghostty. Only the
+/// font-size steps do: repeating copy, paste or reset would be harmful or
+/// pointless.
+pub fn repeats(action: Action) -> bool {
+    matches!(action, Action::FontBigger | Action::FontSmaller)
+}
+
+/// A repeating shortcut whose key is still held.
+#[derive(Clone, Copy, Debug)]
+pub struct Held {
+    pub key: KeyCode,
+    pub action: Action,
+    next: Instant,
+}
+
+impl Held {
+    pub fn new(key: KeyCode, action: Action, now: Instant) -> Self {
+        Self {
+            key,
+            action,
+            next: now + REPEAT_DELAY,
+        }
+    }
+
+    /// Whether the action fires again at `now`. It fires at most once per
+    /// call, and the next repeat counts from `now`, so a slow frame (a font
+    /// reload) doesn't cause a burst of steps afterwards.
+    pub fn due(&mut self, now: Instant) -> bool {
+        if now < self.next {
+            return false;
+        }
+        self.next = now + REPEAT_INTERVAL;
+        true
     }
 }
 
@@ -175,6 +223,38 @@ mod tests {
         );
         assert_eq!(next_font_size(30, Action::FontReset), DEFAULT_FONT_SIZE);
         assert_eq!(next_font_size(30, Action::Copy), 30);
+    }
+
+    #[test]
+    fn only_font_steps_repeat() {
+        assert!(repeats(Action::FontBigger));
+        assert!(repeats(Action::FontSmaller));
+        assert!(!repeats(Action::FontReset));
+        assert!(!repeats(Action::Copy));
+        assert!(!repeats(Action::Paste));
+    }
+
+    #[test]
+    fn held_chord_repeats_after_delay_then_at_interval() {
+        let t0 = Instant::now();
+        let mut held = Held::new(KeyCode::Equal, Action::FontBigger, t0);
+        // The press itself already fired; nothing more before the delay.
+        assert!(!held.due(t0));
+        assert!(!held.due(t0 + REPEAT_DELAY - Duration::from_millis(1)));
+        assert!(held.due(t0 + REPEAT_DELAY));
+        assert!(!held.due(t0 + REPEAT_DELAY + Duration::from_millis(1)));
+        assert!(held.due(t0 + REPEAT_DELAY + REPEAT_INTERVAL));
+    }
+
+    #[test]
+    fn held_chord_does_not_burst_after_a_slow_frame() {
+        let t0 = Instant::now();
+        let mut held = Held::new(KeyCode::Minus, Action::FontSmaller, t0);
+        // One frame arrives long after several intervals have passed.
+        let late = t0 + REPEAT_DELAY + 5 * REPEAT_INTERVAL;
+        assert!(held.due(late));
+        assert!(!held.due(late));
+        assert!(held.due(late + REPEAT_INTERVAL));
     }
 
     #[test]

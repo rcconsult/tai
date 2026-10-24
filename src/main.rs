@@ -115,6 +115,10 @@ async fn main() -> Result<()> {
     // Same for the cell size in physical pixels, which changes with the
     // DPI scale.
     let cell_pixels = Cell::new(dims.cell_pixels());
+    // When a font-size change resizes the grid. Each resize reflows the
+    // screen and makes the shell redraw its prompt, so a run of size steps
+    // is applied once, after the last one.
+    let mut resize_due: Option<Instant> = None;
 
     // Spawn a child shell connected to a pseudo-terminal.
     let (pty, mut child) = Pty::new(dims)?;
@@ -243,6 +247,13 @@ async fn main() -> Result<()> {
         // can send SIGWINCH to its foreground process group).
         if dims.update(Some(&fonts.primary)) {
             apply_dims(dims, &grid_size, &cell_pixels, &mut terminal, &pty)?;
+            resize_due = None;
+        } else if resize_due.is_some_and(|due| Instant::now() >= due) {
+            resize_due = None;
+            // Skip it when the steps cancelled out (up three, down three).
+            if (dims.grid_size(), dims.cell_pixels()) != (grid_size.get(), cell_pixels.get()) {
+                apply_dims(dims, &grid_size, &cell_pixels, &mut terminal, &pty)?;
+            }
         }
 
         // Do different things based on whether the child process
@@ -278,7 +289,9 @@ async fn main() -> Result<()> {
                                 // old size are dropped instead of growing per size.
                                 fonts = Fonts::load()?;
                                 dims = Dimensions::new(Some(&fonts.primary), size);
-                                apply_dims(dims, &grid_size, &cell_pixels, &mut terminal, &pty)?;
+                                // Draw at the new size right away; resize the
+                                // grid once the steps stop.
+                                resize_due = Some(Instant::now() + shortcuts::RESIZE_SETTLE);
                             }
                         }
                     }
@@ -842,6 +855,8 @@ struct Input<'alloc> {
     actions: Vec<Action>,
     /// Keys whose press was a shortcut, so their release is swallowed too.
     swallowed: Vec<KeyCode>,
+    /// A font-size shortcut still held, which keeps stepping.
+    held: Option<shortcuts::Held>,
 }
 impl<'alloc> Input<'alloc> {
     fn new() -> Result<Self> {
@@ -854,6 +869,7 @@ impl<'alloc> Input<'alloc> {
             selection: SelectionState::new()?,
             actions: Vec::new(),
             swallowed: Vec::new(),
+            held: None,
         })
     }
 
@@ -879,7 +895,46 @@ impl<'alloc> Input<'alloc> {
         }
         let mut text: String = chars_pressed.into_iter().collect();
 
+        // While a shortcut's key is held, the platform keeps producing its
+        // text on key repeat (holding Cmd+= repeats "=") without a new key
+        // press. Drop it so it can't reach the shell through the fallback
+        // at the end. Repeats queued during a slow frame (a font reload)
+        // can arrive with the key's release, so count that frame too.
+        if self
+            .swallowed
+            .iter()
+            .any(|&k| is_key_down(k) || is_key_released(k))
+        {
+            text.clear();
+        }
+
+        // On macOS a Cmd chord is never terminal input, but the platform
+        // still reports its character ("=" for Cmd+=). Drop it.
+        if cfg!(target_os = "macos") && Self::keyboard_mods().contains(key::Mods::SUPER) {
+            text.clear();
+        }
+
         for (kc, key, ucp) in Self::ALL_KEYS {
+            // App shortcuts never reach the pty: not the press, not any text
+            // the platform produced for it, and not the matching release.
+            // Check the press first: a quick tap can press and release a key
+            // within one frame, and treating that as a release alone would
+            // miss the shortcut and leak its text.
+            if is_key_pressed(kc)
+                && let Some(shortcut) =
+                    shortcuts::action_for(kc, Self::keyboard_mods(), cfg!(target_os = "macos"))
+            {
+                self.actions.push(shortcut);
+                if !is_key_released(kc) {
+                    self.swallowed.push(kc);
+                    if shortcuts::repeats(shortcut) {
+                        self.held = Some(shortcuts::Held::new(kc, shortcut, Instant::now()));
+                    }
+                }
+                text.clear();
+                continue;
+            }
+
             let action = if is_key_released(kc) {
                 key::Action::Release
             } else if is_key_pressed(kc) {
@@ -900,19 +955,11 @@ impl<'alloc> Input<'alloc> {
 
             let mods = Self::keyboard_mods();
 
-            // App shortcuts never reach the pty: not the press, not any text
-            // the platform produced for it, and not the matching release.
-            if action == key::Action::Release {
-                if let Some(i) = self.swallowed.iter().position(|&k| k == kc) {
-                    self.swallowed.swap_remove(i);
-                    continue;
-                }
-            } else if let Some(shortcut) =
-                shortcuts::action_for(kc, mods, cfg!(target_os = "macos"))
+            // The release of a shortcut's key is swallowed like its press.
+            if action == key::Action::Release
+                && let Some(i) = self.swallowed.iter().position(|&k| k == kc)
             {
-                self.actions.push(shortcut);
-                self.swallowed.push(kc);
-                text.clear();
+                self.swallowed.swap_remove(i);
                 continue;
             }
 
@@ -962,6 +1009,22 @@ impl<'alloc> Input<'alloc> {
                 // Text was consumed by the encoder — clear it so the
                 // fallback below doesn't double-send.
                 text.clear();
+            }
+        }
+
+        // A held font-size shortcut keeps stepping, as in Ghostty, until its
+        // key is released or the modifiers no longer make the same chord.
+        if let Some(held) = &mut self.held {
+            let same_chord = is_key_down(held.key)
+                && shortcuts::action_for(
+                    held.key,
+                    Self::keyboard_mods(),
+                    cfg!(target_os = "macos"),
+                ) == Some(held.action);
+            if !same_chord {
+                self.held = None;
+            } else if held.due(Instant::now()) {
+                self.actions.push(held.action);
             }
         }
 
