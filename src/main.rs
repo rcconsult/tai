@@ -346,8 +346,15 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Draw the current terminal screen.
-        renderer.render_terminal(&terminal, dims, &fonts, &coverage)?;
+        // Draw the current terminal screen. Mouse buttons and the wheel may
+        // change what's shown without changing any cell (a selection being
+        // dragged, the viewport scrolled), so they always redraw. Typing
+        // doesn't need to: the shell's echo changes cells.
+        let mouse_active = mouse_wheel() != (0.0, 0.0)
+            || [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
+                .into_iter()
+                .any(|b| is_mouse_button_down(b) || is_mouse_button_released(b));
+        renderer.render_terminal(&terminal, dims, &fonts, &coverage, mouse_active)?;
         next_frame().await
     }
 }
@@ -395,6 +402,18 @@ struct Renderer<'alloc> {
     row_it: RowIterator<'alloc>,
     cell_it: CellIterator<'alloc>,
     placement_it: PlacementIterator<'alloc>,
+    /// The last drawn frame, kept in a texture so a frame where nothing
+    /// changed only copies it to the screen instead of drawing every cell.
+    frame: Option<Frame>,
+}
+
+/// A drawn terminal frame and what it was drawn from.
+struct Frame {
+    target: RenderTarget,
+    dims: Dimensions,
+    /// Whether the cursor was drawn, and where. The render state's dirty
+    /// flags track cell contents, so the cursor is compared separately.
+    cursor: Option<(u16, u16)>,
 }
 
 impl<'alloc> Renderer<'alloc> {
@@ -404,6 +423,7 @@ impl<'alloc> Renderer<'alloc> {
             row_it: RowIterator::new()?,
             cell_it: CellIterator::new()?,
             placement_it: PlacementIterator::new()?,
+            frame: None,
         })
     }
 
@@ -423,6 +443,7 @@ impl<'alloc> Renderer<'alloc> {
         dims: Dimensions,
         fonts: &Fonts,
         coverage: &Coverage,
+        force: bool,
     ) -> Result<()> {
         // Snapshot the terminal state into our render state. This is the
         // only point where we need access to the terminal; after this the
@@ -432,6 +453,52 @@ impl<'alloc> Renderer<'alloc> {
         // this is upheld in the Rust API by making the snapshot take an
         // exclusive (mutable) reference to the render state.
         let snapshot = self.render_state.update(terminal)?;
+
+        // Redraw only when something changed, as Ghostty does: its renderer
+        // draws on a wakeup from the IO thread and skips clean frames
+        // (src/renderer/Thread.zig at a887df42). The render state reports
+        // changed cells; the cursor, the window and font size, and input
+        // (a selection being dragged) are checked here too. Otherwise the
+        // last frame is copied to the screen.
+        let cursor = if snapshot.cursor_visible()? {
+            snapshot.cursor_viewport()?.map(|vp| (vp.x, vp.y))
+        } else {
+            None
+        };
+        let unchanged = !force
+            && snapshot.dirty()? == Dirty::Clean
+            && self
+                .frame
+                .as_ref()
+                .is_some_and(|f| f.dims == dims && f.cursor == cursor);
+        if unchanged {
+            if let Some(frame) = &self.frame {
+                Self::present(frame);
+            }
+            return Ok(());
+        }
+        if self.frame.as_ref().is_none_or(|f| f.dims != dims) {
+            // The texture has the window's size in physical pixels, so text
+            // stays as sharp as when it's drawn to the screen directly.
+            let target = render_target(
+                (dims.window_width * dims.dpi_scale).round() as u32,
+                (dims.window_height * dims.dpi_scale).round() as u32,
+            );
+            target.texture.set_filter(FilterMode::Nearest);
+            self.frame = Some(Frame {
+                target,
+                dims,
+                cursor,
+            });
+        }
+        let frame = self.frame.as_mut().expect("frame was just created");
+        frame.cursor = cursor;
+        let mut camera =
+            Camera2D::from_display_rect(Rect::new(0.0, 0.0, dims.window_width, dims.window_height));
+        // A render target is drawn upside down compared with the screen.
+        camera.zoom.y = -camera.zoom.y;
+        camera.render_target = Some(frame.target.clone());
+        set_camera(&camera);
 
         // Get the terminal's background color from the render state snapshot.
         let colors = snapshot.colors()?;
@@ -651,7 +718,26 @@ impl<'alloc> Renderer<'alloc> {
 
         // Reset global dirty state so the next update reports changes accurately.
         snapshot.set_dirty(Dirty::Clean)?;
+
+        set_default_camera();
+        if let Some(frame) = &self.frame {
+            Self::present(frame);
+        }
         Ok(())
+    }
+
+    /// Copy a drawn frame to the screen.
+    fn present(frame: &Frame) {
+        draw_texture_ex(
+            &frame.target.texture,
+            0.0,
+            0.0,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(frame.dims.window_width, frame.dims.window_height)),
+                ..Default::default()
+            },
+        );
     }
 
     fn render_kitty_images<'t>(
