@@ -916,6 +916,18 @@ impl<'alloc> Input<'alloc> {
                 continue;
             }
 
+            // Windows reports AltGr as Ctrl+Alt. When it produced a character
+            // (AltGr+2 gives '@' on Swiss and German layouts), that character
+            // is the input: with Ctrl+Alt left in, the encoder sends ESC NUL
+            // or a CSI u sequence instead. Marking them consumed isn't
+            // enough (it sends NUL), so drop them.
+            #[cfg(windows)]
+            let mods = if maybe_text.is_some() && mods.contains(key::Mods::CTRL | key::Mods::ALT) {
+                mods - (key::Mods::CTRL | key::Mods::ALT)
+            } else {
+                mods
+            };
+
             // Consumed mods are modifiers the platform's text input
             // already accounted for when producing the UTF-8 text.
             // For printable keys, shift is consumed (it turns 'a' → 'A').
