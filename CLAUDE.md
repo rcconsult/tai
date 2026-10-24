@@ -56,6 +56,12 @@ These rules come from `../ppxai/CLAUDE.md` and the owner's global `~/.claude/CLA
 - **Make sure an empty result really ran.** A check that never ran prints the same nothing as a check that found nothing. Don't add `2>/dev/null` to a verification command. Print the exit status when "found nothing" is the finding. `grep` exits 1 for no match and 2 for an error.
 - **Don't expand scope.** Do what was asked. If you spot something else worth doing, mention it and wait for a yes.
 - **Read the source, not summaries.** Commit subjects, ADR titles and subagent reports point you somewhere. They don't prove anything. Open the files that matter, especially when a change in ppxai might affect tai.
+- **Check Ghostty before inventing a fix.** libghostty-vt gives tai only the VT layer. Ghostty's app layer has already solved most of what sits above it, so look there first and port its approach:
+  - First read the libghostty-vt header for the API you're calling (`.local/ghostty/include/ghostty/vt/`). `key/event.h`, for example, says not to pass C0 control characters as key text, which tai only learned by debugging Ctrl+C.
+  - Then read how Ghostty's own app does it: input in `src/input/` and `src/apprt/`, fonts in `src/font/`, locale and OS integration in `src/os/`.
+  - When you port from Ghostty, record the path and the pinned commit in the code or the commit message, as for the sister projects.
+  - Ghostty doesn't run on Windows. For ConPTY and Windows input, use Windows Terminal (`microsoft/terminal`) as the reference.
+  - Quirks of macroquad and miniquad are tai's own; see `docs/lessons/`.
 - **No release actions without explicit permission each time.** That covers tagging, creating releases, force-pushing, rewriting pushed history and merging to the default branch.
 - **Python code taken from ppxai keeps ppxai's rules:**
   - Python 3.10+ with type hints, dataclasses, `async` for I/O, and pytest.
