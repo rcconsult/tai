@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Always build through `scripts/cargo.sh`, never plain `cargo`. libghostty-vt's build script runs whichever `zig` is on `PATH`. The pinned Ghostty needs an exact Zig major.minor, 0.15.x, and that's not the system Zig. On first use, the wrapper fetches Zig into `.local/zig/` (`scripts/fetch-zig.sh`, checked against ziglang.org's sha256) and Ghostty into `.local/ghostty/` (`scripts/fetch-ghostty.sh`). `.cargo/config.toml` points `GHOSTTY_SOURCE_DIR` at that checkout.
 
-- Build: `scripts/cargo.sh build` (the first build compiles libghostty-vt with Zig, about a minute)
+- Build: `scripts/cargo.sh build` (the first build fetches Zig and Ghostty and compiles libghostty-vt, a few minutes)
 - Run: `scripts/cargo.sh run` (opens a window running `$SHELL`). On macOS, `TAI_APPLE_GFX=metal` selects Metal instead of OpenGL.
 - Lint: `scripts/cargo.sh fmt --check` and `scripts/cargo.sh clippy`
 - Test: `scripts/cargo.sh test`, or `scripts/cargo.sh test <name>` for a single test
@@ -28,7 +28,7 @@ Three pins move together: the `libghostty-vt` version in `Cargo.toml`, `GHOSTTY_
 - **Milestone (a):** a PTY running `$SHELL` or ppxai's TUI, rendered with macroquad (from `ghostling_rs`, with audio off). **Milestone (b):** a native chat UI built on winit + wgpu.
 - **Engine:** tai launches `ppxai-server --uds --announce` as its own child process. Don't run the engine in-process, which would force a Python host. Don't use stdio JSON-RPC either: it has no interrupt or consent handling.
 - All of ppxai's wire format lives in **one Rust client module**, covering one-shot (`/v1/oneshot`, stable, no streaming), chat (`/chat` SSE + `/interrupt` + `/consent`, internal) and tasks (`/v1/agent/*` SSE, not yet sealed). Pin the ppxai version and keep a tai-side contract test for the unstable routes.
-- Ghostty's macOS build stamps a minimum of macOS 13.0. Check how herdr gets around that before pinning Ghostty.
+- Ghostty's macOS build stamps its objects with a minimum of macOS 13.0. The statically linked `tai` binary still gets rustc's default (10.12 on x86_64) and runs on macOS 12 (ADR 0001 notes). Watch for libghostty-vt calling APIs newer than macOS 12.
 
 Record new architecture decisions in `docs/decisions/`, following its README.
 

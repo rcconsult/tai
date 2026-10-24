@@ -2,8 +2,8 @@
 //!
 //! Taken from uzaaft/libghostty-rs `example/ghostling_rs/src/main.rs` at tag
 //! v0.2.2 (a3a9676, "release: 0.2.2"), licensed MIT OR Apache-2.0. tai's
-//! changes: window title, `TAI_APPLE_GFX` (gl|metal), `COLORTERM`, and a
-//! login shell on macOS.
+//! changes: window title, XTVERSION and log name, `TAI_APPLE_GFX` (gl|metal),
+//! `COLORTERM`, and a login shell on macOS.
 //!
 //! Original description follows.
 //!
@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
             })
         })?
         // xtversion effect — responds to CSI > q with our application name.
-        .on_xtversion(|_term| Some("ghostling-rs"))?
+        .on_xtversion(|_term| Some("tai"))?
         // color_scheme effect — responds to CSI ? 996 n.
         // We don't have any API to query the OS color scheme, so we return
         // false to silently ignore the query rather than guessing.
@@ -204,7 +204,7 @@ async fn main() -> Result<()> {
     let mut input = Input::new()?;
 
     tracing::info!(
-        "ghostling-rs | simd: {}, optimize: {:?}",
+        "tai | simd: {}, optimize: {:?}",
         if build_info::supports_simd()? {
             "enabled"
         } else {

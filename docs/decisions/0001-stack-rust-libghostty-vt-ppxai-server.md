@@ -26,16 +26,18 @@ not recorded):
   renderer or a PTY, so the embedder draws the screen and spawns the child.
 - The API is not stable yet and there is no tagged release. It builds from
   source with Zig, using `zig build -Demit-lib-vt`. The Zig version you need
-  depends on the Ghostty commit; both dev hosts have Zig 0.17.0.
+  depends on the Ghostty commit; both dev hosts have Zig 0.17.0 (but see
+  the 2026-10-24 notes: the pinned build uses a repo-local Zig 0.15.2).
 - On macOS, Ghostty's build (`Config.zig`) forces a minimum target of 13.0.
   A smoke-test build of libghostty-vt still ran on macOS 12, but it's
   stamped as needing 13.0. That build was from `ghostty-org/ghostty`
   `22f100c6367045bb5fc86172f837047dee2f7670`, "docs: replace stale function
-  name. `ghostty_vt_osc_free()` should be `ghostty_osc_free` (#14818)". herdr 0.9.5 vendors libghostty-vt (at Ghostty
-  `44f2a44df`) and ships a macOS binary stamped 10.12, so there is a known way
-  around this. herdr also carries local patches on its vendored copy, but
-none of them concerns the macOS minimum, so how herdr gets 10.12 is still
-unexplained.
+  name. `ghostty_vt_osc_free()` should be `ghostty_osc_free` (#14818)".
+  herdr 0.9.5 vendors libghostty-vt (at Ghostty `44f2a44df`) and ships a
+  macOS binary stamped 10.12, so there is a known way around this. herdr
+  also carries local patches on its vendored copy, but none of them
+  concerns the macOS minimum, so how herdr gets 10.12 is still unexplained
+  (explained since: see the 2026-10-24 notes).
 
 **Rust bindings:** the `libghostty-vt` crate on crates.io comes from
 `github.com/uzaaft/libghostty-rs`. It's community-maintained and licensed
@@ -155,3 +157,23 @@ staleness sweep across the Markdown docs"):
   has announced. Then reconsider decisions 1 and 3.
 - macroquad or wgpu can't hold an interactive frame rate on the weaker dev
   host.
+
+## Notes
+
+Fact-fix notes under the ADR README's exception. They correct the record
+to match what was built and observed, and don't change the decision.
+
+- **2026-10-24, Zig version.** libghostty-vt 0.2.2 pins Ghostty `a887df42`,
+  whose `build.zig.zon` declares `minimum_zig_version` 0.15.2. Ghostty
+  requires an exact Zig major.minor (`src/build/zig.zig`, `requireZig`), so
+  Zig 0.17 refuses to build it. The owner chose to keep the crates.io
+  release: `scripts/fetch-zig.sh` fetches Zig 0.15.2 into `.local/`, and
+  `scripts/cargo.sh` builds with it first on `PATH`. The system Zig 0.17
+  is unused.
+- **2026-10-24, macOS minimum.** The milestone (a) build on the macOS dev
+  host links libghostty-vt statically. All 11 objects in `libghostty-vt.a`
+  carry `LC_BUILD_VERSION` minos 13.0, yet the `tai` binary carries
+  `LC_VERSION_MIN_MACOSX` 10.12 (rustc's x86_64 default), links with no
+  warnings, and runs on macOS 12. That is very likely how herdr reaches
+  10.12, with no Ghostty patch involved. What remains open is whether
+  libghostty-vt calls any API newer than macOS 12 at runtime.
