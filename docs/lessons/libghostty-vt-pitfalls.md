@@ -20,7 +20,7 @@ Every stack sample was `linefeed` → `PageList.grow` →
 `Page.assertIntegrity` → `verifyIntegrity` → `lookupHyperlink`.
 
 `scripts/cargo.sh` exports `LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseSafe` unless
-the build is `--release` (or `--profile release*`). The build script honours
+the build is `-r`, `--release` or `--profile release*`. The build script honours
 that variable over `DEBUG`, and applies it to every profile, which is why
 it isn't set in `.cargo/config.toml`: there it would also turn release
 builds from ReleaseFast into ReleaseSafe. ReleaseSafe keeps Zig's safety

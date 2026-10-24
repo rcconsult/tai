@@ -17,14 +17,14 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 # exported LIBGHOSTTY_VT_SYS_OPTIMIZE wins. See
 # docs/lessons/libghostty-vt-pitfalls.md.
 release=false
-for arg in "$@"; do
-    case $arg in
-    --release | --profile=release*) release=true ;;
-    esac
-done
 prev=
 for arg in "$@"; do
-    [ "$prev" = --profile ] && case $arg in release*) release=true ;; esac
+    # Arguments after `--` belong to the program, not to cargo.
+    [ "$arg" = -- ] && break
+    case $arg in
+    -r | --release | --profile=release*) release=true ;;
+    release*) [ "$prev" = --profile ] && release=true ;;
+    esac
     prev=$arg
 done
 if [ "$release" = false ] && [ -z "${LIBGHOSTTY_VT_SYS_OPTIMIZE:-}" ]; then
