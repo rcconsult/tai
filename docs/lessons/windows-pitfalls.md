@@ -113,3 +113,11 @@ DLL search to System32 before the pseudo console is created, so
 `grep -n SetDefaultDllDirectories src/pty_windows.rs`). With WezTerm
 removed from `PATH`, the owner saw no garbling after the same resize
 steps.
+
+Even with the system ConPTY, text printed while the grid was narrow stays
+narrow after it widens. On 2026-10-25, `ls` run at the largest font size
+left each file name one character per line after Ctrl+0, in order and not
+garbled. The rewritten ConPTY turns some line wraps into hard line breaks
+(450eec48d lists it as unresolved: "`WriteCharsLegacy` emits a `\r\n` …
+This breaks text reflow on window resize"), and hard breaks can't be
+rejoined. Output printed after the resize lays out at the new width.
