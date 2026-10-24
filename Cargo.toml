@@ -14,3 +14,7 @@ macroquad = { version = "0.4.14", default-features = false }
 nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user", "ioctl"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Vendored macroquad with a clipboard fix; see vendor/macroquad/TAI-PATCHES.md.
+[patch.crates-io]
+macroquad = { path = "vendor/macroquad" }
