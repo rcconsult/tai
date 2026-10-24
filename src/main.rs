@@ -24,8 +24,9 @@ use std::{
 };
 
 use macroquad::{
+    input::utils,
     miniquad::{
-        CursorIcon, conf,
+        CursorIcon, EventHandler, KeyMods, conf,
         window::{order_quit, set_mouse_cursor},
     },
     prelude::*,
@@ -844,6 +845,74 @@ impl Dimensions {
 // Input handling
 // ---------------------------------------------------------------------------
 
+/// One keyboard event from macroquad's ordered input stream, with the
+/// modifiers held when it happened.
+enum KeyInput {
+    Down {
+        keycode: KeyCode,
+        mods: key::Mods,
+        repeat: bool,
+    },
+    Up {
+        keycode: KeyCode,
+        mods: key::Mods,
+    },
+    Char(char),
+}
+
+/// Collects the keyboard events macroquad replays to an input subscriber
+/// (`utils::repeat_all_miniquad_input`), in the order they happened.
+#[derive(Default)]
+struct KeyEvents(Vec<KeyInput>);
+
+impl EventHandler for KeyEvents {
+    fn update(&mut self) {}
+    fn draw(&mut self) {}
+    fn key_down_event(&mut self, keycode: KeyCode, keymods: KeyMods, repeat: bool) {
+        self.0.push(KeyInput::Down {
+            keycode,
+            mods: mods_from(keymods),
+            repeat,
+        });
+    }
+    fn key_up_event(&mut self, keycode: KeyCode, keymods: KeyMods) {
+        self.0.push(KeyInput::Up {
+            keycode,
+            mods: mods_from(keymods),
+        });
+    }
+    fn char_event(&mut self, character: char, _keymods: KeyMods, _repeat: bool) {
+        self.0.push(KeyInput::Char(character));
+    }
+}
+
+fn mods_from(keymods: KeyMods) -> key::Mods {
+    let mut mods = key::Mods::empty();
+    if keymods.shift {
+        mods |= key::Mods::SHIFT;
+    }
+    if keymods.alt {
+        mods |= key::Mods::ALT;
+    }
+    if keymods.ctrl {
+        mods |= key::Mods::CTRL;
+    }
+    if keymods.logo {
+        mods |= key::Mods::SUPER;
+    }
+    mods
+}
+
+/// A key press (or repeat) waiting for the characters the platform sends
+/// after it.
+struct PendingKey {
+    action: key::Action,
+    key: Key,
+    ucp: char,
+    mods: key::Mods,
+    text: String,
+}
+
 struct Input<'alloc> {
     key_encoder: key::Encoder<'alloc>,
     key_event: key::Event<'alloc>,
@@ -857,6 +926,21 @@ struct Input<'alloc> {
     swallowed: Vec<KeyCode>,
     /// A font-size shortcut still held, which keeps stepping.
     held: Option<shortcuts::Held>,
+    /// Our subscription to macroquad's ordered input event stream.
+    input_subscriber: usize,
+    /// This frame's keyboard events, reused between frames.
+    key_events: KeyEvents,
+    /// The key pressed last, waiting for the characters it produces.
+    pending_key: Option<PendingKey>,
+    /// Whether characters are dropped until the next key press, because
+    /// they belong to a shortcut or a Cmd chord.
+    drop_chars: bool,
+    /// Whether the platform reports a key's character just before its key
+    /// press (X11) rather than just after it (Windows, macOS, Wayland).
+    /// `None` until the first plain letter shows which.
+    chars_before_keys: Option<bool>,
+    /// On X11, characters waiting for the key press they belong to.
+    lead_text: String,
 }
 impl<'alloc> Input<'alloc> {
     fn new() -> Result<Self> {
@@ -870,147 +954,146 @@ impl<'alloc> Input<'alloc> {
             actions: Vec::new(),
             swallowed: Vec::new(),
             held: None,
+            input_subscriber: utils::register_input_subscriber(),
+            key_events: KeyEvents::default(),
+            pending_key: None,
+            drop_chars: false,
+            // miniquad doesn't say whether it ended up on Wayland or X11.
+            chars_before_keys: if cfg!(target_os = "linux") {
+                None
+            } else {
+                Some(false)
+            },
+            lead_text: String::new(),
         })
     }
 
-    /// Poll macroquad for keyboard events and use the libghostty key encoder
-    /// to produce the correct VT escape sequences, which are then written
-    /// to the pty.  The encoder respects terminal modes (cursor key
-    /// application mode, Kitty keyboard protocol, etc.) so we don't need
-    /// to maintain our own escape-sequence tables.
+    /// Read this frame's keyboard events from macroquad's ordered event
+    /// stream and use the libghostty key encoder to produce the correct VT
+    /// escape sequences, which are then written to the pty. The encoder
+    /// respects terminal modes (cursor key application mode, Kitty keyboard
+    /// protocol, etc.) so we don't need to maintain our own escape-sequence
+    /// tables.
+    ///
+    /// The stream keeps the order in which keys and characters happened, and
+    /// marks auto-repeat. Polling key state instead (is_key_pressed) loses
+    /// both: macroquad never reports a repeat as a press, so held non-text
+    /// keys didn't repeat, and a frame's characters couldn't be matched to
+    /// the keys that produced them, so they could be dropped or reordered.
     fn handle_keyboard_input(&mut self, terminal: &Terminal<'alloc, '_>) -> Result<()> {
-        // Drain printable characters from macroquad's input queue.  We collect
-        // them into a single UTF-8 buffer so the encoder can attach text
-        // to the key event.
-        let mut chars_pressed = Vec::<char>::with_capacity(4);
-        while let Some(ch) = get_char_pressed() {
-            // Windows also reports Ctrl+letter, Enter, Tab and Backspace as
-            // control characters (Ctrl+C as U+0003). Given those as text, the
-            // encoder emits CSI u (Ctrl+C becomes ESC[3;5u) instead of the
-            // control byte, and ConPTY doesn't treat that as Ctrl+C. The
-            // encoder derives control bytes from the key and mods anyway.
-            if !ch.is_control() {
-                chars_pressed.push(ch);
-            }
-        }
-        let mut text: String = chars_pressed.into_iter().collect();
+        // macroquad also queues characters for get_char_pressed and never
+        // clears that queue itself. tai reads the stream instead, so empty it.
+        while get_char_pressed().is_some() {}
 
-        // While a shortcut's key is held, the platform keeps producing its
-        // text on key repeat (holding Cmd+= repeats "=") without a new key
-        // press. Drop it so it can't reach the shell through the fallback
-        // at the end. Repeats queued during a slow frame (a font reload)
-        // can arrive with the key's release, so count that frame too.
-        if self
-            .swallowed
-            .iter()
-            .any(|&k| is_key_down(k) || is_key_released(k))
-        {
-            text.clear();
+        let mut events = std::mem::take(&mut self.key_events);
+        utils::repeat_all_miniquad_input(&mut events, self.input_subscriber);
+        if self.chars_before_keys.is_none() {
+            self.chars_before_keys = Self::char_order(&events.0);
         }
+        let chars_before_keys = self.chars_before_keys == Some(true);
+        for event in events.0.drain(..) {
+            match event {
+                KeyInput::Down {
+                    keycode,
+                    mods,
+                    repeat,
+                } => {
+                    self.flush_pending_key(terminal)?;
+                    // On X11 the key's character came just before it.
+                    let lead = std::mem::take(&mut self.lead_text);
 
-        // On macOS a Cmd chord is never terminal input, but the platform
-        // still reports its character ("=" for Cmd+=). Drop it.
-        if cfg!(target_os = "macos") && Self::keyboard_mods().contains(key::Mods::SUPER) {
-            text.clear();
-        }
+                    // A shortcut's key held down: its repeats, and the text
+                    // the platform produces for them ("=" for Ctrl+=), never
+                    // reach the pty. The held step timer below handles them.
+                    if self.swallowed.contains(&keycode) {
+                        self.drop_chars = true;
+                        continue;
+                    }
+                    if !repeat
+                        && let Some(shortcut) =
+                            shortcuts::action_for(keycode, mods, cfg!(target_os = "macos"))
+                    {
+                        self.actions.push(shortcut);
+                        self.swallowed.push(keycode);
+                        if shortcuts::repeats(shortcut) {
+                            self.held =
+                                Some(shortcuts::Held::new(keycode, shortcut, Instant::now()));
+                        }
+                        self.drop_chars = true;
+                        continue;
+                    }
 
-        for (kc, key, ucp) in Self::ALL_KEYS {
-            // App shortcuts never reach the pty: not the press, not any text
-            // the platform produced for it, and not the matching release.
-            // Check the press first: a quick tap can press and release a key
-            // within one frame, and treating that as a release alone would
-            // miss the shortcut and leak its text.
-            if is_key_pressed(kc)
-                && let Some(shortcut) =
-                    shortcuts::action_for(kc, Self::keyboard_mods(), cfg!(target_os = "macos"))
-            {
-                self.actions.push(shortcut);
-                if !is_key_released(kc) {
-                    self.swallowed.push(kc);
-                    if shortcuts::repeats(shortcut) {
-                        self.held = Some(shortcuts::Held::new(kc, shortcut, Instant::now()));
+                    // On macOS a Cmd chord is never terminal input, but the
+                    // platform still reports its character ("=" for Cmd+=).
+                    self.drop_chars = cfg!(target_os = "macos") && mods.contains(key::Mods::SUPER);
+
+                    let lead = if self.drop_chars { String::new() } else { lead };
+
+                    // A key tai has no mapping for: its character, if any,
+                    // goes to the pty as plain text.
+                    let Some((key, ucp)) = Self::key_for(keycode) else {
+                        self.response.extend_from_slice(lead.as_bytes());
+                        continue;
+                    };
+                    self.pending_key = Some(PendingKey {
+                        action: if repeat {
+                            key::Action::Repeat
+                        } else {
+                            key::Action::Press
+                        },
+                        key,
+                        ucp,
+                        mods,
+                        text: lead,
+                    });
+                }
+                KeyInput::Up { keycode, mods } => {
+                    self.flush_pending_key(terminal)?;
+                    self.flush_lead_text();
+                    // The release of a shortcut's key is swallowed like its press.
+                    if let Some(i) = self.swallowed.iter().position(|&k| k == keycode) {
+                        self.swallowed.swap_remove(i);
+                        continue;
+                    }
+                    if let Some((key, ucp)) = Self::key_for(keycode) {
+                        self.encode_key(terminal, key::Action::Release, key, ucp, mods, None)?;
                     }
                 }
-                text.clear();
-                continue;
-            }
-
-            let action = if is_key_released(kc) {
-                key::Action::Release
-            } else if is_key_pressed(kc) {
-                key::Action::Press
-            } else {
-                continue;
-            };
-
-            // Conditionally attach any UTF-8 text that macroquad produced for this frame.
-            // For unmodified printable keys this is the character itself;
-            // for special keys or ctrl combos there's typically no text.
-            // Release events never carry text.
-            let maybe_text = if !text.is_empty() && !is_key_released(kc) {
-                Some(text.as_str())
-            } else {
-                None
-            };
-
-            let mods = Self::keyboard_mods();
-
-            // The release of a shortcut's key is swallowed like its press.
-            if action == key::Action::Release
-                && let Some(i) = self.swallowed.iter().position(|&k| k == kc)
-            {
-                self.swallowed.swap_remove(i);
-                continue;
-            }
-
-            // Windows reports AltGr as Ctrl+Alt. When it produced a character
-            // (AltGr+2 gives '@' on Swiss and German layouts), that character
-            // is the input: with Ctrl+Alt left in, the encoder sends ESC NUL
-            // or a CSI u sequence instead. Marking them consumed isn't
-            // enough (it sends NUL), so drop them.
-            #[cfg(windows)]
-            let mods = if maybe_text.is_some() && mods.contains(key::Mods::CTRL | key::Mods::ALT) {
-                mods - (key::Mods::CTRL | key::Mods::ALT)
-            } else {
-                mods
-            };
-
-            // Consumed mods are modifiers the platform's text input
-            // already accounted for when producing the UTF-8 text.
-            // For printable keys, shift is consumed (it turns 'a' → 'A').
-            // For non-printable keys nothing is consumed.
-            let mut consumed = key::Mods::empty();
-            if ucp != '\0' && mods.contains(key::Mods::SHIFT) {
-                consumed |= key::Mods::SHIFT;
-            }
-
-            self.key_event
-                .set_action(action)
-                .set_key(key)
-                .set_mods(mods)
-                .set_consumed_mods(consumed)
-                // The unshifted codepoint is the character the key produces
-                // with no modifiers.  The Kitty protocol needs it to identify
-                // keys independent of the current shift state.
-                .set_unshifted_codepoint(ucp)
-                .set_utf8(maybe_text);
-
-            if maybe_text.is_some() {
-                text.clear();
-            }
-
-            self.key_encoder
-                // Sync encoder options from the terminal so mode changes (e.g.
-                // application cursor keys, Kitty keyboard protocol) are honoured.
-                .set_options_from_terminal(terminal)
-                .encode_to_vec(&self.key_event, &mut self.response)?;
-
-            if !self.response.is_empty() {
-                // Text was consumed by the encoder — clear it so the
-                // fallback below doesn't double-send.
-                text.clear();
+                KeyInput::Char(ch) => {
+                    // Windows also reports Ctrl+letter, Enter, Tab and
+                    // Backspace as control characters (Ctrl+C as U+0003).
+                    // Given those as text, the encoder emits CSI u (Ctrl+C
+                    // becomes ESC[3;5u) instead of the control byte, and
+                    // ConPTY doesn't treat that as Ctrl+C. The encoder
+                    // derives control bytes from the key and mods anyway.
+                    if ch.is_control() {
+                        continue;
+                    }
+                    if chars_before_keys {
+                        self.lead_text.push(ch);
+                        continue;
+                    }
+                    if self.drop_chars {
+                        continue;
+                    }
+                    match &mut self.pending_key {
+                        // The character belongs to the key just pressed.
+                        Some(pending) => pending.text.push(ch),
+                        // No key to attach it to: an unmapped key, or a
+                        // character that arrived a frame after its key (seen
+                        // in VMs). Write it as it is.
+                        None => {
+                            let mut buf = [0u8; 4];
+                            self.response
+                                .extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                }
             }
         }
+        self.flush_pending_key(terminal)?;
+        self.flush_lead_text();
+        self.key_events = events;
 
         // A held font-size shortcut keeps stepping, as in Ghostty, until its
         // key is released or the modifiers no longer make the same chord.
@@ -1027,15 +1110,125 @@ impl<'alloc> Input<'alloc> {
                 self.actions.push(held.action);
             }
         }
+        Ok(())
+    }
 
-        // Fallback: on some platforms (e.g. VMs) the character event arrives
-        // a frame after the key-press event.  If we collected UTF-8 text but
-        // no key event consumed it, write it directly to the PTY so input
-        // isn't silently dropped.
-        if !text.is_empty() {
+    /// Characters with no key press after them (a key reported only as a
+    /// character): write them as they are.
+    fn flush_lead_text(&mut self) {
+        self.response.extend_from_slice(self.lead_text.as_bytes());
+        self.lead_text.clear();
+    }
+
+    /// Learn from the first plain letter whether characters come just
+    /// before their key press (Some(true)) or just after it (Some(false)).
+    fn char_order(events: &[KeyInput]) -> Option<bool> {
+        let is_char_of = |event: Option<&KeyInput>, ucp: char| matches!(event, Some(KeyInput::Char(ch)) if ch.to_ascii_lowercase() == ucp);
+        events.iter().enumerate().find_map(|(i, event)| {
+            let KeyInput::Down {
+                keycode,
+                mods,
+                repeat: false,
+            } = event
+            else {
+                return None;
+            };
+            let (_, ucp) = Self::key_for(*keycode)?;
+            if !ucp.is_ascii_lowercase() || !key::Mods::SHIFT.contains(*mods) {
+                return None;
+            }
+            if i > 0 && is_char_of(events.get(i - 1), ucp) {
+                Some(true)
+            } else if is_char_of(events.get(i + 1), ucp) {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Encode the key pressed last, with the characters that followed it.
+    fn flush_pending_key(&mut self, terminal: &Terminal<'alloc, '_>) -> Result<()> {
+        let Some(pending) = self.pending_key.take() else {
+            return Ok(());
+        };
+        let text = (!pending.text.is_empty()).then_some(pending.text.as_str());
+
+        // Windows reports AltGr as Ctrl+Alt. When it produced a character
+        // (AltGr+2 gives '@' on Swiss and German layouts), that character is
+        // the input: with Ctrl+Alt left in, the encoder sends ESC NUL or a
+        // CSI u sequence instead. Marking them consumed isn't enough (it
+        // sends NUL), so drop them.
+        #[cfg(windows)]
+        let mods = if text.is_some() && pending.mods.contains(key::Mods::CTRL | key::Mods::ALT) {
+            pending.mods - (key::Mods::CTRL | key::Mods::ALT)
+        } else {
+            pending.mods
+        };
+        #[cfg(not(windows))]
+        let mods = pending.mods;
+
+        let before = self.response.len();
+        self.encode_key(
+            terminal,
+            pending.action,
+            pending.key,
+            pending.ucp,
+            mods,
+            text,
+        )?;
+        // A key the encoder has no sequence for still typed its text.
+        if self.response.len() == before
+            && let Some(text) = text
+        {
             self.response.extend_from_slice(text.as_bytes());
         }
         Ok(())
+    }
+
+    fn encode_key(
+        &mut self,
+        terminal: &Terminal<'alloc, '_>,
+        action: key::Action,
+        key: Key,
+        ucp: char,
+        mods: key::Mods,
+        text: Option<&str>,
+    ) -> Result<()> {
+        // Consumed mods are modifiers the platform's text input
+        // already accounted for when producing the UTF-8 text.
+        // For printable keys, shift is consumed (it turns 'a' → 'A').
+        // For non-printable keys nothing is consumed.
+        let mut consumed = key::Mods::empty();
+        if ucp != '\0' && mods.contains(key::Mods::SHIFT) {
+            consumed |= key::Mods::SHIFT;
+        }
+
+        self.key_event
+            .set_action(action)
+            .set_key(key)
+            .set_mods(mods)
+            .set_consumed_mods(consumed)
+            // The unshifted codepoint is the character the key produces
+            // with no modifiers.  The Kitty protocol needs it to identify
+            // keys independent of the current shift state.
+            .set_unshifted_codepoint(ucp)
+            .set_utf8(text);
+
+        self.key_encoder
+            // Sync encoder options from the terminal so mode changes (e.g.
+            // application cursor keys, Kitty keyboard protocol) are honoured.
+            .set_options_from_terminal(terminal)
+            .encode_to_vec(&self.key_event, &mut self.response)?;
+        Ok(())
+    }
+
+    /// The libghostty key and unshifted codepoint for a macroquad key code.
+    fn key_for(keycode: KeyCode) -> Option<(Key, char)> {
+        Self::ALL_KEYS
+            .iter()
+            .find(|(kc, _, _)| *kc == keycode)
+            .map(|&(_, key, ucp)| (key, ucp))
     }
 
     /// Poll macroquad for mouse events and use the libghostty mouse encoder
