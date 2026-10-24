@@ -1212,6 +1212,8 @@ struct SelectionState<'alloc> {
     release_event: ReleaseEvent<'alloc>,
     drag_event: DragEvent<'alloc>,
     start_time: Instant,
+    /// The cursor last set, so it is only set again when it changes.
+    cursor: Cell<Option<CursorIcon>>,
 }
 
 impl SelectionState<'_> {
@@ -1225,6 +1227,7 @@ impl SelectionState<'_> {
             release_event: ReleaseEvent::new()?,
             drag_event: DragEvent::new()?,
             start_time: Instant::now(),
+            cursor: Cell::new(None),
         })
     }
 
@@ -1308,7 +1311,7 @@ impl SelectionState<'_> {
             && (self.is_selecting(terminal)? || Input::mouse_over_selectable_text(terminal, dims)?);
         let rectangle = Input::selection_rectangle_mods(Input::keyboard_mods());
 
-        set_mouse_cursor(if selectable {
+        let cursor = if selectable {
             if rectangle {
                 CursorIcon::Crosshair
             } else {
@@ -1316,7 +1319,15 @@ impl SelectionState<'_> {
             }
         } else {
             CursorIcon::Default
-        });
+        };
+        // On Windows set_mouse_cursor calls SetCursor right away. Doing that
+        // every frame overwrote the resize arrows Windows shows on the
+        // window border, so the cursor flickered and the border was hard
+        // to grab.
+        if self.cursor.get() != Some(cursor) {
+            set_mouse_cursor(cursor);
+            self.cursor.set(Some(cursor));
+        }
         Ok(())
     }
 }
