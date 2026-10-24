@@ -937,7 +937,7 @@ struct Input<'alloc> {
     drop_chars: bool,
     /// Whether the platform reports a key's character just before its key
     /// press (X11) rather than just after it (Windows, macOS, Wayland).
-    /// `None` until the first plain letter shows which.
+    /// `None` until the first letter key shows which.
     chars_before_keys: Option<bool>,
     /// On X11, characters waiting for the key press they belong to.
     lead_text: String,
@@ -1120,21 +1120,25 @@ impl<'alloc> Input<'alloc> {
         self.lead_text.clear();
     }
 
-    /// Learn from the first plain letter whether characters come just
-    /// before their key press (Some(true)) or just after it (Some(false)).
+    /// Learn from the first letter key whether characters come just before
+    /// their key press (Some(true)) or just after it (Some(false)). Any
+    /// modifiers count: on X11 Ctrl+C still reports 'c' just before the
+    /// press, and it is often the first key typed. Where Ctrl+C reports
+    /// U+0003 instead (Windows, Wayland) it doesn't match, and the order
+    /// stays unknown, which is treated as "after".
     fn char_order(events: &[KeyInput]) -> Option<bool> {
         let is_char_of = |event: Option<&KeyInput>, ucp: char| matches!(event, Some(KeyInput::Char(ch)) if ch.to_ascii_lowercase() == ucp);
         events.iter().enumerate().find_map(|(i, event)| {
             let KeyInput::Down {
                 keycode,
-                mods,
                 repeat: false,
+                ..
             } = event
             else {
                 return None;
             };
             let (_, ucp) = Self::key_for(*keycode)?;
-            if !ucp.is_ascii_lowercase() || !key::Mods::SHIFT.contains(*mods) {
+            if !ucp.is_ascii_lowercase() {
                 return None;
             }
             if i > 0 && is_char_of(events.get(i - 1), ucp) {
