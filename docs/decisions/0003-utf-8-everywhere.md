@@ -44,6 +44,27 @@ error, and that is the shape of the problem.
 inherits everything else, including whatever locale tai was started with.
 The Windows child gets `COLORTERM`. tai sets no locale variables.
 
+**What the macOS session observed (macOS 12.7.6, 2026-10-24):**
+
+- GUI launches carry no locale. `launchctl getenv` for `LANG`, `LC_ALL`
+  and `LC_CTYPE` is empty, and neither Finder nor a Dock-launched iTerm2 has
+  any of them in its environment. A tai started that way (simulated with
+  `env -i`) gave its shell no `LANG` or `LC_*`. An interactive zsh fixes
+  that from the user's `.zshrc`, but anything tai spawns directly, such as
+  `ppxai-server`, would run in the C locale.
+- The system-derived value can be invalid. With `AppleLocale=en_CH`,
+  Ghostty's `setLangFromCocoa` builds `en_CH.UTF-8`, which macOS 12 doesn't
+  have (no `/usr/share/locale/en_CH*`). `locale` then reports
+  `LC_CTYPE="C"`. Ghostty recovers only through the later steps of
+  `ensureLocale`: `setlocale` fails, so it unsets `LANG`, retries, and
+  falls back to `en_US.UTF-8`. Mismatches between region and language like
+  `en_CH` are common.
+- A tai started from another terminal passes that terminal's identity on
+  (`TERM_PROGRAM=iTerm.app`, `TERM_PROGRAM_VERSION`, `LC_TERMINAL`,
+  `TERM_SESSION_ID`, `TERMINFO_DIRS`). Programs in tai may then use
+  iTerm2-only sequences such as OSC 1337. Ghostty overwrites
+  `TERM_PROGRAM` with its own value.
+
 ## Decision (proposed)
 
 1. **UTF-8 is tai's only encoding,** on the PTY, the clipboard (on Windows the
@@ -54,9 +75,10 @@ The Windows child gets `COLORTERM`. tai sets no locale variables.
    of `LC_ALL`, `LC_CTYPE` and `LANG`:
    - If it names UTF-8 (`UTF-8` or `utf8`, any case), leave everything
      alone.
-   - If none is set, then on macOS set `LANG` from the system's preferred
-     locale as Ghostty does, falling back to `en_US.UTF-8`. On Linux set
-     `LC_CTYPE=C.UTF-8`.
+   - If none is set, then on macOS build `LANG` from the system's preferred
+     locale as Ghostty does, but **validate it** and keep Ghostty's whole
+     fallback chain (drop the value, retry, then `en_US.UTF-8`). On Linux
+     set `LC_CTYPE=C.UTF-8`.
    - If `LANG` or `LC_CTYPE` names a non-UTF-8 locale, set `LC_CTYPE` to
      the UTF-8 variant of the same locale if the system has it, otherwise
      to `C.UTF-8` (Linux) or `UTF-8` (macOS). `LANG` and the other
@@ -110,6 +132,13 @@ The Windows child gets `COLORTERM`. tai sets no locale variables.
   need `objc2` or a `defaults read -g AppleLocale` call.
 
 ## Open questions
+
+- Should tai set `TERM_PROGRAM=tai` (and `TERM_PROGRAM_VERSION`) and drop
+  an inherited `LC_TERMINAL*` and `TERM_SESSION_ID`, as Ghostty does for
+  `TERM_PROGRAM`? It isn't an encoding question, but it's the same
+  "what environment does the child get" decision.
+- The sensed locale must also reach children tai spawns without a shell,
+  such as `ppxai-server` (ADR 0001).
 
 - Should tai's user configuration (when it has one) be able to override
   the sensed locale, as Ghostty's `language` option does on GTK?
