@@ -19,9 +19,15 @@ On 2026-10-24 a debug tai on Windows froze ("Not Responding", one core at
 Every stack sample was `linefeed` → `PageList.grow` →
 `Page.assertIntegrity` → `verifyIntegrity` → `lookupHyperlink`.
 
-`.cargo/config.toml` sets `LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseSafe"`,
-which the build script honours over `DEBUG`. ReleaseSafe keeps Zig's
-safety checks (bounds, overflow) but not `slow_runtime_safety`. To debug
-libghostty-vt itself, override it for one build:
+`scripts/cargo.sh` exports `LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseSafe` unless
+the build is `--release` (or `--profile release*`). The build script honours
+that variable over `DEBUG`, and applies it to every profile, which is why
+it isn't set in `.cargo/config.toml`: there it would also turn release
+builds from ReleaseFast into ReleaseSafe. ReleaseSafe keeps Zig's safety
+checks (bounds, overflow) but not `slow_runtime_safety`. Plain `cargo`
+skips the wrapper and gets the Debug mode back.
+
+tai logs the mode at startup: `tai | simd: enabled, optimize: ReleaseSafe`.
+To debug libghostty-vt itself, override it for one build:
 `LIBGHOSTTY_VT_SYS_OPTIMIZE=Debug scripts/cargo.sh build`, and expect
 heavy output to be slow.
