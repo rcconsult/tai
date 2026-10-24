@@ -1069,13 +1069,16 @@ impl<'alloc> Input<'alloc> {
         let rows = terminal.rows()?;
         let (xpos, ypos) = mouse_position();
 
+        // Clamp to the last cell, not one past it: grid_ref rejects x == cols
+        // or y == rows with InvalidValue, and the right and bottom padding
+        // (where a window-corner drag starts) map there.
         let x = if xpos > PADDING {
-            ((xpos - PADDING) / dims.cell_width).clamp(0.0, cols as f32) as u16
+            ((xpos - PADDING) / dims.cell_width).clamp(0.0, cols.saturating_sub(1) as f32) as u16
         } else {
             0
         };
         let y = if ypos > PADDING {
-            ((ypos - PADDING) / dims.cell_height).clamp(0.0, rows as f32) as u32
+            ((ypos - PADDING) / dims.cell_height).clamp(0.0, rows.saturating_sub(1) as f32) as u32
         } else {
             0
         };
