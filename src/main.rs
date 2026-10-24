@@ -67,6 +67,92 @@ mod shortcuts;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Whether `TAI_APPLE_GFX=metal` asks for Metal. Other platforms ignore it.
+fn use_metal() -> bool {
+    cfg!(target_vendor = "apple") && std::env::var("TAI_APPLE_GFX").as_deref() == Ok("metal")
+}
+
+/// A material that copies a texture to the screen without blending.
+///
+/// Drawing a glyph into the frame's render target blends the alpha channel
+/// too, which leaves alpha below 1 on antialiased edges. Presenting that
+/// texture with macroquad's default alpha blending then mixes those edges
+/// with the back buffer and darkens them. The shaders are macroquad's
+/// default ones (vendor/macroquad/src/quad_gl.rs, `shader` module).
+fn present_material() -> Result<Material> {
+    const VERTEX: &str = r#"#version 100
+    attribute vec3 position;
+    attribute vec2 texcoord;
+    attribute vec4 color0;
+
+    varying lowp vec2 uv;
+    varying lowp vec4 color;
+
+    uniform mat4 Model;
+    uniform mat4 Projection;
+
+    void main() {
+        gl_Position = Projection * Model * vec4(position, 1);
+        color = color0 / 255.0;
+        uv = texcoord;
+    }"#;
+    const FRAGMENT: &str = r#"#version 100
+    varying lowp vec4 color;
+    varying lowp vec2 uv;
+
+    uniform sampler2D Texture;
+
+    void main() {
+        gl_FragColor = color * texture2D(Texture, uv);
+    }"#;
+    const METAL: &str = r#"#include <metal_stdlib>
+    using namespace metal;
+
+    struct Uniforms
+    {
+        float4x4 Model;
+        float4x4 Projection;
+    };
+
+    struct Vertex
+    {
+        float3 position    [[attribute(0)]];
+        float2 texcoord    [[attribute(1)]];
+        float4 color0      [[attribute(2)]];
+    };
+
+    struct RasterizerData
+    {
+        float4 position [[position]];
+        float4 color [[user(locn0)]];
+        float2 uv [[user(locn1)]];
+    };
+
+    vertex RasterizerData vertexShader(Vertex v [[stage_in]], constant Uniforms& uniforms [[buffer(0)]])
+    {
+        RasterizerData out;
+        out.position = uniforms.Model * uniforms.Projection * float4(v.position, 1);
+        out.color = v.color0 / 255.0;
+        out.uv = v.texcoord;
+        return out;
+    }
+
+    fragment float4 fragmentShader(RasterizerData in [[stage_in]], texture2d<float> tex [[texture(0)]], sampler texSmplr [[sampler(0)]])
+    {
+        return in.color * tex.sample(texSmplr, in.uv);
+    }"#;
+    let shader = if use_metal() {
+        ShaderSource::Msl { program: METAL }
+    } else {
+        ShaderSource::Glsl {
+            vertex: VERTEX,
+            fragment: FRAGMENT,
+        }
+    };
+    // The default pipeline params have blending off.
+    Ok(load_material(shader, MaterialParams::default())?)
+}
+
 // ---------------------------------------------------------------------------
 // Adjustable constants for the renderer. All of these are chosen empirically,
 // so feel free to tweak and tune these settings to your liking :)
@@ -405,6 +491,9 @@ struct Renderer<'alloc> {
     /// The last drawn frame, kept in a texture so a frame where nothing
     /// changed only copies it to the screen instead of drawing every cell.
     frame: Option<Frame>,
+    /// Copies the frame to the screen with blending off. See
+    /// [`present_material`].
+    present_material: Material,
 }
 
 /// A drawn terminal frame and what it was drawn from.
@@ -424,6 +513,7 @@ impl<'alloc> Renderer<'alloc> {
             cell_it: CellIterator::new()?,
             placement_it: PlacementIterator::new()?,
             frame: None,
+            present_material: present_material()?,
         })
     }
 
@@ -473,7 +563,7 @@ impl<'alloc> Renderer<'alloc> {
                 .is_some_and(|f| f.dims == dims && f.cursor == cursor);
         if unchanged {
             if let Some(frame) = &self.frame {
-                Self::present(frame);
+                Self::present(frame, &self.present_material);
             }
             return Ok(());
         }
@@ -721,13 +811,14 @@ impl<'alloc> Renderer<'alloc> {
 
         set_default_camera();
         if let Some(frame) = &self.frame {
-            Self::present(frame);
+            Self::present(frame, &self.present_material);
         }
         Ok(())
     }
 
     /// Copy a drawn frame to the screen.
-    fn present(frame: &Frame) {
+    fn present(frame: &Frame, material: &Material) {
+        gl_use_material(material);
         draw_texture_ex(
             &frame.target.texture,
             0.0,
@@ -738,6 +829,7 @@ impl<'alloc> Renderer<'alloc> {
                 ..Default::default()
             },
         );
+        gl_use_default_material();
     }
 
     fn render_kitty_images<'t>(
@@ -1829,9 +1921,10 @@ impl SelectionState<'_> {
 /// Metal stays opt-in: on the macOS dev host it leaked GPU memory steadily
 /// (about 1.2 MB/s while htop redrew) where OpenGL stayed flat.
 fn macroquad_conf() -> Conf {
-    let apple_gfx_api = match std::env::var("TAI_APPLE_GFX").as_deref() {
-        Ok("metal") => conf::AppleGfxApi::Metal,
-        _ => conf::AppleGfxApi::OpenGl,
+    let apple_gfx_api = if use_metal() {
+        conf::AppleGfxApi::Metal
+    } else {
+        conf::AppleGfxApi::OpenGl
     };
     Conf {
         window_title: "tai".to_owned(),
