@@ -7,7 +7,6 @@
 //! `read` reports end of stream once the waiter has seen the exit.
 
 use std::{
-    ffi::OsString,
     io::{Read, Write},
     path::PathBuf,
     sync::{
@@ -195,14 +194,28 @@ fn pty_size(dims: Dimensions) -> PtySize {
     }
 }
 
-fn default_shell() -> OsString {
-    let on_path = std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("pwsh.exe").is_file()));
-    if on_path {
-        return "pwsh.exe".into();
+/// Always an absolute path: given a bare name, portable-pty and
+/// CreateProcessW would also look in the current directory and next to
+/// tai.exe, so a planted pwsh.exe or cmd.exe there would run instead.
+fn default_shell() -> PathBuf {
+    let pwsh = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join("pwsh.exe"))
+            .find(|exe| exe.is_file())
+    });
+    if let Some(pwsh) = pwsh {
+        return pwsh;
     }
-    match std::env::var_os("COMSPEC") {
-        Some(comspec) if !comspec.is_empty() => comspec,
-        _ => PathBuf::from("cmd.exe").into_os_string(),
+    if let Some(comspec) = std::env::var_os("COMSPEC").map(PathBuf::from)
+        && comspec.is_absolute()
+        && comspec.is_file()
+    {
+        return comspec;
     }
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join(r"System32\cmd.exe")
 }
