@@ -11,8 +11,9 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        mpsc::{self, Receiver, TryRecvError},
+        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
     },
+    time::Duration,
 };
 
 use libghostty_vt::Terminal;
@@ -29,6 +30,8 @@ pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Mutex<Box<dyn Write + Send>>,
     output: Receiver<Chunk>,
+    /// A chunk wait_readable took from `output`, for the next read.
+    waited: Mutex<Option<Chunk>>,
     exit: Arc<OnceLock<ExitStatus>>,
 }
 
@@ -101,6 +104,7 @@ impl Pty {
             master: pair.master,
             writer: Mutex::new(writer),
             output,
+            waited: Mutex::new(None),
             exit: Arc::clone(&exit),
         };
         Ok((pty, Child::Active(Handle { killer, exit })))
@@ -108,6 +112,12 @@ impl Pty {
 
     /// Feed all output received so far into the ghostty terminal.
     pub fn read(&self, term: &mut Terminal) -> Result<(), PtyError> {
+        if let Some(chunk) = self.waited.lock().ok().and_then(|mut w| w.take()) {
+            match chunk {
+                Ok(data) => term.vt_write(&data),
+                Err(e) => return Err(PtyError::OtherError(e)),
+            }
+        }
         loop {
             match self.output.try_recv() {
                 Ok(Ok(data)) => term.vt_write(&data),
@@ -123,10 +133,22 @@ impl Pty {
         }
     }
 
-    /// Wait until output is available, or `timeout` passes. Not implemented
-    /// on Windows yet: it returns at once, so input is echoed a frame later
-    /// than on Unix.
-    pub fn wait_readable(&self, _timeout: std::time::Duration) {}
+    /// Wait until output is available, or `timeout` passes. The reader
+    /// thread's channel has no peek, so a chunk that arrives is kept for
+    /// the next read.
+    pub fn wait_readable(&self, timeout: Duration) {
+        let Ok(mut waited) = self.waited.lock() else {
+            return;
+        };
+        if waited.is_some() {
+            return;
+        }
+        match self.output.recv_timeout(timeout) {
+            Ok(chunk) => *waited = Some(chunk),
+            // read() reports a closed channel.
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+        }
+    }
 
     /// Best-effort write to the pseudo console. Errors drop the data, as on
     /// Unix.
