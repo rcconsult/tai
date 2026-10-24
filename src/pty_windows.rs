@@ -51,6 +51,12 @@ impl Pty {
             cmd.cwd(dir);
         }
         cmd.env("COLORTERM", "truecolor");
+        // Give the shell default Ctrl+C handling. The "ignore Ctrl+C" flag is
+        // inherited, so if whatever launched tai set it, ConPTY would never
+        // turn the 0x03 we write into a CTRL_C_EVENT and Ctrl+C would never
+        // interrupt anything in the shell. The Unix mod pty resets SIGINT
+        // for the same reason.
+        allow_ctrl_c();
         let mut child = pair
             .slave
             .spawn_command(cmd)
@@ -191,6 +197,21 @@ fn pty_size(dims: Dimensions) -> PtySize {
         cols,
         pixel_width: (dims.window_width * dims.dpi_scale) as u16,
         pixel_height: (dims.window_height * dims.dpi_scale) as u16,
+    }
+}
+
+/// Clear this process's inherited "ignore Ctrl+C" flag, which children
+/// inherit in turn.
+#[allow(unsafe_code)]
+fn allow_ctrl_c() {
+    // SAFETY: with a null handler, SetConsoleCtrlHandler only sets the
+    // process's ignore flag; it touches no memory of ours.
+    let ok = unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) };
+    if ok == 0 {
+        tracing::warn!(
+            "SetConsoleCtrlHandler failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
