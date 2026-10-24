@@ -798,7 +798,14 @@ impl<'alloc> Input<'alloc> {
         // to the key event.
         let mut chars_pressed = Vec::<char>::with_capacity(4);
         while let Some(ch) = get_char_pressed() {
-            chars_pressed.push(ch);
+            // Windows also reports Ctrl+letter, Enter, Tab and Backspace as
+            // control characters (Ctrl+C as U+0003). Given those as text, the
+            // encoder emits CSI u (Ctrl+C becomes ESC[3;5u) instead of the
+            // control byte, and ConPTY doesn't treat that as Ctrl+C. The
+            // encoder derives control bytes from the key and mods anyway.
+            if !ch.is_control() {
+                chars_pressed.push(ch);
+            }
         }
         let mut text: String = chars_pressed.into_iter().collect();
 
