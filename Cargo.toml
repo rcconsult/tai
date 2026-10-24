@@ -11,9 +11,15 @@ publish = false
 libghostty-vt = { version = "=0.2.2", features = ["tracing"] }
 # Keep the `audio` feature off: it needs libasound2-dev on Linux and tai has no sound.
 macroquad = { version = "0.4.14", default-features = false }
-nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user", "ioctl"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user", "ioctl"] }
+
+# ConPTY on Windows (ADR 0002).
+[target.'cfg(windows)'.dependencies]
+portable-pty = "0.9.0"
 
 # miniquad's macOS clipboard is a stub (get returns None, set does nothing),
 # so macOS uses arboard. Text only: no image support.

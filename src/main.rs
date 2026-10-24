@@ -30,7 +30,6 @@ use macroquad::{
     },
     prelude::*,
 };
-use nix::sys::wait;
 
 use libghostty_vt::{
     Terminal, TerminalOptions,
@@ -57,6 +56,9 @@ use crate::pty::{Child, Pty, PtyError};
 use crate::shortcuts::Action;
 
 mod clipboard;
+#[cfg(windows)]
+#[path = "pty_windows.rs"]
+mod pty;
 mod shortcuts;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -251,7 +253,7 @@ async fn main() -> Result<()> {
             .update_mouse_cursor(&terminal, dims, matches!(child, Child::Active(_)))?;
 
         match child {
-            Child::Active(pid) => {
+            Child::Active(_) => {
                 // Forward keyboard/mouse input only while the child is alive.
                 input.handle_keyboard_input(&terminal)?;
                 input.handle_mouse_input(&mut terminal, dims)?;
@@ -290,12 +292,12 @@ async fn main() -> Result<()> {
                     Ok(_) => {}
                     Err(PtyError::EndOfStream) => {
                         // EOF — the child's side of the pty is closed.
-                        child = Child::Exited(pid);
+                        child.mark_exited();
                     }
                     Err(PtyError::OtherError(e)) => {
                         // Other error — the child's side of the pty is closed.
                         tracing::error!("failed to read from pty: {e}");
-                        child = Child::Exited(pid);
+                        child.mark_exited();
                     }
                 }
             }
@@ -304,15 +306,13 @@ async fn main() -> Result<()> {
             // EOF can arrive before the child is waitable, so a single
             // WNOHANG attempt right at EOF may miss.  We also check for
             // signal death so the banner can report it properly.
-            Child::Exited(pid) => {
-                if let Ok(wp) = wait::waitpid(pid, Some(wait::WaitPidFlag::WNOHANG)) {
-                    child = Child::Reaped(wp);
-                }
+            Child::Exited(_) => {
+                child.try_reap();
                 // FIXME: For some reason the child isn't being reaped properly.
                 // Let's just unconditionally quit for now.
                 order_quit();
             }
-            Child::Reaped(status) => {
+            Child::Reaped(ref status) => {
                 tracing::info!("Child process exited: {status:?}");
                 order_quit();
             }
@@ -745,6 +745,7 @@ impl Dimensions {
         self.window_height = screen_height();
         true
     }
+    #[cfg(unix)]
     fn to_winsize(self) -> nix::pty::Winsize {
         let (cols, rows) = self.grid_size();
         nix::pty::Winsize {
@@ -1374,6 +1375,10 @@ impl DecodePng for PngDecoder {
 /// Of course, you could just use any off-the-shelf PTY crate on crates.io,
 /// but we'd like to keep this demo self-contained using minimal dependencies,
 /// so here you go.
+///
+/// Windows has no forkpty; `pty_windows.rs` implements the same interface
+/// on ConPTY (ADR 0002).
+#[cfg(unix)]
 mod pty {
     // Unfortunately, there will be some unsafe shenanigans here.
     #![allow(unsafe_code)]
@@ -1548,6 +1553,24 @@ mod pty {
         Active(Pid),
         Exited(Pid),
         Reaped(wait::WaitStatus),
+    }
+
+    impl Child {
+        /// Record that the child's side of the pty has closed.
+        pub fn mark_exited(&mut self) {
+            if let Child::Active(pid) = *self {
+                *self = Child::Exited(pid);
+            }
+        }
+
+        /// Reap an exited child without blocking.
+        pub fn try_reap(&mut self) {
+            if let Child::Exited(pid) = *self
+                && let Ok(wp) = wait::waitpid(pid, Some(wait::WaitPidFlag::WNOHANG))
+            {
+                *self = Child::Reaped(wp);
+            }
+        }
     }
 
     impl Drop for Child {
