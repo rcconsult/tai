@@ -22,7 +22,7 @@ nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user
 # ConPTY on Windows (ADR 0002).
 [target.'cfg(windows)'.dependencies]
 portable-pty = "0.9.0"
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_System_LibraryLoader"] }
 
 # miniquad's macOS clipboard is a stub (get returns None, set does nothing),
 # so macOS uses arboard. Text only: no image support.

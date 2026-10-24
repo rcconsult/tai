@@ -45,20 +45,11 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
 
 - Font fallback covers Nerd Font icons and general symbols. Emoji and CJK show as boxes.
 - macroquad is vendored with a clipboard fix (`vendor/macroquad/TAI-PATCHES.md`).
-- Windows: after a large resize or font-size change (for example a big
-  step up, then Ctrl+0), the screen can show lines out of order. Press
-  Ctrl+L or run `clear` to redraw it. One known cause is tai picking up
-  another program's older ConPTY, such as WezTerm's when WezTerm is on
-  `PATH`. To use Windows' own ConPTY instead, start tai with WezTerm
-  removed from `PATH`:
-
-  ```powershell
-  $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notlike '*WezTerm*' }) -join ';'
-  .\tai.exe
-  ```
-
-  Details: `docs/lessons/windows-pitfalls.md`, "tai may run another app's
-  ConPTY".
+- Windows: tai uses Windows' own ConPTY (ADR 0004). Another program's
+  older ConPTY, such as WezTerm's, garbled the screen after a large
+  resize. If lines ever show out of order after a resize, press Ctrl+L or
+  run `clear` to redraw. Details: `docs/lessons/windows-pitfalls.md`,
+  "tai may run another app's ConPTY".
 
 ## Licence notes
 

@@ -43,6 +43,7 @@ impl Pty {
     ///   2. %COMSPEC%
     ///   3. cmd.exe
     pub fn new(dims: Dimensions) -> std::io::Result<(Self, Child)> {
+        use_system_conpty();
         let pair = native_pty_system()
             .openpty(pty_size(dims))
             .map_err(std::io::Error::other)?;
@@ -224,6 +225,30 @@ fn pty_size(dims: Dimensions) -> PtySize {
         cols,
         pixel_width: (dims.window_width * dims.dpi_scale) as u16,
         pixel_height: (dims.window_height * dims.dpi_scale) as u16,
+    }
+}
+
+/// Make portable-pty use Windows' own ConPTY. It first tries
+/// `LoadLibraryW("conpty.dll")` by bare name, which searches tai's folder,
+/// the current directory and PATH, so it could load another app's older
+/// ConPTY (WezTerm's garbles the screen after a resize) or a planted DLL.
+/// Restricting DLL search to System32, which has no conpty.dll, makes it
+/// fall back to the ConPTY in kernel32.dll. This applies to every later
+/// LoadLibrary in tai; the window and OpenGL are set up before this runs.
+/// See docs/lessons/windows-pitfalls.md.
+#[allow(unsafe_code)]
+fn use_system_conpty() {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    };
+    // SAFETY: SetDefaultDllDirectories only changes the process's DLL
+    // search path; it takes a flag and touches no memory of ours.
+    let ok = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    if ok == 0 {
+        tracing::warn!(
+            "SetDefaultDllDirectories failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 

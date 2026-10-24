@@ -107,8 +107,9 @@ To see which ConPTY a running tai uses, list its child processes
 (`Get-CimInstance Win32_Process -Filter "ParentProcessId=<tai pid>"`) or
 its loaded modules (`conpty.dll`).
 
-**Open:** whether tai should always use the system ConPTY (load it from
-`kernel32.dll` explicitly) or ship a known OpenConsole, as Windows
-Terminal and WezTerm do. Either way, loading `conpty.dll` by bare name
-should stop. With the system ConPTY on this host the screen redrew after
-a resize; a full check of the garbling case is still to do.
+**What tai does:** `use_system_conpty` in `src/pty_windows.rs` restricts
+DLL search to System32 before the pseudo console is created, so
+`portable-pty` falls back to the system ConPTY (ADR 0004,
+`grep -n SetDefaultDllDirectories src/pty_windows.rs`). With WezTerm
+removed from `PATH`, the owner saw no garbling after the same resize
+steps.
