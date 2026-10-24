@@ -19,5 +19,13 @@ tai's root `Cargo.toml` uses this copy through `[patch.crates-io]`.
 2. `Cargo.toml`: `[lints.rust] warnings = "allow"`. Path dependencies
    aren't lint-capped the way registry crates are, so without this,
    macroquad's own warnings would show up in tai's builds.
+3. `src/text.rs`, new `Font::with_fresh_cache`: a font sharing the parsed
+   font data (`Arc<fontdue::Font>`) with an empty glyph cache in a new
+   atlas. tai calls it on font-size changes instead of loading the fonts
+   again, which re-parsed every glyph (about 0.1 s per step in release,
+   0.8 s in debug, for the three bundled fonts). Upstream has no way to
+   clear a font's cache or share its parsed data, because `set_atlas` and
+   `set_characters` are `pub(crate)`.
 
-Drop this vendored copy once a macroquad release includes the fix.
+Drop this vendored copy once a macroquad release includes the clipboard fix
+and a way to reset a font's glyph cache without parsing it again.

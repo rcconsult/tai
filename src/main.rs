@@ -379,9 +379,9 @@ async fn main() -> Result<()> {
                         Action::FontBigger | Action::FontSmaller | Action::FontReset => {
                             let size = shortcuts::next_font_size(dims.font_size, action);
                             if size != dims.font_size {
-                                // Reload the fonts so the glyph atlases of the
-                                // old size are dropped instead of growing per size.
-                                fonts = Fonts::load()?;
+                                // Start empty glyph caches so the old size's
+                                // atlases are dropped instead of growing per size.
+                                fonts = fonts.fresh_caches();
                                 dims = Dimensions::new(Some(&fonts.primary), size);
                                 // Draw at the new size right away; resize the
                                 // grid once the steps stop.

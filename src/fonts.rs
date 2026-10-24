@@ -158,8 +158,8 @@ impl Coverage {
 }
 
 /// The macroquad fonts used for drawing. Each one keeps a glyph atlas per
-/// size it has drawn, so they're reloaded on font-size changes to drop the
-/// old atlases.
+/// size it has drawn, so a font-size change replaces the atlases (see
+/// `fresh_caches`).
 pub struct Fonts {
     pub primary: Font,
     pub symbols: Font,
@@ -173,6 +173,21 @@ impl Fonts {
             symbols: load_ttf_font_from_bytes(SYMBOLS_BYTES)?,
             iosevka: load_ttf_font_from_bytes(IOSEVKA_BYTES)?,
         })
+    }
+
+    /// The same fonts with empty glyph caches, for a font-size change. Like
+    /// Ghostty, which builds a new glyph atlas and cache for each font size
+    /// and frees the old ones (`src/font/SharedGridSet.zig`, `ref`/`deref`,
+    /// at a887df4 "terminal: bound page map probe lengths without tombstones
+    /// (#13294)"), this drops the old size's glyphs. Unlike reloading, it
+    /// keeps the parsed font data, which took about 0.1 s per step in
+    /// release builds and 0.8 s in debug ones.
+    pub fn fresh_caches(&self) -> Self {
+        Self {
+            primary: self.primary.with_fresh_cache(),
+            symbols: self.symbols.with_fresh_cache(),
+            iosevka: self.iosevka.with_fresh_cache(),
+        }
     }
 
     /// The font that draws `face`. `Blank` draws nothing, so any font will do.

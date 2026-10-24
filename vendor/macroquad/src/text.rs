@@ -73,6 +73,26 @@ impl Font {
         })
     }
 
+    /// tai patch: a font that shares this one's parsed font data but starts
+    /// with an empty glyph cache in a new atlas, as `load_ttf_font_from_bytes`
+    /// leaves it. Parsing is the slow part of loading a font, so this lets a
+    /// font-size change drop the old size's glyphs without parsing again.
+    /// The old atlas is freed when the last font using it is dropped.
+    pub fn with_fresh_cache(&self) -> Font {
+        let atlas = Arc::new(Mutex::new(Atlas::new(
+            get_quad_context(),
+            miniquad::FilterMode::Linear,
+        )));
+        let mut font = Font {
+            font: self.font.clone(),
+            atlas,
+            characters: Arc::new(Mutex::new(HashMap::new())),
+        };
+        font.populate_font_cache(&Font::ascii_character_list(), 15);
+        font.set_filter(get_context().default_filter_mode);
+        font
+    }
+
     pub(crate) fn set_atlas(&mut self, atlas: Arc<Mutex<Atlas>>) {
         self.atlas = atlas;
     }
