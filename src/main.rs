@@ -898,8 +898,13 @@ impl<'alloc> Input<'alloc> {
         // While a shortcut's key is held, the platform keeps producing its
         // text on key repeat (holding Cmd+= repeats "=") without a new key
         // press. Drop it so it can't reach the shell through the fallback
-        // at the end.
-        if self.swallowed.iter().any(|&k| is_key_down(k)) {
+        // at the end. Repeats queued during a slow frame (a font reload)
+        // can arrive with the key's release, so count that frame too.
+        if self
+            .swallowed
+            .iter()
+            .any(|&k| is_key_down(k) || is_key_released(k))
+        {
             text.clear();
         }
 
