@@ -1,6 +1,7 @@
 # ADR 0004: Use Windows' own ConPTY
 
-- **Status:** Proposed 2026-10-25.
+- **Status:** Accepted 2026-10-25 (owner), implemented in
+  `src/pty_windows.rs` (`use_system_conpty`) and checked on Windows 11.
 - **Deciders:** owner. Written by the Claude session on the Windows dev host.
 - **Related:** [ADR 0002](0002-windows-11-support.md), decision 2 (ConPTY
   through `portable-pty`), which this amends without replacing.
