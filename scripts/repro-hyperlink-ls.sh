@@ -8,6 +8,8 @@
 # tai execs $SHELL with no arguments, so this script launches tai with
 # itself as $SHELL; TAI_REPRO_OUT tells the two roles apart. Needs GNU ls
 # (`gls` on macOS, from coreutils) for --hyperlink.
+#
+# Unix only: Windows tai ignores $SHELL (src/pty_windows.rs, default_shell).
 set -eu
 
 if [ -n "${TAI_REPRO_OUT:-}" ]; then

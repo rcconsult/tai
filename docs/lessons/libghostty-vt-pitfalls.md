@@ -49,7 +49,9 @@ backports its code hunks, and `scripts/fetch-ghostty.sh` applies it.
 the listing inside tai and prints whether tai finished, froze or crashed,
 the Ghostty optimize mode, and how many "OutOfSpace" warnings were logged.
 Thousands of warnings with no crash mean the patch works. Run it on dev and
-release builds after moving the pin or dropping the patch. On 2026-10-25,
+release builds after moving the pin or dropping the patch. It works on
+macOS and Linux only, because Windows tai ignores `$SHELL`
+(`src/pty_windows.rs`, `default_shell`). On 2026-10-25,
 on macOS with 16,950 lines: the unpatched ReleaseSafe build crashed in
 about 4 s, Zig Debug froze for 300 s, and the patched builds finished in
 about 15 s (ReleaseSafe) and 9 s (ReleaseFast).
