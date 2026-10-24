@@ -123,6 +123,11 @@ impl Pty {
         }
     }
 
+    /// Wait until output is available, or `timeout` passes. Not implemented
+    /// on Windows yet: it returns at once, so input is echoed a frame later
+    /// than on Unix.
+    pub fn wait_readable(&self, _timeout: std::time::Duration) {}
+
     /// Best-effort write to the pseudo console. Errors drop the data, as on
     /// Unix.
     pub fn write(&self, data: &[u8]) {

@@ -82,6 +82,12 @@ const CELL_GAP: f32 = 0.0;
 /// Vertical gap between rows.
 const ROW_GAP: f32 = 12.0;
 
+/// How long to wait for the shell's echo after sending typed input. Reading
+/// right after the write finds nothing yet, which put each echo a frame late.
+/// A shell echoes within a millisecond or two; the wait ends as soon as it
+/// does, so this only bounds the frame time when nothing comes back.
+const ECHO_WAIT: Duration = Duration::from_millis(4);
+
 #[macroquad::main(macroquad_conf)]
 async fn main() -> Result<()> {
     // Initialize tracing with default log level set to info.
@@ -300,8 +306,14 @@ async fn main() -> Result<()> {
 
                 // Write the composed response back to the PTY,
                 // and clear it in preparation of the next frame.
+                let typed = !input.response.is_empty();
                 pty.write(&input.response);
                 input.response.clear();
+                // Give the shell a moment to echo what was just typed, so the
+                // echo is drawn this frame instead of the next one.
+                if typed {
+                    pty.wait_readable(ECHO_WAIT);
+                }
 
                 match pty.read(&mut terminal) {
                     Ok(_) => {}
@@ -1865,6 +1877,18 @@ mod pty {
                     Ok((Self(fd), Child::Active(child)))
                 }
             }
+        }
+
+        /// Wait until the pty master has output to read, or `timeout` passes.
+        pub fn wait_readable(&self, timeout: std::time::Duration) {
+            let mut fds = [nix::libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: nix::libc::POLLIN,
+                revents: 0,
+            }];
+            let ms = timeout.as_millis().try_into().unwrap_or(i32::MAX);
+            // An error or a timeout both just mean "read what there is".
+            _ = unsafe { nix::libc::poll(fds.as_mut_ptr(), 1, ms) };
         }
 
         /// Drain all available output from the pty master and feed it into the
