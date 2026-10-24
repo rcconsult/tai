@@ -6,13 +6,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **tai** is a terminal app that runs the **ppxai engine harness** behind a UI built on **libghostty** (Ghostty's embeddable terminal library).
 
-**Status:** the stack is chosen, but the repo has no source code, build system or tests yet. Once the Rust project is scaffolded, add the build, lint and test commands here, including how to run a single test. Don't guess them.
+**Status:** milestone (a) is scaffolded. `src/main.rs` is `ghostling_rs` from libghostty-rs v0.2.2 with small tai changes, and its header records the provenance. There are no tests yet.
+
+## Build
+
+Always build through `scripts/cargo.sh`, never plain `cargo`. libghostty-vt's build script runs whichever `zig` is on `PATH`. The pinned Ghostty needs an exact Zig major.minor, 0.15.x, and that's not the system Zig. On first use, the wrapper fetches Zig into `.local/zig/` (`scripts/fetch-zig.sh`, checked against ziglang.org's sha256) and Ghostty into `.local/ghostty/` (`scripts/fetch-ghostty.sh`). `.cargo/config.toml` points `GHOSTTY_SOURCE_DIR` at that checkout.
+
+- Build: `scripts/cargo.sh build` (the first build compiles libghostty-vt with Zig, about a minute)
+- Run: `scripts/cargo.sh run` (opens a window running `$SHELL`). On macOS, `TAI_APPLE_GFX=metal` selects Metal instead of OpenGL.
+- Lint: `scripts/cargo.sh fmt --check` and `scripts/cargo.sh clippy`
+- Test: `scripts/cargo.sh test`, or `scripts/cargo.sh test <name>` for a single test
+
+Three pins move together: the `libghostty-vt` version in `Cargo.toml`, `GHOSTTY_COMMIT` in `scripts/fetch-ghostty.sh` (it must equal the crate's `crates/libghostty-vt-sys/build.rs` pin), and `ZIG_VERSION` in `scripts/fetch-zig.sh` (it must match that Ghostty commit's `build.zig.zon` `minimum_zig_version`).
 
 ## Stack
 
 [ADR 0001](docs/decisions/0001-stack-rust-libghostty-vt-ppxai-server.md) records the decision. In short:
 
-- **Rust**, using **libghostty-vt** through the crates.io `libghostty-vt` crate. Pin the Ghostty commit with `GHOSTTY_SOURCE_DIR`. Full libghostty (`ghostty.h`) supports Apple platforms only, and Ghostty says it's not for outside embedders.
+- **Rust**, using **libghostty-vt** through the crates.io `libghostty-vt` crate. Pin the Ghostty commit with `GHOSTTY_SOURCE_DIR` (see Build). Full libghostty (`ghostty.h`) supports Apple platforms only, and Ghostty says it's not for outside embedders.
 - libghostty-vt has no renderer and no PTY. tai draws the screen and spawns the child process itself.
 - **Milestone (a):** a PTY running `$SHELL` or ppxai's TUI, rendered with macroquad (from `ghostling_rs`, with audio off). **Milestone (b):** a native chat UI built on winit + wgpu.
 - **Engine:** tai launches `ppxai-server --uds --announce` as its own child process. Don't run the engine in-process, which would force a Python host. Don't use stdio JSON-RPC either: it has no interrupt or consent handling.

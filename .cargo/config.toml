@@ -1,0 +1,4 @@
+# Build libghostty-vt from our own pinned Ghostty checkout (ADR 0001),
+# fetched by scripts/fetch-ghostty.sh. An exported GHOSTTY_SOURCE_DIR wins.
+[env]
+GHOSTTY_SOURCE_DIR = { value = ".local/ghostty", relative = true }
