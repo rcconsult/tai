@@ -17,6 +17,9 @@ dest="$root/.local/ghostty"
 if [ ! -d "$dest/.git" ]; then
     mkdir -p "$dest"
     git -C "$dest" init -q
+    # With autocrlf=true (common on Windows) every file would look modified
+    # and trip the local-changes check below.
+    git -C "$dest" config core.autocrlf false
     git -C "$dest" remote add origin "$GHOSTTY_REPO"
 fi
 

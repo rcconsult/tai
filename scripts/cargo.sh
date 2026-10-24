@@ -7,5 +7,6 @@ set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 "$root/scripts/fetch-zig.sh" >/dev/null
 "$root/scripts/fetch-ghostty.sh" >/dev/null
+"$root/scripts/prefetch-zig-deps.sh" >/dev/null
 
 PATH="$root/.local/zig:$PATH" exec cargo "$@"

@@ -109,11 +109,12 @@ owner accepts ~1.8 s server probes for now"):**
    equivalent and isn't needed.
 4. **Build scripts stay POSIX sh and run under Git Bash** (Git for Windows
    is already needed for the Ghostty clone). `fetch-zig.sh` gains a Windows
-   case (`.zip`, `zig.exe`, `unzip`), `cargo.sh` uses `;` as the `PATH`
-   separator there, and `fetch-ghostty.sh` clones with
+   case (`.zip`, `unzip`) and `fetch-ghostty.sh` clones with
    `core.autocrlf=false`. One script prefetches the github.com packages that
    Zig's own fetch fails on, with `curl`/`git` and `zig fetch`, before
-   `cargo` runs.
+   `cargo` runs. `cargo.sh` needs no change: Git Bash converts its
+   `:`-separated `PATH` to Windows form for native programs (checked with
+   `where zig`).
 5. **Keep the Linux shortcut mapping on Windows** (Ctrl+Shift+C/V, Ctrl+= /
    - / 0, plain Ctrl+C/V to the shell). It matches Windows Terminal, and
    `src/shortcuts.rs` already gives it to every non-macOS host.
