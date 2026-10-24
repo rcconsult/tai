@@ -1,6 +1,9 @@
 # ADR 0002: Windows 11 support
 
-- **Status:** Proposed 2026-10-24. Not accepted, not implemented.
+- **Status:** Accepted 2026-10-24 (owner). Decisions 1-6 are implemented on
+  main and verified on Windows 11, with Linux and macOS re-verified after
+  the shared changes. Decision 7 (the engine link) waits for milestone (b);
+  its open questions below still hold.
 - **Deciders:** owner. Written by the Claude session on the Windows dev host
   (Windows 11 Pro x86_64), with input from the Linux and macOS sessions.
 - **Related:** [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md),
@@ -93,7 +96,7 @@ owner accepts ~1.8 s server probes for now"):**
 - The `--announce` path binds port 0 on a socket it creates itself. No TCP
   mode was found that reports a bound port back to the parent.
 
-## Decision (proposed)
+## Decision
 
 1. **Target `x86_64-pc-windows-msvc`**, linking libghostty-vt statically as
    on the other platforms. Windows 11 is the supported Windows.

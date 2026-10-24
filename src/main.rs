@@ -59,6 +59,7 @@ use crate::shortcuts::Action;
 
 mod clipboard;
 mod fonts;
+mod locale;
 #[cfg(windows)]
 #[path = "pty_windows.rs"]
 mod pty;
@@ -1807,6 +1808,10 @@ mod pty {
         ///   2. The pw_shell field from the passwd database
         ///   3. /bin/sh as a last resort
         pub fn new(dims: Dimensions) -> std::io::Result<(Self, Child)> {
+            // Work out the shell's locale before forking: it may run
+            // `defaults` on macOS, and it logs (ADR 0003).
+            let locale = crate::locale::child_env();
+
             // forkpty() combines openpty + fork + login_tty into one call.
             // In the child it sets up the slave side as stdin/stdout/stderr.
             match unsafe { nix::pty::forkpty(&dims.to_winsize(), None)? } {
@@ -1860,6 +1865,8 @@ mod pty {
                     _ = Command::new(&shell)
                         .env("TERM", "xterm-256color")
                         .env("COLORTERM", "truecolor")
+                        // A UTF-8 character type; see src/locale.rs.
+                        .envs(locale.iter().map(|(k, v)| (k, v)))
                         .arg0(arg0)
                         .exec();
 

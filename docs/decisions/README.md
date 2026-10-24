@@ -7,8 +7,8 @@ Status is summarised; the record itself is authoritative.
 | # | Decision | Status |
 |---|---|---|
 | [0001](0001-stack-rust-libghostty-vt-ppxai-server.md) | Rust + libghostty-vt for the UI, ppxai-server as a child process for the engine | ✅ Accepted 2026-10-24, not yet implemented |
-| [0002](0002-windows-11-support.md) | Windows 11 support: MSVC, ConPTY via portable-pty, loopback TCP to the engine | 📝 Proposed 2026-10-24 |
-| [0003](0003-utf-8-everywhere.md) | UTF-8 everywhere, with the locale sensed per OS | 📝 Proposed 2026-10-24 |
+| [0002](0002-windows-11-support.md) | Windows 11 support: MSVC, ConPTY via portable-pty, loopback TCP to the engine | ✅ Accepted 2026-10-24; engine link waits for milestone (b) |
+| [0003](0003-utf-8-everywhere.md) | UTF-8 everywhere, with the locale sensed per OS | ✅ Accepted 2026-10-24 |
 
 Numbering is sequential. The next record is `0004`.
 

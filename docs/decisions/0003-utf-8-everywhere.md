@@ -1,6 +1,9 @@
 # ADR 0003: UTF-8 everywhere, with the locale sensed per OS
 
-- **Status:** Proposed 2026-10-24. Not accepted, not implemented.
+- **Status:** Accepted 2026-10-24 (owner). Decisions 1, 3 and 4 are on main
+  (4 through the Iosevka fallback's blank spaces). Decision 2 is in
+  `src/locale.rs`. Decision 5 has nothing to apply to yet: tai does no
+  text layout of its own.
 - **Deciders:** owner. Written by the Claude session on the Windows dev host.
 - **Related:** [ADR 0002](0002-windows-11-support.md) (Windows), popos-tai's
   `fonts-fallback` branch (a fallback font for missing glyphs).
@@ -65,7 +68,7 @@ The Windows child gets `COLORTERM`. tai sets no locale variables.
   iTerm2-only sequences such as OSC 1337. Ghostty overwrites
   `TERM_PROGRAM` with its own value.
 
-## Decision (proposed)
+## Decision
 
 1. **UTF-8 is tai's only encoding,** on the PTY, the clipboard (on Windows the
    round trip through miniquad was tested with non-ASCII text) and the
@@ -136,7 +139,8 @@ The Windows child gets `COLORTERM`. tai sets no locale variables.
 - Should tai set `TERM_PROGRAM=tai` (and `TERM_PROGRAM_VERSION`) and drop
   an inherited `LC_TERMINAL*` and `TERM_SESSION_ID`, as Ghostty does for
   `TERM_PROGRAM`? It isn't an encoding question, but it's the same
-  "what environment does the child get" decision.
+  "what environment does the child get" decision. Seen on macOS: iTerm2's
+  shell integration in the user's `.zshrc` emits OSC 1337 inside tai.
 - The sensed locale must also reach children tai spawns without a shell,
   such as `ppxai-server` (ADR 0001).
 
