@@ -214,7 +214,9 @@ async fn main() -> Result<()> {
     // is applied once, after the last one.
     let mut resize_due: Option<Instant> = None;
 
-    // Spawn a child shell connected to a pseudo-terminal.
+    // Spawn a child shell connected to a pseudo-terminal. On Windows this
+    // restricts tai's DLL search to System32 (ADR 0004), so keep it after
+    // the window and GL context exist, as it is here inside macroquad::main.
     let (pty, mut child) = Pty::new(dims)?;
 
     // Install the PNG decoder so the terminal can handle PNG images in the

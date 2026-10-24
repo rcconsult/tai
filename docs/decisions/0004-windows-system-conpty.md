@@ -61,11 +61,21 @@ window renders. fmt, clippy and the 29 tests pass.
 
 ## Accepted risks
 
-- `SetDefaultDllDirectories` applies to the whole process: any later
+- `SetDefaultDllDirectories` applies to the whole tai process: any later
   `LoadLibrary` by bare name searches only System32. The window and OpenGL
-  are set up before the PTY, so their DLLs are already loaded. A future
-  feature that loads a DLL from tai's own folder would have to pass a full
-  path or add that folder with `AddDllDirectory`.
+  are set up before the PTY (`Pty::new` runs inside `macroquad::main`,
+  after miniquad created the window and GL context), so their DLLs are
+  already loaded. A future feature that loads a DLL from tai's own folder
+  would have to pass a full path or add that folder with
+  `AddDllDirectory`.
+- Some DLLs load lazily later, such as text-service (IME) modules on first
+  focus and GL driver helpers. These normally load by full path from the
+  registry, so the System32-only default shouldn't affect them. Untested:
+  no IME was used on the dev host.
+- It doesn't reach the shell: Microsoft documents that the process DLL
+  search path "applies only to the calling process" (`SetDefaultDllDirectories`,
+  Remarks). Programs run inside tai keep the normal DLL search.
+  (`SetDllDirectory`, by contrast, is passed on to child processes.)
 - tai gets whatever ConPTY the Windows version ships. Older Windows 11
   builds may have a pre-rewrite system ConPTY, with which
   `PSEUDOCONSOLE_RESIZE_QUIRK` could cause the same garbling. Only the dev
