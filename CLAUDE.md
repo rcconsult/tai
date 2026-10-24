@@ -14,7 +14,7 @@ Always build through `scripts/cargo.sh`, never plain `cargo`. libghostty-vt's bu
 
 - Build: `scripts/cargo.sh build` (the first build fetches Zig and Ghostty and compiles libghostty-vt, a few minutes)
 - Run: `scripts/cargo.sh run` (opens a window running `$SHELL`). On macOS, `TAI_APPLE_GFX=metal` selects Metal instead of OpenGL. Keep it opt-in: Metal leaked GPU memory on the macOS dev host.
-- Shortcuts (`src/shortcuts.rs`, following Ghostty's defaults): on macOS, Cmd+C/V copy and paste and Cmd+= / Cmd+- / Cmd+0 change the font size. On Linux, it's Ctrl+Shift+C/V and Ctrl+= / Ctrl+- / Ctrl+0. Plain Ctrl+C and Ctrl+V go to the shell.
+- Shortcuts (`src/shortcuts.rs`, following Ghostty's defaults): on macOS, Cmd+C/V copy and paste and Cmd+= / Cmd+- / Cmd+0 change the font size. On Linux, it's Ctrl+Shift+C/V and Ctrl+= / Ctrl+- / Ctrl+0. Plain Ctrl+C and Ctrl+V go to the shell. The clipboard backend (`src/clipboard.rs`) is miniquad on Linux and `arboard` on macOS, because miniquad 0.4.11's macOS clipboard is a no-op stub.
 - Lint: `scripts/cargo.sh fmt --check` and `scripts/cargo.sh clippy`
 - Test: `scripts/cargo.sh test`, or `scripts/cargo.sh test <name>` for a single test
 

@@ -15,6 +15,11 @@ nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+# miniquad's macOS clipboard is a stub (get returns None, set does nothing),
+# so macOS uses arboard. Text only: no image support.
+[target.'cfg(target_os = "macos")'.dependencies]
+arboard = { version = "3.7.0", default-features = false }
+
 # Vendored macroquad with a clipboard fix; see vendor/macroquad/TAI-PATCHES.md.
 [patch.crates-io]
 macroquad = { path = "vendor/macroquad" }

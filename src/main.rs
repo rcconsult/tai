@@ -26,7 +26,7 @@ use std::{
 use macroquad::{
     miniquad::{
         CursorIcon, conf,
-        window::{clipboard_get, clipboard_set, order_quit, set_mouse_cursor},
+        window::{order_quit, set_mouse_cursor},
     },
     prelude::*,
 };
@@ -56,6 +56,7 @@ use libghostty_vt::{
 use crate::pty::{Child, Pty, PtyError};
 use crate::shortcuts::Action;
 
+mod clipboard;
 mod shortcuts;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -260,7 +261,7 @@ async fn main() -> Result<()> {
                     match action {
                         Action::Copy => copy_selection(&terminal)?,
                         Action::Paste => {
-                            if let Some(text) = clipboard_get() {
+                            if let Some(text) = clipboard::get() {
                                 let bracketed = terminal.mode(Mode::BRACKETED_PASTE)?;
                                 input
                                     .response
@@ -352,7 +353,7 @@ fn copy_selection(terminal: &Terminal<'_, '_>) -> Result<()> {
     if let Some(text) = terminal.format_selection_alloc(None, options)?
         && !text.is_empty()
     {
-        clipboard_set(&String::from_utf8_lossy(&text));
+        clipboard::set(&String::from_utf8_lossy(&text));
     }
     Ok(())
 }
