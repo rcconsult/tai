@@ -43,11 +43,13 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
 
 ## Known gaps
 
-- No font fallback yet, so Nerd Font prompt icons show as boxes.
+- Font fallback covers Nerd Font icons only. Emoji and CJK show as boxes.
 - macroquad is vendored with a clipboard fix (`vendor/macroquad/TAI-PATCHES.md`).
 
 ## Licence notes
 
 `src/main.rs` started from libghostty-rs's `ghostling_rs` example (MIT OR
 Apache-2.0). The bundled JetBrains Mono font is under the SIL Open Font
-License (`fonts/OFL.txt`).
+License (`fonts/OFL.txt`). The bundled Symbols Nerd Font Mono, used as the
+fallback for icons, is MIT, and its icon sets carry their own licences
+(`fonts/README.md`).

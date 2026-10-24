@@ -4,8 +4,8 @@
 //! v0.2.2 (a3a9676, "release: 0.2.2"), licensed MIT OR Apache-2.0. tai's
 //! changes: window title, XTVERSION and log name, `TAI_APPLE_GFX` (gl|metal),
 //! `COLORTERM`, a login shell on macOS, default signal handling for the
-//! shell, HiDPI and baseline fixes, and the copy/paste/font-size shortcuts
-//! in `shortcuts.rs`.
+//! shell, HiDPI and baseline fixes, the copy/paste/font-size shortcuts in
+//! `shortcuts.rs`, and icon font fallback in `fonts.rs`.
 //!
 //! Original description follows.
 //!
@@ -53,10 +53,12 @@ use libghostty_vt::{
     },
 };
 
+use crate::fonts::{Coverage, Face, Fonts};
 use crate::pty::{Child, Pty, PtyError};
 use crate::shortcuts::Action;
 
 mod clipboard;
+mod fonts;
 mod shortcuts;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -65,11 +67,6 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 // Adjustable constants for the renderer. All of these are chosen empirically,
 // so feel free to tweak and tune these settings to your liking :)
 // ---------------------------------------------------------------------------
-
-/// The bundled font. Font sizes are in logical (screen) points; macroquad
-/// rasterizes glyphs at font_size * dpi_scale itself, so they stay crisp on
-/// HiDPI / Retina displays without scaling here.
-const FONT_BYTES: &[u8] = include_bytes!("../fonts/JetBrainsMono-Medium.ttf");
 
 /// Small padding from window edges
 const PADDING: f32 = 6.0;
@@ -95,11 +92,15 @@ async fn main() -> Result<()> {
     // Make libghostty-vt emit through the same tracing subscriber.
     libghostty_vt::set_logger(Some(Box::new(libghostty_vt::log::TracingLogger)))?;
 
-    let mut font = load_ttf_font_from_bytes(FONT_BYTES)?;
+    // Font sizes are in logical (screen) points; macroquad rasterizes glyphs
+    // at font_size * dpi_scale itself, so they stay crisp on HiDPI / Retina
+    // displays without scaling here.
+    let mut fonts = Fonts::load()?;
+    let coverage = Coverage::new()?;
 
     // Compute the initial grid from the window size
     // and measured cell metrics.
-    let mut dims = Dimensions::new(Some(&font), shortcuts::DEFAULT_FONT_SIZE);
+    let mut dims = Dimensions::new(Some(&fonts.primary), shortcuts::DEFAULT_FONT_SIZE);
     let (cols, rows) = dims.grid_size();
 
     // Track window size so we only recalculate the grid on actual changes.
@@ -238,7 +239,7 @@ async fn main() -> Result<()> {
         // We update both the ghostty terminal (so it reflows text) and the
         // pty's winsize (so the child shell knows about the new size and
         // can send SIGWINCH to its foreground process group).
-        if dims.update(Some(&font)) {
+        if dims.update(Some(&fonts.primary)) {
             apply_dims(dims, &grid_size, &cell_pixels, &mut terminal, &pty)?;
         }
 
@@ -271,10 +272,10 @@ async fn main() -> Result<()> {
                         Action::FontBigger | Action::FontSmaller | Action::FontReset => {
                             let size = shortcuts::next_font_size(dims.font_size, action);
                             if size != dims.font_size {
-                                // Reload the font so the glyph atlas of the old
-                                // size is dropped instead of growing per size.
-                                font = load_ttf_font_from_bytes(FONT_BYTES)?;
-                                dims = Dimensions::new(Some(&font), size);
+                                // Reload the fonts so the glyph atlases of the
+                                // old size are dropped instead of growing per size.
+                                fonts = Fonts::load()?;
+                                dims = Dimensions::new(Some(&fonts.primary), size);
                                 apply_dims(dims, &grid_size, &cell_pixels, &mut terminal, &pty)?;
                             }
                         }
@@ -319,7 +320,7 @@ async fn main() -> Result<()> {
         }
 
         // Draw the current terminal screen.
-        renderer.render_terminal(&terminal, dims, Some(&font))?;
+        renderer.render_terminal(&terminal, dims, &fonts, &coverage)?;
         next_frame().await
     }
 }
@@ -393,7 +394,8 @@ impl<'alloc> Renderer<'alloc> {
         &mut self,
         terminal: &Terminal<'alloc, '_>,
         dims: Dimensions,
-        font: Option<&Font>,
+        fonts: &Fonts,
+        coverage: &Coverage,
     ) -> Result<()> {
         // Snapshot the terminal state into our render state. This is the
         // only point where we need access to the terminal; after this the
@@ -436,11 +438,19 @@ impl<'alloc> Renderer<'alloc> {
         // Reusable text buffer for reading cell graphemes as UTF-8 text.
         let mut text = String::with_capacity(16);
 
+        // Fallback-font icons of the current row. They're drawn after the
+        // row's cells: an icon may spread into the next cell when that one is
+        // blank, which is only known once the next cell is read, and the next
+        // cell's background must not paint over it.
+        let mut icons: Vec<Icon> = Vec::new();
+
         // For convenience, `next` gives you the same iteration back only
         // as a shared pointer, so you can simultaneously iterate through
         // all rows while having a handle to query data for each row.
         while let Some(row) = row_it.next() {
             let mut x = PADDING;
+            // Whether the last icon is waiting to learn if the next cell is blank.
+            let mut icon_open = false;
 
             // Cell iterators work similarly as they create a cell *iteration*
             // from a row iteration, which can then be used in a similar pattern.
@@ -454,6 +464,16 @@ impl<'alloc> Renderer<'alloc> {
                 let selected = cell.is_selected()?;
                 let graphemes = cell.graphemes_len()?;
                 let bg = cell.bg_color()?;
+                if graphemes > 0 {
+                    // Convert read grapheme codepoints into UTF-8 text.
+                    cell.graphemes_utf8(&mut text)?;
+                }
+                if std::mem::take(&mut icon_open)
+                    && (graphemes == 0 || text == " ")
+                    && let Some(icon) = icons.last_mut()
+                {
+                    icon.cells = 2;
+                }
 
                 if graphemes == 0 {
                     if selected {
@@ -470,9 +490,6 @@ impl<'alloc> Renderer<'alloc> {
                         draw_rectangle(x, y, dims.cell_width, dims.cell_height, color(bg));
                     }
                 } else {
-                    // Convert read grapheme codepoints into UTF-8 text.
-                    cell.graphemes_utf8(&mut text)?;
-
                     // Resolve foreground and background colors using the new
                     // per-cell color queries. These flatten style colors,
                     // content-tag colors, and palette lookups into a single RGB
@@ -507,42 +524,53 @@ impl<'alloc> Renderer<'alloc> {
                         draw_rectangle(x, y, dims.cell_width, dims.cell_height, color(bg));
                     }
 
-                    // Draw the text for the cell.
-                    draw_text_ex(
-                        &text,
-                        x,
-                        y + dims.baseline,
-                        TextParams {
-                            font,
-                            font_size: dims.font_size,
-                            color: color(fg),
-                            ..Default::default()
-                        },
-                    );
-
-                    // Bold: draw the text a second time shifted 1 pixel to the
-                    // right to thicken the strokes ("fake bold").
-                    //
-                    // In a more sophisticated terminal one would obviously use the
-                    // correct bold version of the font using font discovery, but
-                    // let's do it the hackier way here.
-                    if bold {
-                        draw_text_ex(
+                    // Draw the text for the cell, in the fallback font when the
+                    // primary lacks the glyph (e.g. Nerd Font icons). The first
+                    // codepoint decides for the whole grapheme.
+                    let face = text
+                        .chars()
+                        .next()
+                        .map_or(Face::Primary, |ch| coverage.face_for(ch));
+                    if face == Face::Fallback {
+                        icons.push(Icon {
+                            text: text.clone(),
+                            x,
+                            y,
+                            fg: color(fg),
+                            bold,
+                            cells: 1,
+                        });
+                        icon_open = true;
+                    } else {
+                        let baseline = y + dims.baseline;
+                        draw_glyph(
                             &text,
-                            x + 1.0,
-                            y + dims.baseline,
-                            TextParams {
-                                font,
-                                font_size: dims.font_size,
-                                color: color(fg),
-                                ..Default::default()
-                            },
+                            x,
+                            baseline,
+                            &fonts.primary,
+                            dims.font_size,
+                            color(fg),
+                            bold,
                         );
                     }
                 }
 
                 x += dims.cell_width;
                 continue;
+            }
+
+            for icon in icons.drain(..) {
+                let place = coverage.place(Face::Fallback, dims.font_size, icon.cells);
+                let baseline = icon.y + dims.baseline - place.rise;
+                draw_glyph(
+                    &icon.text,
+                    icon.x,
+                    baseline,
+                    &fonts.fallback,
+                    place.font_size,
+                    icon.fg,
+                    icon.bold,
+                );
             }
 
             // Clear per-row dirty flag after rendering it.
@@ -672,6 +700,46 @@ impl<'alloc> Renderer<'alloc> {
         }
 
         Ok(())
+    }
+}
+
+/// A fallback-font glyph waiting to be drawn at the end of its row.
+struct Icon {
+    text: String,
+    x: f32,
+    y: f32,
+    fg: Color,
+    bold: bool,
+    /// How many cells it spans: 2 when the next cell is blank.
+    cells: u8,
+}
+
+/// Draw one cell's text with its baseline at `baseline`.
+fn draw_glyph(
+    text: &str,
+    x: f32,
+    baseline: f32,
+    font: &Font,
+    font_size: u16,
+    fg: Color,
+    bold: bool,
+) {
+    let params = TextParams {
+        font: Some(font),
+        font_size,
+        color: fg,
+        ..Default::default()
+    };
+    draw_text_ex(text, x, baseline, params.clone());
+
+    // Bold: draw the text a second time shifted 1 pixel to the right to
+    // thicken the strokes ("fake bold").
+    //
+    // In a more sophisticated terminal one would obviously use the correct
+    // bold version of the font using font discovery, but let's do it the
+    // hackier way here.
+    if bold {
+        draw_text_ex(text, x + 1.0, baseline, params);
     }
 }
 
