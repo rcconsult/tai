@@ -937,7 +937,7 @@ struct Input<'alloc> {
     drop_chars: bool,
     /// Whether the platform reports a key's character just before its key
     /// press (X11) rather than just after it (Windows, macOS, Wayland).
-    /// `None` until the first letter key shows which.
+    /// `None` until a key with a character shows which.
     chars_before_keys: Option<bool>,
     /// On X11, characters waiting for the key press they belong to.
     lead_text: String,
@@ -991,6 +991,7 @@ impl<'alloc> Input<'alloc> {
             self.chars_before_keys = Self::char_order(&events.0);
         }
         let chars_before_keys = self.chars_before_keys == Some(true);
+        let order_unknown = self.chars_before_keys.is_none();
         for event in events.0.drain(..) {
             match event {
                 KeyInput::Down {
@@ -1027,7 +1028,18 @@ impl<'alloc> Input<'alloc> {
                     // platform still reports its character ("=" for Cmd+=).
                     self.drop_chars = cfg!(target_os = "macos") && mods.contains(key::Mods::SUPER);
 
-                    let lead = if self.drop_chars { String::new() } else { lead };
+                    let mut lead = if self.drop_chars { String::new() } else { lead };
+
+                    // With the order still unknown, held characters belong to
+                    // this key only if it's a Ctrl chord (X11 reports 'c' for
+                    // Ctrl+C just before it). Not with Alt as well, which is
+                    // AltGr on Windows. Otherwise they were typed on their own.
+                    if order_unknown
+                        && !(mods.contains(key::Mods::CTRL) && !mods.contains(key::Mods::ALT))
+                    {
+                        self.response.extend_from_slice(lead.as_bytes());
+                        lead.clear();
+                    }
 
                     // A key tai has no mapping for: its character, if any,
                     // goes to the pty as plain text.
@@ -1079,6 +1091,9 @@ impl<'alloc> Input<'alloc> {
                     match &mut self.pending_key {
                         // The character belongs to the key just pressed.
                         Some(pending) => pending.text.push(ch),
+                        // Maybe X11 reporting it before its key: hold it
+                        // until the next key event decides.
+                        None if order_unknown => self.lead_text.push(ch),
                         // No key to attach it to: an unmapped key, or a
                         // character that arrived a frame after its key (seen
                         // in VMs). Write it as it is.
@@ -1120,12 +1135,12 @@ impl<'alloc> Input<'alloc> {
         self.lead_text.clear();
     }
 
-    /// Learn from the first letter key whether characters come just before
-    /// their key press (Some(true)) or just after it (Some(false)). Any
-    /// modifiers count: on X11 Ctrl+C still reports 'c' just before the
-    /// press, and it is often the first key typed. Where Ctrl+C reports
-    /// U+0003 instead (Windows, Wayland) it doesn't match, and the order
-    /// stays unknown, which is treated as "after".
+    /// Learn from the first key with a character whether characters come
+    /// just before their key press (Some(true)) or just after it
+    /// (Some(false)). Any modifiers count: on X11 Ctrl+C and Ctrl+= still
+    /// report 'c' and '=' just before the press, and those are often the
+    /// first keys typed. Where Ctrl+C reports U+0003 instead (Windows,
+    /// Wayland) it doesn't match, and the order stays unknown.
     fn char_order(events: &[KeyInput]) -> Option<bool> {
         let is_char_of = |event: Option<&KeyInput>, ucp: char| matches!(event, Some(KeyInput::Char(ch)) if ch.to_ascii_lowercase() == ucp);
         events.iter().enumerate().find_map(|(i, event)| {
@@ -1138,7 +1153,7 @@ impl<'alloc> Input<'alloc> {
                 return None;
             };
             let (_, ucp) = Self::key_for(*keycode)?;
-            if !ucp.is_ascii_lowercase() {
+            if ucp == '\0' {
                 return None;
             }
             if i > 0 && is_char_of(events.get(i - 1), ucp) {
