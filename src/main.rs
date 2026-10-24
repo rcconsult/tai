@@ -56,9 +56,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 // so feel free to tweak and tune these settings to your liking :)
 // ---------------------------------------------------------------------------
 
-/// Desired font size in logical (screen) points — the actual texture
-/// will be rasterized at font_size * dpi_scale so glyphs stay crisp on
-/// HiDPI / Retina displays.
+/// Desired font size in logical (screen) points. macroquad rasterizes
+/// glyphs at font_size * dpi_scale itself, so they stay crisp on HiDPI /
+/// Retina displays without scaling here.
 const FONT_SIZE: u16 = 10;
 
 /// Small padding from window edges
@@ -99,6 +99,9 @@ async fn main() -> Result<()> {
     // main loop below. Don't worry, this is completely safe and is just
     // here to make the Rust compiler happy.
     let grid_size = Cell::new((cols, rows));
+    // Same for the cell size in physical pixels, which changes with the
+    // DPI scale.
+    let cell_pixels = Cell::new(dims.cell_pixels());
 
     // Spawn a child shell connected to a pseudo-terminal.
     let (pty, mut child) = Pty::new(dims)?;
@@ -120,7 +123,10 @@ async fn main() -> Result<()> {
     // The terminal options don't include cell pixel dimensions, so
     // issue an initial resize to set them.  Without this, Kitty
     // graphics placement_rect would divide by zero cell sizes.
-    terminal.resize(cols, rows, dims.cell_width as u32, dims.cell_height as u32)?;
+    {
+        let (cell_w, cell_h) = dims.cell_pixels();
+        terminal.resize(cols, rows, cell_w, cell_h)?;
+    }
 
     terminal
         // Enable Kitty graphics by setting a storage limit.  Without this the
@@ -147,13 +153,15 @@ async fn main() -> Result<()> {
         // so programs can discover the terminal geometry in cells and pixels.
         .on_size({
             let gs = &grid_size;
+            let cp = &cell_pixels;
             move |_term| {
                 let (columns, rows) = gs.get();
+                let (cell_width, cell_height) = cp.get();
                 Some(SizeReportSize {
                     rows,
                     columns,
-                    cell_width: dims.cell_width as u32,
-                    cell_height: dims.cell_height as u32,
+                    cell_width,
+                    cell_height,
                 })
             }
         })?
@@ -220,10 +228,14 @@ async fn main() -> Result<()> {
         // We update both the ghostty terminal (so it reflows text) and the
         // pty's winsize (so the child shell knows about the new size and
         // can send SIGWINCH to its foreground process group).
-        if dims.update() {
+        if dims.update(Some(&font)) {
             let (cols, rows) = dims.grid_size();
             grid_size.set((cols, rows));
-            terminal.resize(cols, rows, dims.cell_width as u32, dims.cell_height as u32)?;
+            cell_pixels.set(dims.cell_pixels());
+            {
+                let (cell_w, cell_h) = dims.cell_pixels();
+                terminal.resize(cols, rows, cell_w, cell_h)?;
+            }
             pty.resize(dims);
         }
 
@@ -437,10 +449,10 @@ impl<'alloc> Renderer<'alloc> {
                     draw_text_ex(
                         &text,
                         x,
-                        y + FONT_SIZE as f32 + ROW_GAP,
+                        y + dims.baseline,
                         TextParams {
                             font,
-                            font_size: (FONT_SIZE as f32 * screen_dpi_scale()) as u16,
+                            font_size: FONT_SIZE,
                             color: color(fg),
                             ..Default::default()
                         },
@@ -456,10 +468,10 @@ impl<'alloc> Renderer<'alloc> {
                         draw_text_ex(
                             &text,
                             x + 1.0,
-                            y + FONT_SIZE as f32 + ROW_GAP,
+                            y + dims.baseline,
                             TextParams {
                                 font,
-                                font_size: (FONT_SIZE as f32 * screen_dpi_scale()) as u16,
+                                font_size: FONT_SIZE,
                                 color: color(fg),
                                 ..Default::default()
                             },
@@ -572,16 +584,17 @@ impl<'alloc> Renderer<'alloc> {
                 info.grid_rows as f32 * dims.cell_height,
             );
 
-            // Read the sub-cell pixel offsets
-            let x_offset = placement.x_offset()?;
-            let y_offset = placement.y_offset()?;
+            // Read the sub-cell pixel offsets. They are in the terminal's
+            // physical pixels; we draw in logical units.
+            let x_offset = placement.x_offset()? as f32 / dims.dpi_scale;
+            let y_offset = placement.y_offset()? as f32 / dims.dpi_scale;
 
             let tex = Texture2D::from_rgba8(image_width as u16, image_height as u16, data);
 
             draw_texture_ex(
                 &tex,
-                PADDING + info.viewport_col as f32 * dims.cell_width + x_offset as f32,
-                PADDING + info.viewport_row as f32 * dims.cell_height + y_offset as f32,
+                PADDING + info.viewport_col as f32 * dims.cell_width + x_offset,
+                PADDING + info.viewport_row as f32 * dims.cell_height + y_offset,
                 WHITE,
                 DrawTextureParams {
                     dest_size: Some(dest_size),
@@ -612,12 +625,18 @@ struct Dimensions {
     window_height: f32,
     cell_width: f32,
     cell_height: f32,
+    /// Offset from a cell's top edge to the text baseline.
+    baseline: f32,
+    /// DPI scale the cell metrics were measured at.
+    dpi_scale: f32,
 }
 
 impl Dimensions {
     fn new(font: Option<&Font>) -> Self {
         // Measure a representative glyph to derive the monospace cell size.
-        let glyph_size = measure_text("M", font, FONT_SIZE, screen_dpi_scale());
+        // measure_text applies the DPI scale itself and returns logical
+        // units, the same units we draw in.
+        let glyph_size = measure_text("M", font, FONT_SIZE, 1.0);
 
         // Guard against zero cell dimensions — these would cause division
         // by zero when computing the terminal grid.
@@ -625,9 +644,21 @@ impl Dimensions {
         Self {
             cell_width: glyph_size.width.max(1.0) + CELL_GAP,
             cell_height: glyph_size.height.max(1.0) + ROW_GAP,
+            // Center the glyph vertically: half the row gap above it, then
+            // its ascent (offset_y) down to the baseline.
+            baseline: ROW_GAP / 2.0 + glyph_size.offset_y,
+            dpi_scale: screen_dpi_scale(),
             window_width: screen_width(),
             window_height: screen_height(),
         }
+    }
+
+    /// Cell size in physical pixels, as the terminal and the pty report it.
+    fn cell_pixels(self) -> (u32, u32) {
+        (
+            (self.cell_width * self.dpi_scale) as u32,
+            (self.cell_height * self.dpi_scale) as u32,
+        )
     }
 
     fn grid_size(self) -> (u16, u16) {
@@ -635,7 +666,13 @@ impl Dimensions {
         let rows = ((self.window_height - 2.0 * PADDING) / self.cell_height).max(1.0) as u16;
         (cols, rows)
     }
-    fn update(&mut self) -> bool {
+    fn update(&mut self, font: Option<&Font>) -> bool {
+        // The DPI scale may not be final on the first frame, or may change
+        // when the window moves between displays; re-measure the cells then.
+        if screen_dpi_scale() != self.dpi_scale {
+            *self = Self::new(font);
+            return true;
+        }
         if screen_width() == self.window_width && screen_height() == self.window_height {
             return false;
         }
@@ -648,8 +685,8 @@ impl Dimensions {
         nix::pty::Winsize {
             ws_col: cols,
             ws_row: rows,
-            ws_xpixel: self.window_width as u16,
-            ws_ypixel: self.window_height as u16,
+            ws_xpixel: (self.window_width * self.dpi_scale) as u16,
+            ws_ypixel: (self.window_height * self.dpi_scale) as u16,
         }
     }
 }
