@@ -32,3 +32,11 @@ arboard = { version = "3.7.0", default-features = false }
 # Vendored macroquad with a clipboard fix; see vendor/macroquad/TAI-PATCHES.md.
 [patch.crates-io]
 macroquad = { path = "vendor/macroquad" }
+
+# Optimize dependencies in dev builds. fontdue parses every glyph of a
+# font eagerly (much of it in ttf-parser), and each font-size step reloads
+# all fonts: unoptimized, the three bundled fonts took ~1.1 s per step on
+# Windows, ~0.3 s with this, ~0.15 s in release (issue #2). tai's own code
+# stays unoptimized, so its rebuilds stay quick.
+[profile.dev.package."*"]
+opt-level = 3
