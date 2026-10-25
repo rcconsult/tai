@@ -7,8 +7,9 @@
 //! from). Unicode spaces draw blank without a font. System-font discovery
 //! for emoji and CJK is left for later.
 
-use macroquad::Error;
-use macroquad::text::{Font, load_ttf_font_from_bytes};
+use std::sync::Arc;
+
+use macroquad::text::{Font, load_ttf_font_from_fontdue};
 
 pub const PRIMARY_BYTES: &[u8] = include_bytes!("../fonts/JetBrainsMono-Medium.ttf");
 pub const SYMBOLS_BYTES: &[u8] = include_bytes!("../fonts/SymbolsNerdFontMono-Regular.ttf");
@@ -51,9 +52,9 @@ struct Fit {
 /// font size, so it's built once. fontdue keeps a codepoint → glyph map, so
 /// a lookup is a hash lookup with no rasterizing.
 pub struct Coverage {
-    primary: fontdue::Font,
-    symbols: fontdue::Font,
-    iosevka: fontdue::Font,
+    primary: Arc<fontdue::Font>,
+    symbols: Arc<fontdue::Font>,
+    iosevka: Arc<fontdue::Font>,
     primary_mid: f32,
     symbols_fit: Fit,
     iosevka_fit: Fit,
@@ -109,9 +110,9 @@ impl Coverage {
             primary_mid: mid(line_metrics(&primary)?),
             symbols_fit: Fit::new(&primary, &symbols, SYMBOLS_PROBE)?,
             iosevka_fit: Fit::new(&primary, &iosevka, IOSEVKA_PROBE)?,
-            primary,
-            symbols,
-            iosevka,
+            primary: Arc::new(primary),
+            symbols: Arc::new(symbols),
+            iosevka: Arc::new(iosevka),
         })
     }
 
@@ -177,12 +178,15 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    pub fn load() -> Result<Self, Error> {
-        Ok(Self {
-            primary: load_ttf_font_from_bytes(PRIMARY_BYTES)?,
-            symbols: load_ttf_font_from_bytes(SYMBOLS_BYTES)?,
-            iosevka: load_ttf_font_from_bytes(IOSEVKA_BYTES)?,
-        })
+    /// The drawing fonts, sharing the parsed font data with `coverage`.
+    /// fontdue keeps every glyph's outline, so a second parse would cost
+    /// about 100 MB more for the three bundled fonts.
+    pub fn load(coverage: &Coverage) -> Self {
+        Self {
+            primary: load_ttf_font_from_fontdue(coverage.primary.clone()),
+            symbols: load_ttf_font_from_fontdue(coverage.symbols.clone()),
+            iosevka: load_ttf_font_from_fontdue(coverage.iosevka.clone()),
+        }
     }
 
     /// The same fonts with empty glyph caches, for a font-size change. Like

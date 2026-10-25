@@ -321,6 +321,25 @@ pub fn load_ttf_font_from_bytes(bytes: &[u8]) -> Result<Font, Error> {
     Ok(font)
 }
 
+/// tai patch: a font from font data the caller has already parsed, set up
+/// as `load_ttf_font_from_bytes` leaves it. Parsing keeps every glyph's
+/// outline in memory, so a caller that also uses the `fontdue::Font` itself
+/// can share it instead of holding a second copy.
+pub fn load_ttf_font_from_fontdue(font: Arc<fontdue::Font>) -> Font {
+    let atlas = Arc::new(Mutex::new(Atlas::new(
+        get_quad_context(),
+        miniquad::FilterMode::Linear,
+    )));
+    let mut font = Font {
+        font,
+        atlas,
+        characters: Arc::new(Mutex::new(HashMap::new())),
+    };
+    font.populate_font_cache(&Font::ascii_character_list(), 15);
+    font.set_filter(get_context().default_filter_mode);
+    font
+}
+
 /// Draw text with given font_size
 /// Returns text size
 pub fn draw_text(

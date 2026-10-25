@@ -201,8 +201,8 @@ async fn main() -> Result<()> {
     // Font sizes are in logical (screen) points; macroquad rasterizes glyphs
     // at font_size * dpi_scale itself, so they stay crisp on HiDPI / Retina
     // displays without scaling here.
-    let mut fonts = Fonts::load()?;
     let coverage = Coverage::new()?;
+    let mut fonts = Fonts::load(&coverage);
 
     // Compute the initial grid from the window size
     // and measured cell metrics.
