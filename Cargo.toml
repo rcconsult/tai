@@ -13,6 +13,8 @@ libghostty-vt = { version = "=0.2.2", features = ["tracing"] }
 macroquad = { version = "0.4.14", default-features = false }
 # Glyph coverage checks for font fallback. Same version macroquad uses.
 fontdue = "0.9.5"
+# Sixel decoding, for translating Sixel into Kitty images (ADR 0006).
+icy_sixel = "0.7.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

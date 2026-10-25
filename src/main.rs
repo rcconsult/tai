@@ -67,6 +67,7 @@ mod placeholders;
 #[path = "pty_windows.rs"]
 mod pty;
 mod shortcuts;
+mod sixel;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -264,6 +265,9 @@ async fn main() -> Result<()> {
         .set_kitty_image_from_temp_file_allowed(true)?
         .set_kitty_image_from_shared_mem_allowed(true)?;
 
+    // Whether DA1 lists Sixel (ADR 0009). tai translates Sixel either way.
+    let advertise_sixel = std::env::var("TAI_SIXEL").as_deref() == Ok("1");
+
     // Register effects so the terminal can respond to VT queries (device
     // attributes, mode reports, size queries, etc.) that programs like
     // vim, tmux, and htop send during startup.  Without these, query
@@ -294,16 +298,27 @@ async fn main() -> Result<()> {
         // device_attributes effect — responds to DA1/DA2/DA3 queries so
         // terminal applications can identify the terminal's capabilities.
         // We report VT220-level conformance with a modest feature set.
-        .on_device_attributes(|_term| {
+        .on_device_attributes(move |_term| {
             Some(DeviceAttributes {
-                // DA1: VT220-level with a few common features.
+                // DA1: VT220-level with a few common features. Sixel only on
+                // request (ADR 0009): textual-image picks Sixel over Kitty
+                // placeholders whenever it's listed.
                 primary: PrimaryDeviceAttributes::new(
                     ConformanceLevel::VT220,
-                    &[
-                        DeviceAttributeFeature::COLUMNS_132,
-                        DeviceAttributeFeature::SELECTIVE_ERASE,
-                        DeviceAttributeFeature::ANSI_COLOR,
-                    ],
+                    if advertise_sixel {
+                        &[
+                            DeviceAttributeFeature::COLUMNS_132,
+                            DeviceAttributeFeature::SIXEL,
+                            DeviceAttributeFeature::SELECTIVE_ERASE,
+                            DeviceAttributeFeature::ANSI_COLOR,
+                        ]
+                    } else {
+                        &[
+                            DeviceAttributeFeature::COLUMNS_132,
+                            DeviceAttributeFeature::SELECTIVE_ERASE,
+                            DeviceAttributeFeature::ANSI_COLOR,
+                        ]
+                    },
                 ),
                 // DA2: VT220-type, version 1, no ROM cartridge.
                 secondary: SecondaryDeviceAttributes {
@@ -336,6 +351,9 @@ async fn main() -> Result<()> {
     // the Kitty keyboard protocol, SGR mouse reporting and tracking modes,
     // etc.
     let mut input = Input::new()?;
+
+    // Translates Sixel images in the pty's output into Kitty images.
+    let mut sixel = sixel::Translator::new();
 
     tracing::info!(
         "tai | simd: {}, optimize: {:?}",
@@ -420,7 +438,12 @@ async fn main() -> Result<()> {
                     pty.wait_readable(ECHO_WAIT);
                 }
 
-                match pty.read(&mut terminal, frame_start + PARSE_DEADLINE) {
+                // Sixel images become Kitty images on the way in (ADR 0006).
+                let cell_height = cell_pixels.get().1;
+                let mut write = |bytes: &[u8]| {
+                    sixel.feed(bytes, cell_height, &mut |out| terminal.vt_write(out));
+                };
+                match pty.read(&mut write, frame_start + PARSE_DEADLINE) {
                     Ok(_) => {}
                     Err(PtyError::EndOfStream) => {
                         // EOF — the child's side of the pty is closed.
@@ -2944,15 +2967,15 @@ mod pty {
             }
         }
 
-        /// Feed the output received so far into the ghostty terminal, until
-        /// `deadline`; the rest waits for the next frame.
-        pub fn read(&self, term: &mut Terminal, deadline: Instant) -> Result<(), PtyError> {
+        /// Pass the output received so far to `sink`, until `deadline`; the
+        /// rest waits for the next frame.
+        pub fn read(&self, sink: &mut dyn FnMut(&[u8]), deadline: Instant) -> Result<(), PtyError> {
             if let Some(chunk) = self.waited.lock().ok().and_then(|mut w| w.take()) {
-                term.vt_write(&chunk?);
+                sink(&chunk?);
             }
             while Instant::now() < deadline {
                 match self.output.try_recv() {
-                    Ok(chunk) => term.vt_write(&chunk?),
+                    Ok(chunk) => sink(&chunk?),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return Err(PtyError::EndOfStream),
                 }

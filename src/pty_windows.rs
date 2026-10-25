@@ -22,7 +22,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use libghostty_vt::Terminal;
 use portable_pty::{
     ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system,
 };
@@ -126,18 +125,18 @@ impl Pty {
         Ok((pty, Child::Active(Handle { killer, exit })))
     }
 
-    /// Feed the output received so far into the ghostty terminal, until
-    /// `deadline`; the rest waits for the next frame.
-    pub fn read(&self, term: &mut Terminal, deadline: Instant) -> Result<(), PtyError> {
+    /// Pass the output received so far to `sink`, until `deadline`; the
+    /// rest waits for the next frame.
+    pub fn read(&self, sink: &mut dyn FnMut(&[u8]), deadline: Instant) -> Result<(), PtyError> {
         if let Some(chunk) = self.waited.lock().ok().and_then(|mut w| w.take()) {
             match chunk {
-                Ok(data) => term.vt_write(&data),
+                Ok(data) => sink(&data),
                 Err(e) => return Err(PtyError::OtherError(e)),
             }
         }
         while Instant::now() < deadline {
             match self.output.try_recv() {
-                Ok(Ok(data)) => term.vt_write(&data),
+                Ok(Ok(data)) => sink(&data),
                 Ok(Err(e)) => return Err(PtyError::OtherError(e)),
                 Err(TryRecvError::Disconnected) => return Err(PtyError::EndOfStream),
                 Err(TryRecvError::Empty) => {
