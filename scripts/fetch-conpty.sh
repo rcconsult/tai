@@ -9,6 +9,7 @@
 # version and all three hashes together.
 set -eu
 
+# Windows means Git Bash or MSYS2, as for the other scripts (ADR 0002).
 case "$(uname -s)" in
     MINGW* | MSYS*) ;;
     *) exit 0 ;;
@@ -35,6 +36,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 id=microsoft.windows.console.conpty
+echo "fetching ConPTY $CONPTY_VERSION from nuget.org" >&2
 curl -sSfL "https://api.nuget.org/v3-flatcontainer/$id/$CONPTY_VERSION/$id.$CONPTY_VERSION.nupkg" \
     -o "$tmp/conpty.nupkg"
 check() {
