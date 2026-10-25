@@ -15,7 +15,7 @@ pub const SYMBOLS_BYTES: &[u8] = include_bytes!("../fonts/SymbolsNerdFontMono-Re
 pub const IOSEVKA_BYTES: &[u8] = include_bytes!("../fonts/IosevkaFixedSS01-Medium.ttf");
 
 /// How a codepoint is drawn: with one of the bundled fonts, or not at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Face {
     Primary,
     Symbols,
@@ -131,6 +131,16 @@ impl Coverage {
             Face::Iosevka
         } else {
             Face::Primary
+        }
+    }
+
+    /// The parsed font that draws `face`, for rasterizing its glyphs.
+    /// `Blank` draws nothing, so any font will do.
+    pub fn font(&self, face: Face) -> &fontdue::Font {
+        match face {
+            Face::Primary | Face::Blank => &self.primary,
+            Face::Symbols => &self.symbols,
+            Face::Iosevka => &self.iosevka,
         }
     }
 

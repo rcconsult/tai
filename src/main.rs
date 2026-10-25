@@ -57,6 +57,7 @@ use crate::fonts::{Coverage, Face, Fonts, is_space};
 use crate::pty::{Child, Pty, PtyError};
 use crate::shortcuts::Action;
 
+mod cells;
 mod clipboard;
 mod fonts;
 mod identity;
@@ -507,6 +508,52 @@ struct Renderer<'alloc> {
     /// Copies the frame to the screen with blending off. See
     /// [`present_material`].
     present_material: Material,
+    /// The cell-buffer renderer of ADR 0008, or `None` for the
+    /// immediate-mode one: under Metal, without instancing, or with
+    /// `TAI_RENDERER=immediate`.
+    cells: Option<CellGrid>,
+}
+
+/// The state of the cell-buffer renderer (ADR 0008). Each viewport row's
+/// backgrounds and glyph instances are rebuilt only when the row is dirty,
+/// as Ghostty's `rebuildRow` does (src/renderer/generic.zig at a887df42),
+/// and every changed frame draws all rows from them: the backgrounds as
+/// one texture with a texel per cell, the text as one instanced draw.
+struct CellGrid {
+    text: cells::TextPass,
+    atlas: cells::GlyphAtlas,
+    rows: Vec<RowCells>,
+    /// What the rows and the atlas were built for.
+    dims: Option<Dimensions>,
+    bg_texture: Option<Texture2D>,
+    bg_pixels: Vec<u8>,
+    instances: Vec<cells::Instance>,
+}
+
+/// One viewport row, as last built.
+#[derive(Default)]
+struct RowCells {
+    /// A colour per cell; transparent where the terminal's background shows.
+    bg: Vec<[u8; 4]>,
+    text: Vec<cells::Instance>,
+    virtual_runs: Vec<placeholders::Placement>,
+}
+
+impl CellGrid {
+    fn new() -> Option<Self> {
+        if use_metal() || std::env::var("TAI_RENDERER").as_deref() == Ok("immediate") {
+            return None;
+        }
+        Some(Self {
+            text: cells::TextPass::new()?,
+            atlas: cells::GlyphAtlas::new(),
+            rows: Vec::new(),
+            dims: None,
+            bg_texture: None,
+            bg_pixels: Vec::new(),
+            instances: Vec::new(),
+        })
+    }
 }
 
 /// A drawn terminal frame and what it was drawn from.
@@ -527,6 +574,7 @@ impl<'alloc> Renderer<'alloc> {
             placement_it: PlacementIterator::new()?,
             frame: None,
             present_material: present_material()?,
+            cells: CellGrid::new(),
         })
     }
 
@@ -548,6 +596,11 @@ impl<'alloc> Renderer<'alloc> {
         coverage: &Coverage,
         force: bool,
     ) -> Result<()> {
+        if let Some(mut grid) = self.cells.take() {
+            let result = self.render_cells(&mut grid, terminal, dims, coverage, force);
+            self.cells = Some(grid);
+            return result;
+        }
         // Snapshot the terminal state into our render state. This is the
         // only point where we need access to the terminal; after this the
         // snapshot owns everything we need to draw the frame.
@@ -915,6 +968,337 @@ impl<'alloc> Renderer<'alloc> {
         // Reset global dirty state so the next update reports changes accurately.
         snapshot.set_dirty(Dirty::Clean)?;
 
+        set_default_camera();
+        if let Some(frame) = &self.frame {
+            Self::present(frame, &self.present_material);
+        }
+        Ok(())
+    }
+
+    /// Render the terminal with the cell-buffer renderer (ADR 0008). Cells
+    /// are read as in the immediate-mode path above, but into per-row
+    /// buffers, and only for dirty rows.
+    fn render_cells(
+        &mut self,
+        grid: &mut CellGrid,
+        terminal: &Terminal<'alloc, '_>,
+        dims: Dimensions,
+        coverage: &Coverage,
+        force: bool,
+    ) -> Result<()> {
+        let snapshot = self.render_state.update(terminal)?;
+        let cursor = if snapshot.cursor_visible()? {
+            snapshot.cursor_viewport()?.map(|vp| (vp.x, vp.y))
+        } else {
+            None
+        };
+        let unchanged = !force
+            && snapshot.dirty()? == Dirty::Clean
+            && self
+                .frame
+                .as_ref()
+                .is_some_and(|f| f.dims == dims && f.cursor == cursor);
+        if unchanged {
+            if let Some(frame) = &self.frame {
+                Self::present(frame, &self.present_material);
+            }
+            return Ok(());
+        }
+        let graphics = terminal.kitty_graphics();
+
+        // Mouse input can change the selection or the viewport without
+        // marking rows, so it rebuilds every row, as do new dimensions.
+        let rebuild = force || snapshot.dirty()? == Dirty::Full || grid.dims != Some(dims);
+        if grid
+            .dims
+            .is_none_or(|d| d.font_size != dims.font_size || d.dpi_scale != dims.dpi_scale)
+        {
+            // A new glyph size: start an empty atlas, as Ghostty builds a
+            // new one per font size (see `Fonts::fresh_caches`).
+            grid.atlas.clear();
+        }
+        grid.dims = Some(dims);
+
+        if self.frame.as_ref().is_none_or(|f| f.dims != dims) {
+            let target = render_target(
+                (dims.window_width * dims.dpi_scale).round() as u32,
+                (dims.window_height * dims.dpi_scale).round() as u32,
+            );
+            target.texture.set_filter(FilterMode::Nearest);
+            self.frame = Some(Frame {
+                target,
+                dims,
+                cursor,
+            });
+        }
+        let frame = self.frame.as_mut().expect("frame was just created");
+        frame.cursor = cursor;
+        let mut camera =
+            Camera2D::from_display_rect(Rect::new(0.0, 0.0, dims.window_width, dims.window_height));
+        // A render target is drawn upside down compared with the screen.
+        camera.zoom.y = -camera.zoom.y;
+        camera.render_target = Some(frame.target.clone());
+        set_camera(&camera);
+
+        let colors = snapshot.colors()?;
+        let CellGrid {
+            text: text_pass,
+            atlas,
+            rows,
+            bg_texture,
+            bg_pixels,
+            instances,
+            ..
+        } = grid;
+
+        let mut row_it = self.row_it.update(&snapshot)?;
+        let mut text = String::with_capacity(16);
+        let mut icons: Vec<Icon> = Vec::new();
+        let mut placeholder_cells: Vec<Option<placeholders::PlaceholderCell>> = Vec::new();
+        let mut row_index = 0;
+        let mut y = PADDING;
+        let transparent = [0; 4];
+        let rgba = |c: RgbColor| [c.r, c.g, c.b, 255];
+
+        while let Some(row) = row_it.next() {
+            if rows.len() <= row_index {
+                rows.push(RowCells::default());
+            }
+            if !rebuild && !row.dirty()? {
+                y += dims.cell_height;
+                row_index += 1;
+                continue;
+            }
+            let built = &mut rows[row_index];
+            built.bg.clear();
+            built.text.clear();
+            built.virtual_runs.clear();
+            let mut x = PADDING;
+            let mut icon_open = false;
+            let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
+            placeholder_cells.clear();
+
+            let mut cell_it = self.cell_it.update(row)?;
+            while let Some(cell) = cell_it.next() {
+                let selected = cell.is_selected()?;
+                let graphemes = cell.graphemes_len()?;
+                let bg = cell.bg_color()?;
+                if graphemes > 0 {
+                    cell.graphemes_utf8(&mut text)?;
+                }
+                if std::mem::take(&mut icon_open)
+                    && (graphemes == 0 || text.chars().next().is_some_and(is_space))
+                    && let Some(icon) = icons.last_mut()
+                {
+                    icon.cells = 2;
+                }
+
+                if placeholder_row {
+                    let cp = (graphemes > 0).then(|| cell.graphemes()).transpose()?;
+                    if let Some(cps) = cp.filter(|c| c.first() == Some(&placeholders::PLACEHOLDER))
+                    {
+                        let style = cell.style()?;
+                        placeholder_cells.push(Some(placeholders::PlaceholderCell {
+                            diacritics: cps[1..].to_vec(),
+                            fg: id_color(style.fg_color),
+                            underline: id_color(style.underline_color),
+                        }));
+                        built.bg.push(bg.map_or(transparent, rgba));
+                        x += dims.cell_width;
+                        continue;
+                    }
+                    placeholder_cells.push(None);
+                }
+
+                if graphemes == 0 {
+                    built.bg.push(if selected {
+                        rgba(colors.foreground)
+                    } else {
+                        bg.map_or(transparent, rgba)
+                    });
+                } else {
+                    let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
+                    let mut has_bg = bg.is_some();
+                    let mut bg = bg.unwrap_or(colors.background);
+                    let mut bold = false;
+                    if cell.has_styling()? {
+                        let style = cell.style()?;
+                        if style.inverse {
+                            std::mem::swap(&mut fg, &mut bg);
+                            has_bg = true;
+                        }
+                        bold = style.bold;
+                    }
+                    if selected {
+                        std::mem::swap(&mut fg, &mut bg);
+                        has_bg = true;
+                    }
+                    built.bg.push(if has_bg { rgba(bg) } else { transparent });
+
+                    let face = text
+                        .chars()
+                        .next()
+                        .map_or(Face::Primary, |ch| coverage.face_for(ch));
+                    if face == Face::Symbols || face == Face::Iosevka {
+                        icons.push(Icon {
+                            text: text.clone(),
+                            face,
+                            x,
+                            y,
+                            fg: color(fg),
+                            bold,
+                            cells: 1,
+                        });
+                        icon_open = true;
+                    } else if face == Face::Primary {
+                        atlas.push_text(
+                            &mut built.text,
+                            coverage.font(face),
+                            face,
+                            &text,
+                            x,
+                            y + dims.baseline,
+                            dims.font_size,
+                            dims.dpi_scale,
+                            color(fg),
+                            bold,
+                        );
+                    }
+                }
+                x += dims.cell_width;
+            }
+
+            // Icons go after the row's text, so one that overhangs into a
+            // blank next cell isn't covered by it.
+            for icon in icons.drain(..) {
+                let place = coverage.place(icon.face, dims.font_size, icon.cells);
+                atlas.push_text(
+                    &mut built.text,
+                    coverage.font(icon.face),
+                    icon.face,
+                    &icon.text,
+                    icon.x,
+                    icon.y + dims.baseline - place.rise,
+                    place.font_size,
+                    dims.dpi_scale,
+                    icon.fg,
+                    icon.bold,
+                );
+            }
+            if placeholder_row {
+                built.virtual_runs = placeholders::row_placements(placeholder_cells.drain(..));
+            }
+            row.set_dirty(false)?;
+            y += dims.cell_height;
+            row_index += 1;
+        }
+        rows.truncate(row_index);
+
+        clear_background(color(colors.background));
+        if let Ok(graphics) = graphics.as_ref() {
+            Self::render_kitty_images(
+                terminal,
+                &mut self.placement_it,
+                graphics,
+                Layer::BelowBg,
+                dims,
+            )?
+        }
+
+        // Backgrounds: one texel per cell, stretched over the grid with
+        // nearest filtering, as Ghostty's cell_bg pass looks up each pixel's
+        // cell (src/renderer/shaders/glsl/cell_bg.f.glsl at a887df42).
+        let cols = rows.iter().map(|r| r.bg.len()).max().unwrap_or(0);
+        if cols > 0 {
+            bg_pixels.clear();
+            bg_pixels.resize(cols * rows.len() * 4, 0);
+            for (r, row) in rows.iter().enumerate() {
+                let start = r * cols * 4;
+                bg_pixels[start..start + row.bg.len() * 4].copy_from_slice(row.bg.as_flattened());
+            }
+            let (w, h) = (cols as u16, rows.len() as u16);
+            let texture = match bg_texture {
+                Some(t) if t.width() as u16 == w && t.height() as u16 == h => {
+                    t.update_from_bytes(w.into(), h.into(), bg_pixels);
+                    t
+                }
+                _ => {
+                    let t = Texture2D::from_rgba8(w, h, bg_pixels);
+                    t.set_filter(FilterMode::Nearest);
+                    bg_texture.insert(t)
+                }
+            };
+            draw_texture_ex(
+                texture,
+                PADDING,
+                PADDING,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(
+                        cols as f32 * dims.cell_width,
+                        rows.len() as f32 * dims.cell_height,
+                    )),
+                    ..Default::default()
+                },
+            );
+        }
+
+        instances.clear();
+        for row in rows.iter() {
+            instances.extend_from_slice(&row.text);
+        }
+        text_pass.draw(
+            instances,
+            atlas,
+            camera.matrix(),
+            frame.target.render_pass.raw_miniquad_id(),
+        );
+
+        if let Ok(graphics) = graphics.as_ref() {
+            Self::render_kitty_images(
+                terminal,
+                &mut self.placement_it,
+                graphics,
+                Layer::BelowText,
+                dims,
+            )?;
+            let virtual_runs: Vec<(u16, placeholders::Placement)> = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
+                .collect();
+            if !virtual_runs.is_empty() {
+                Self::render_virtual_placements(
+                    &mut self.placement_it,
+                    graphics,
+                    &virtual_runs,
+                    dims,
+                )?;
+            }
+        }
+
+        if let Some((x, y)) = cursor {
+            let cursor_color = colors.cursor.unwrap_or(colors.foreground);
+            draw_rectangle(
+                PADDING + x as f32 * dims.cell_width,
+                PADDING + y as f32 * dims.cell_height,
+                dims.cell_width,
+                dims.cell_height,
+                color(cursor_color),
+            );
+        }
+
+        if let Ok(graphics) = graphics.as_ref() {
+            Self::render_kitty_images(
+                terminal,
+                &mut self.placement_it,
+                graphics,
+                Layer::AboveText,
+                dims,
+            )?
+        }
+
+        snapshot.set_dirty(Dirty::Clean)?;
         set_default_camera();
         if let Some(frame) = &self.frame {
             Self::present(frame, &self.present_material);
