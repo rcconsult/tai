@@ -55,6 +55,13 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
   shows one character per line, in any terminal, because `wsl.exe`
   writes UTF-16 into pipes. Set `$env:WSL_UTF8 = '1'` first. Details:
   `docs/lessons/windows-pitfalls.md`.
+- ppxai's TUI (ppxaide) doesn't know `TERM_PROGRAM=tai` yet, so it says
+  "Terminal does not support image display". It picks an image protocol
+  from a fixed list of terminal names (`ppxai/tui/terminal.py`,
+  `detect_image_protocol`). Until `tai` is on that list, as Kitty, set
+  `PPXAI_IMAGE_PROTOCOL=kitty` before starting it (PowerShell:
+  `$env:PPXAI_IMAGE_PROTOCOL = 'kitty'`). With that, its image panel draws
+  in tai (checked on Windows).
 
 ## Licence notes
 
