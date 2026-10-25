@@ -59,6 +59,7 @@ use crate::shortcuts::Action;
 
 mod clipboard;
 mod fonts;
+mod identity;
 mod locale;
 #[cfg(windows)]
 #[path = "pty_windows.rs"]
@@ -2026,6 +2027,8 @@ mod pty {
             // Work out the shell's locale before forking: it may run
             // `defaults` on macOS, and it logs (ADR 0003).
             let locale = crate::locale::child_env();
+            // Other terminals' identity variables to drop (ADR 0005).
+            let foreign = crate::identity::foreign_vars(std::env::vars_os());
 
             // forkpty() combines openpty + fork + login_tty into one call.
             // In the child it sets up the slave side as stdin/stdout/stderr.
@@ -2077,9 +2080,15 @@ mod pty {
                     arg0.push(name);
 
                     // Replace the child process with the user's shell via `exec`.
-                    _ = Command::new(&shell)
+                    let mut command = Command::new(&shell);
+                    for name in &foreign {
+                        command.env_remove(name);
+                    }
+                    _ = command
                         .env("TERM", "xterm-256color")
                         .env("COLORTERM", "truecolor")
+                        // Identify tai, not the terminal that started it.
+                        .envs(crate::identity::vars())
                         // A UTF-8 character type; see src/locale.rs.
                         .envs(locale.iter().map(|(k, v)| (k, v)))
                         .arg0(arg0)

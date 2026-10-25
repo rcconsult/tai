@@ -56,6 +56,14 @@ impl Pty {
             cmd.cwd(dir);
         }
         cmd.env("COLORTERM", "truecolor");
+        // Identify tai, not the terminal that started it (ADR 0005). A
+        // WT_SESSION from Windows Terminal would make programs send Sixel.
+        for name in crate::identity::foreign_vars(std::env::vars_os()) {
+            cmd.env_remove(name);
+        }
+        for (name, value) in crate::identity::vars() {
+            cmd.env(name, value);
+        }
         // Give the shell default Ctrl+C handling. The "ignore Ctrl+C" flag is
         // inherited, so if whatever launched tai set it, ConPTY would never
         // turn the 0x03 we write into a CTRL_C_EVENT and Ctrl+C would never
