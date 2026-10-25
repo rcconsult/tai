@@ -56,6 +56,46 @@ upstream as not-fl3/miniquad#697.
 is opt-in (`macroquad_conf` in `src/main.rs`). Before making Metal the
 default, check that miniquad drains an autorelease pool each frame.
 
+**Upstream status (checked 2026-10-25):**
+
+- #697 is open, with no replies and no linked fix.
+- Neither miniquad 0.4.11, the version macroquad 0.4.16 pins exactly, nor
+  master `39c928fb` (2026-07-25, "metal: collapse consecutive same-target
+  passes into one encoder") creates a pool around the frame. The only
+  `autorelease` is in `native/apple/apple_util.rs`, for a string.
+- The leak is wider than Metal's objects. The loop in `run`
+  (`src/native/macos.rs`) also fetches events with
+  `nextEventMatchingMask`, which returns autoreleased `NSEvent`s.
+  `[NSApp run]` would wrap each event in a pool; miniquad's own loop
+  doesn't.
+
+**The fix, if tai needs Metal:** wrap each pass of that loop, the event
+fetching and `perform_redraw`, in `objc_autoreleasePoolPush()` /
+`objc_autoreleasePoolPop()` from the Objective-C runtime. That's about ten
+lines. tai would carry it as a vendored miniquad patch, like
+`vendor/macroquad`, and offer it upstream on #697.
+
+**Other miniquad issues that bear on macOS:**
+
+- OpenGL frame pacing (#559) was fixed by #623 (CVDisplayLink) in 0.4.9,
+  so tai has it.
+- #694 (open) honours `swap_interval: Some(0)` on macOS. It's only
+  useful for benchmarks and off-screen drawing.
+- #418 (open): Metal draws some sampler filter modes, viewports and line
+  primitives wrongly. Check tai's drawing before switching backends.
+- Metal's `commit_frame` (`src/graphics/metal.rs`) calls
+  `waitUntilCompleted` every frame, so the CPU waits for the GPU and
+  frames can't overlap.
+- Master's Metal fixes from July 2026, encoder collapsing and MSAA
+  handling, aren't in a release yet.
+
+**Metal is not a fix for slow OpenGL drawing by itself.** Apple runs
+OpenGL on top of Metal, so each draw call costs more on OpenGL, and Metal
+removes that layer. But tai's cost is the number of draw calls per frame.
+Batching them (ADR 0008's renderer) helps both backends, and Metal's
+per-frame `waitUntilCompleted` adds its own cost. Measure both backends
+on the slowest Mac with the leak patched before choosing.
+
 ## The text API already applies the DPI scale
 
 In macroquad 0.4.16, `measure_text` and `draw_text_ex` multiply
