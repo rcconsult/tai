@@ -841,6 +841,11 @@ impl<'alloc> Renderer<'alloc> {
         // The two passes, then the icons, which overhang their cell.
         backgrounds.draw();
         glyphs.draw(&fonts.primary, dims.font_size);
+        // Cache every icon glyph before drawing any: see cache_glyphs.
+        for icon in &row_icons {
+            let place = coverage.place(icon.face, dims.font_size, icon.cells);
+            cache_glyphs(&icon.text, fonts.get(icon.face), place.font_size);
+        }
         for icon in row_icons {
             let place = coverage.place(icon.face, dims.font_size, icon.cells);
             let baseline = icon.y + dims.baseline - place.rise;
@@ -1144,6 +1149,8 @@ impl Glyphs {
     }
 
     fn draw(&self, font: &Font, font_size: u16) {
+        // Cache every glyph first: see cache_glyphs.
+        cache_glyphs(&self.text, font, font_size);
         for (range, x, baseline, fg, bold) in &self.cells {
             draw_glyph(
                 &self.text[range.clone()],
@@ -1156,6 +1163,19 @@ impl Glyphs {
             );
         }
     }
+}
+
+/// Put the glyphs of `text` into the font's atlas without drawing them.
+///
+/// macroquad caches a glyph the first time it's drawn. When a new glyph
+/// doesn't fit, the atlas doubles, every glyph moves, and the atlas texture
+/// is replaced. Glyphs of that font already queued in the frame still point
+/// at the old texture and positions, so they draw as nothing or garbage,
+/// and tai's kept frame keeps them that way. Measuring the text caches the
+/// glyphs at the same pixel size `draw_text_ex` uses, so any growth happens
+/// before the first glyph of the frame is queued.
+fn cache_glyphs(text: &str, font: &Font, font_size: u16) {
+    measure_text(text, Some(font), font_size, 1.0);
 }
 
 /// Draw one cell's text with its baseline at `baseline`.
