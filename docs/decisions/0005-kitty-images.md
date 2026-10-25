@@ -1,6 +1,9 @@
 # ADR 0005: Kitty images, from detection to drawing
 
-- **Status:** Proposed 2026-10-25.
+- **Status:** Accepted 2026-10-25 (owner). Implemented in `src/identity.rs`
+  (decision 1) and `src/placeholders.rs` (decision 2); checked on Linux,
+  macOS (1x and Retina 2x) and Windows (through the bundled ConPTY of
+  ADR 0007).
 - **Deciders:** owner. Written by the Claude session on the macOS dev host.
   The Linux and Windows sessions reviewed it, and their findings widened
   decision 1.
