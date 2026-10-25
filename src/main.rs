@@ -177,6 +177,13 @@ const ROW_GAP: f32 = 12.0;
 /// does, so this only bounds the frame time when nothing comes back.
 const ECHO_WAIT: Duration = Duration::from_millis(4);
 
+/// How far into a frame the pty's output may be parsed before the frame is
+/// drawn. Parsing stops earlier once the queued output runs out. A child
+/// that never pauses can't starve the screen, and parsing still gets most
+/// of a 60 Hz frame: a fixed 8 ms per frame halved flood throughput on
+/// Linux and cost about 40% on macOS.
+const PARSE_DEADLINE: Duration = Duration::from_millis(14);
+
 #[macroquad::main(macroquad_conf)]
 async fn main() -> Result<()> {
     // Initialize tracing with default log level set to info.
@@ -340,6 +347,7 @@ async fn main() -> Result<()> {
 
     // Each frame: handle resize → read pty → process input → render.
     loop {
+        let frame_start = Instant::now();
         // Recalculate grid dimensions when the window is resized.
         // We update both the ghostty terminal (so it reflows text) and the
         // pty's winsize (so the child shell knows about the new size and
@@ -407,7 +415,7 @@ async fn main() -> Result<()> {
                     pty.wait_readable(ECHO_WAIT);
                 }
 
-                match pty.read(&mut terminal) {
+                match pty.read(&mut terminal, frame_start + PARSE_DEADLINE) {
                     Ok(_) => {}
                     Err(PtyError::EndOfStream) => {
                         // EOF — the child's side of the pty is closed.
@@ -2270,10 +2278,6 @@ mod pty {
     /// makes a flooding child wait instead of tai's memory growing.
     const QUEUED_CHUNKS: usize = 64;
 
-    /// How long one `read` parses before the frame is drawn, so a child that
-    /// never pauses can't starve the screen.
-    const PARSE_BUDGET: Duration = Duration::from_millis(8);
-
     /// Handle to a pseudo-terminal (PTY).
     ///
     /// A reader thread drains the master into a channel as soon as output
@@ -2415,14 +2419,13 @@ mod pty {
             }
         }
 
-        /// Feed the output received so far into the ghostty terminal, for
-        /// at most PARSE_BUDGET; the rest waits for the next frame.
-        pub fn read(&self, term: &mut Terminal) -> Result<(), PtyError> {
+        /// Feed the output received so far into the ghostty terminal, until
+        /// `deadline`; the rest waits for the next frame.
+        pub fn read(&self, term: &mut Terminal, deadline: Instant) -> Result<(), PtyError> {
             if let Some(chunk) = self.waited.lock().ok().and_then(|mut w| w.take()) {
                 term.vt_write(&chunk?);
             }
-            let start = Instant::now();
-            while start.elapsed() < PARSE_BUDGET {
+            while Instant::now() < deadline {
                 match self.output.try_recv() {
                     Ok(chunk) => term.vt_write(&chunk?),
                     Err(TryRecvError::Empty) => break,

@@ -31,10 +31,6 @@ use crate::Dimensions;
 
 type Chunk = std::io::Result<Vec<u8>>;
 
-/// How long one `read` parses before the frame is drawn, so a child that
-/// never pauses can't starve the screen. The same as the Unix pty's.
-const PARSE_BUDGET: Duration = Duration::from_millis(8);
-
 /// Handle to a pseudo console.
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
@@ -130,17 +126,16 @@ impl Pty {
         Ok((pty, Child::Active(Handle { killer, exit })))
     }
 
-    /// Feed the output received so far into the ghostty terminal, for at
-    /// most PARSE_BUDGET; the rest waits for the next frame.
-    pub fn read(&self, term: &mut Terminal) -> Result<(), PtyError> {
+    /// Feed the output received so far into the ghostty terminal, until
+    /// `deadline`; the rest waits for the next frame.
+    pub fn read(&self, term: &mut Terminal, deadline: Instant) -> Result<(), PtyError> {
         if let Some(chunk) = self.waited.lock().ok().and_then(|mut w| w.take()) {
             match chunk {
                 Ok(data) => term.vt_write(&data),
                 Err(e) => return Err(PtyError::OtherError(e)),
             }
         }
-        let start = Instant::now();
-        while start.elapsed() < PARSE_BUDGET {
+        while Instant::now() < deadline {
             match self.output.try_recv() {
                 Ok(Ok(data)) => term.vt_write(&data),
                 Ok(Err(e)) => return Err(PtyError::OtherError(e)),
