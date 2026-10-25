@@ -50,6 +50,10 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
   resize. If lines ever show out of order after a resize, press Ctrl+L or
   run `clear` to redraw. Details: `docs/lessons/windows-pitfalls.md`,
   "tai may run another app's ConPTY".
+- Windows: piping `wsl.exe` output (for example `wsl --help | more`)
+  shows one character per line, in any terminal, because `wsl.exe`
+  writes UTF-16 into pipes. Set `$env:WSL_UTF8 = '1'` first. Details:
+  `docs/lessons/windows-pitfalls.md`.
 
 ## Licence notes
 

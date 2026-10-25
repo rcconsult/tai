@@ -121,3 +121,17 @@ garbled. The rewritten ConPTY turns some line wraps into hard line breaks
 (450eec48d lists it as unresolved: "`WriteCharsLegacy` emits a `\r\n` …
 This breaks text reflow on window resize"), and hard breaks can't be
 rejoined. Output printed after the resize lays out at the new width.
+
+## `wsl.exe` writes UTF-16 into pipes
+
+`wsl --help | more` in pwsh inside tai showed one character per line. tai
+wasn't the cause: the same happens in any terminal. When its output is
+redirected, `wsl.exe` writes UTF-16LE, and pwsh decodes the bytes as
+UTF-8, so every character arrives followed by a NUL
+(`wsl --help | Select-Object -First 1` gave `0043 0000 006F 0000 …` on
+2026-10-25). `more` breaks the line at each NUL.
+
+`WSL_UTF8=1` makes `wsl.exe` write UTF-8 instead
+(`$env:WSL_UTF8 = '1'`; the same check then gave `0043 006F 0070 …`).
+tai's terminal size was checked at the same time and was right: resizing
+the window reached the shell's console (131×29, 228×37, 78×12).
