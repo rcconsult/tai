@@ -2131,6 +2131,11 @@ mod pty {
         },
         path::PathBuf,
         process::Command,
+        sync::{
+            Mutex,
+            mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+        },
+        time::{Duration, Instant},
     };
 
     use libghostty_vt::Terminal;
@@ -2144,8 +2149,30 @@ mod pty {
 
     use crate::Dimensions;
 
+    type Chunk = Result<Vec<u8>, PtyError>;
+
+    /// Chunks the reader thread may queue before it stops reading, which
+    /// makes a flooding child wait instead of tai's memory growing.
+    const QUEUED_CHUNKS: usize = 64;
+
+    /// How long one `read` parses before the frame is drawn, so a child that
+    /// never pauses can't starve the screen.
+    const PARSE_BUDGET: Duration = Duration::from_millis(8);
+
     /// Handle to a pseudo-terminal (PTY).
-    pub struct Pty(OwnedFd);
+    ///
+    /// A reader thread drains the master into a channel as soon as output
+    /// arrives, as Ghostty's read thread does (`src/termio/Exec.zig`,
+    /// `ReadThread`, at a887df42). Reading only once per frame left the
+    /// child blocked on a full pty buffer while tai drew, which capped a
+    /// full-screen TUI at tai's frame rate. The terminal stays on the main
+    /// thread: libghostty-vt's types are `!Send`.
+    pub struct Pty {
+        fd: OwnedFd,
+        output: Receiver<Chunk>,
+        /// A chunk wait_readable took from `output`, for the next read.
+        waited: Mutex<Option<Chunk>>,
+    }
 
     impl Pty {
         /// Spawn the user's default shell in a new pseudo-terminal.
@@ -2240,46 +2267,54 @@ mod pty {
                     let flags = OFlag::from_bits_retain(raw_flags) | OFlag::O_NONBLOCK;
                     _ = fcntl::fcntl(&fd, fcntl::F_SETFL(flags))?;
 
-                    Ok((Self(fd), Child::Active(child)))
+                    let reader = fd.try_clone()?;
+                    let (tx, output) = mpsc::sync_channel::<Chunk>(QUEUED_CHUNKS);
+                    std::thread::Builder::new()
+                        .name("pty-reader".into())
+                        .spawn(move || read_loop(&reader, &tx))?;
+
+                    let pty = Self {
+                        fd,
+                        output,
+                        waited: Mutex::new(None),
+                    };
+                    Ok((pty, Child::Active(child)))
                 }
             }
         }
 
-        /// Wait until the pty master has output to read, or `timeout` passes.
-        pub fn wait_readable(&self, timeout: std::time::Duration) {
-            let mut fds = [nix::libc::pollfd {
-                fd: self.0.as_raw_fd(),
-                events: nix::libc::POLLIN,
-                revents: 0,
-            }];
-            let ms = timeout.as_millis().try_into().unwrap_or(i32::MAX);
-            // An error or a timeout both just mean "read what there is".
-            _ = unsafe { nix::libc::poll(fds.as_mut_ptr(), 1, ms) };
+        /// Wait until output is available, or `timeout` passes. The reader
+        /// thread's channel has no peek, so a chunk that arrives is kept for
+        /// the next read.
+        pub fn wait_readable(&self, timeout: Duration) {
+            let Ok(mut waited) = self.waited.lock() else {
+                return;
+            };
+            if waited.is_some() {
+                return;
+            }
+            match self.output.recv_timeout(timeout) {
+                Ok(chunk) => *waited = Some(chunk),
+                // read() reports a closed channel.
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+            }
         }
 
-        /// Drain all available output from the pty master and feed it into the
-        /// ghostty terminal. The terminal's VT parser will process any escape
-        /// sequences and update its internal screen/cursor/style state.
-        ///
-        /// Because the fd is non-blocking, read() returns an error with
-        /// EAGAIN once the kernel buffer is empty, at which point we stop.
+        /// Feed the output received so far into the ghostty terminal, for
+        /// at most PARSE_BUDGET; the rest waits for the next frame.
         pub fn read(&self, term: &mut Terminal) -> Result<(), PtyError> {
-            let mut buf = [0u8; 4096];
-            loop {
-                match nix::unistd::read(&self.0, &mut buf) {
-                    // EOF -- the child closed its side of the pty.
-                    Ok(0) => return Err(PtyError::EndOfStream),
-                    Ok(len) => term.vt_write(&buf[..len]),
-
-                    // Distinguish "no data right now" from real errors.
-                    Err(Errno::EAGAIN) => return Ok(()),
-                    Err(Errno::EINTR) => continue, // retry the read
-                    // On Linux, the slave closing often produces EIO rather
-                    // than a clean EOF (read returning 0). Treat it the same.
-                    Err(Errno::EIO) => return Err(PtyError::EndOfStream),
-                    Err(err) => return Err(PtyError::OtherError(err)),
-                };
+            if let Some(chunk) = self.waited.lock().ok().and_then(|mut w| w.take()) {
+                term.vt_write(&chunk?);
             }
+            let start = Instant::now();
+            while start.elapsed() < PARSE_BUDGET {
+                match self.output.try_recv() {
+                    Ok(chunk) => term.vt_write(&chunk?),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return Err(PtyError::EndOfStream),
+                }
+            }
+            Ok(())
         }
 
         /// Best-effort write to the pty master fd. Because the fd is
@@ -2290,7 +2325,7 @@ mod pty {
         pub fn write(&self, data: &[u8]) {
             let mut remaining = data;
             while !remaining.is_empty() {
-                match nix::unistd::write(&self.0, remaining) {
+                match nix::unistd::write(&self.fd, remaining) {
                     Ok(len) => remaining = &remaining[len..],
                     Err(Errno::EINTR) => continue,
                     // EAGAIN or real error -- drop the remainder.
@@ -2306,7 +2341,39 @@ mod pty {
         /// for this ioctl and feed the new window size to it.
         pub fn resize(&self, dims: Dimensions) {
             nix::ioctl_write_ptr_bad!(tiocswinsz, nix::libc::TIOCSWINSZ, nix::pty::Winsize);
-            _ = unsafe { tiocswinsz(self.0.as_raw_fd(), &dims.to_winsize()) };
+            _ = unsafe { tiocswinsz(self.fd.as_raw_fd(), &dims.to_winsize()) };
+        }
+    }
+
+    /// The reader thread: wait for output on the (non-blocking) master, read
+    /// all of it, and queue it for the frame loop. It ends at end of stream,
+    /// on an error, or when the Pty is dropped.
+    fn read_loop(fd: &OwnedFd, tx: &mpsc::SyncSender<Chunk>) {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let mut fds = [nix::libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: nix::libc::POLLIN,
+                revents: 0,
+            }];
+            // Errors other than EINTR show up on the read below.
+            _ = unsafe { nix::libc::poll(fds.as_mut_ptr(), 1, -1) };
+            loop {
+                let chunk = match unistd::read(fd, &mut buf) {
+                    Ok(len) if len > 0 => Ok(buf[..len].to_vec()),
+                    Err(Errno::EAGAIN) => break,
+                    Err(Errno::EINTR) => continue,
+                    // EOF -- the child closed its side of the pty. On Linux,
+                    // the slave closing often produces EIO rather than a
+                    // clean EOF (read returning 0). Treat it the same.
+                    Ok(_) | Err(Errno::EIO) => Err(PtyError::EndOfStream),
+                    Err(err) => Err(PtyError::OtherError(err)),
+                };
+                let last = chunk.is_err();
+                if tx.send(chunk).is_err() || last {
+                    return;
+                }
+            }
         }
     }
 
