@@ -13,7 +13,7 @@ Status is summarised; the record itself is authoritative.
 | [0005](0005-kitty-images.md) | Kitty images: identify tai with `TERM_PROGRAM`, and draw virtual placements | ✅ Accepted 2026-10-25 |
 | [0006](0006-sixel-to-kitty.md) | Accept Sixel by translating it into Kitty images | ✅ Accepted 2026-10-25; not implemented yet |
 | [0007](0007-bundle-conpty.md) | Bundle Microsoft's ConPTY with tai on Windows, so image sequences and DA1 reach tai | ✅ Accepted 2026-10-25 |
-| [0008](0008-gpu-cell-renderer.md) | Draw the grid from GPU cell buffers, as Ghostty does, in milestone (a) | 📝 Proposed 2026-10-25 |
+| [0008](0008-gpu-cell-renderer.md) | Draw the grid from GPU cell buffers, as Ghostty does, in milestone (a) | ✅ Accepted 2026-10-25; prototype on a branch |
 
 Numbering is sequential. The next record is `0009`.
 

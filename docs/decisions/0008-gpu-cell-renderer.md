@@ -1,6 +1,7 @@
 # ADR 0008: Draw the grid from GPU cell buffers, as Ghostty does
 
-- **Status:** Proposed 2026-10-25.
+- **Status:** Accepted 2026-10-25 (owner). The prototype and its macOS
+  measurements follow on their own branch (decision 3).
 - **Deciders:** owner. Written by the Claude session on the macOS dev host.
 - **Related:** [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
   (milestone (a) renders with macroquad; milestone (b) moves to winit +
