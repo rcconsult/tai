@@ -572,6 +572,26 @@ impl<'alloc> Renderer<'alloc> {
             }
             return Ok(());
         }
+        // Obtain the Kitty graphics storage from the terminal. This is a
+        // reference valid until the next mutating terminal call.
+        let graphics = terminal.kitty_graphics();
+
+        // Redraw only the rows that changed when that's safe, as Ghostty's
+        // renderer rebuilds only dirty rows (src/renderer/generic.zig,
+        // rebuildCells, at a887df42). Other rows keep what the frame texture
+        // already holds. A full-screen TUI that updates one line, such as a
+        // spinner, then costs one row instead of the whole screen. Images
+        // can span rows, and mouse input can change the selection or the
+        // viewport without marking rows, so both redraw everything.
+        let mut full = force
+            || snapshot.dirty()? == Dirty::Full
+            || self.frame.as_ref().is_none_or(|f| f.dims != dims);
+        if !full && let Ok(graphics) = graphics.as_ref() {
+            let mut placements = self.placement_it.update(graphics)?;
+            placements.set_layer(Layer::All)?;
+            full = placements.next().is_some();
+        }
+
         if self.frame.as_ref().is_none_or(|f| f.dims != dims) {
             // The texture has the window's size in physical pixels, so text
             // stays as sharp as when it's drawn to the screen directly.
@@ -587,6 +607,9 @@ impl<'alloc> Renderer<'alloc> {
             });
         }
         let frame = self.frame.as_mut().expect("frame was just created");
+        // The cursor is drawn over its row, so the rows it leaves and enters
+        // are redrawn too.
+        let cursor_rows = [frame.cursor, cursor].map(|c| c.map(|(_, y)| y));
         frame.cursor = cursor;
         let mut camera =
             Camera2D::from_display_rect(Rect::new(0.0, 0.0, dims.window_width, dims.window_height));
@@ -597,11 +620,9 @@ impl<'alloc> Renderer<'alloc> {
 
         // Get the terminal's background color from the render state snapshot.
         let colors = snapshot.colors()?;
-        clear_background(color(colors.background));
-
-        // Obtain the Kitty graphics storage from the terminal. This is a
-        // reference valid until the next mutating terminal call.
-        let graphics = terminal.kitty_graphics();
+        if full {
+            clear_background(color(colors.background));
+        }
 
         // Populate the row iterator from the current render state snapshot,
         // resulting in a row *iteration* object, which can be thought of as
@@ -643,6 +664,21 @@ impl<'alloc> Renderer<'alloc> {
         // as a shared pointer, so you can simultaneously iterate through
         // all rows while having a handle to query data for each row.
         while let Some(row) = row_it.next() {
+            if !full {
+                if !row.dirty()? && !cursor_rows.contains(&Some(row_index)) {
+                    y += dims.cell_height;
+                    row_index += 1;
+                    continue;
+                }
+                // Clear the row, padding included, before drawing it again.
+                draw_rectangle(
+                    0.0,
+                    y,
+                    dims.window_width,
+                    dims.cell_height,
+                    color(colors.background),
+                );
+            }
             let mut x = PADDING;
             // Whether the last icon is waiting to learn if the next cell is blank.
             let mut icon_open = false;
