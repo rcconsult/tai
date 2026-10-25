@@ -1,6 +1,9 @@
 # ADR 0007: Bundle Microsoft's ConPTY with tai on Windows
 
-- **Status:** Proposed 2026-10-25.
+- **Status:** Accepted 2026-10-25 (owner). Implemented in
+  `scripts/fetch-conpty.sh`, `scripts/cargo.sh` and `src/pty_windows.rs`;
+  the owner saw a Kitty image drawn in tai on Windows through the bundled
+  ConPTY.
 - **Deciders:** owner. Written by the Claude session on the Windows dev host,
   with review from the Linux session.
 - **Supersedes:** [ADR 0004](0004-windows-system-conpty.md) (use Windows'
@@ -105,9 +108,11 @@ the warning is logged. fmt, clippy and the 29 tests pass.
 
 ## Still to check
 
-- The owner's interactive check with the bundled ConPTY: resize and
-  font-size steps without garbling (the ADR 0004 case), and a Kitty image
-  shown by tai.
+- Done: the owner saw a Kitty image (a direct placement) drawn in tai on
+  2026-10-25, which only the bundled ConPTY lets through.
+- Not yet reported: resize and large font-size steps with the bundled
+  ConPTY, the ADR 0004 garbling case. The resize-quirk bit is ignored by
+  this ConPTY (see Context), so it's expected to pass.
 - Older Windows 10 and 11 builds: only Windows 11 26300 has been tried.
 
 ## Triggers to revisit

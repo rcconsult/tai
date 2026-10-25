@@ -10,7 +10,7 @@ Status is summarised; the record itself is authoritative.
 | [0002](0002-windows-11-support.md) | Windows 11 support: MSVC, ConPTY via portable-pty, loopback TCP to the engine | ✅ Accepted 2026-10-24; engine link waits for milestone (b) |
 | [0003](0003-utf-8-everywhere.md) | UTF-8 everywhere, with the locale sensed per OS | ✅ Accepted 2026-10-24 |
 | [0004](0004-windows-system-conpty.md) | Use Windows' own ConPTY, not whatever `conpty.dll` the DLL search finds | ✅ Accepted 2026-10-25; superseded by 0007 |
-| [0007](0007-bundle-conpty.md) | Bundle Microsoft's ConPTY with tai on Windows, so image sequences and DA1 reach tai | 📝 Proposed 2026-10-25 |
+| [0007](0007-bundle-conpty.md) | Bundle Microsoft's ConPTY with tai on Windows, so image sequences and DA1 reach tai | ✅ Accepted 2026-10-25 |
 
 Numbering is sequential. The next record is `0008`. Records 0005 and 0006 are on their own branches (`kitty-images`, `sixel-adr`) until merged.
 
