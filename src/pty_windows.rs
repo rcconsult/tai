@@ -5,6 +5,12 @@
 //! a channel that `read` drains each frame, and a waiter thread records the
 //! exit status. ConPTY keeps its output pipe open after the shell exits, so
 //! `read` reports end of stream once the waiter has seen the exit.
+//!
+//! Unlike the Unix reader, this one's channel is unbounded. Microsoft warns
+//! that a ConPTY host must keep draining the output pipe on its own thread,
+//! or a blocking write to the input pipe can deadlock against it ("Creating
+//! a Pseudoconsole session", Preparing the communication channels). tai
+//! writes input from the frame loop, so the reader must never stop reading.
 
 use std::{
     io::{Read, Write},
@@ -13,7 +19,7 @@ use std::{
         Arc, Mutex, OnceLock,
         mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use libghostty_vt::Terminal;
@@ -24,6 +30,10 @@ use portable_pty::{
 use crate::Dimensions;
 
 type Chunk = std::io::Result<Vec<u8>>;
+
+/// How long one `read` parses before the frame is drawn, so a child that
+/// never pauses can't starve the screen. The same as the Unix pty's.
+const PARSE_BUDGET: Duration = Duration::from_millis(8);
 
 /// Handle to a pseudo console.
 pub struct Pty {
@@ -120,7 +130,8 @@ impl Pty {
         Ok((pty, Child::Active(Handle { killer, exit })))
     }
 
-    /// Feed all output received so far into the ghostty terminal.
+    /// Feed the output received so far into the ghostty terminal, for at
+    /// most PARSE_BUDGET; the rest waits for the next frame.
     pub fn read(&self, term: &mut Terminal) -> Result<(), PtyError> {
         if let Some(chunk) = self.waited.lock().ok().and_then(|mut w| w.take()) {
             match chunk {
@@ -128,7 +139,8 @@ impl Pty {
                 Err(e) => return Err(PtyError::OtherError(e)),
             }
         }
-        loop {
+        let start = Instant::now();
+        while start.elapsed() < PARSE_BUDGET {
             match self.output.try_recv() {
                 Ok(Ok(data)) => term.vt_write(&data),
                 Ok(Err(e)) => return Err(PtyError::OtherError(e)),
@@ -141,6 +153,7 @@ impl Pty {
                 }
             }
         }
+        Ok(())
     }
 
     /// Wait until output is available, or `timeout` passes. The reader
