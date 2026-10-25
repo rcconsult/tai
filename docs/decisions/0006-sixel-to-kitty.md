@@ -1,6 +1,7 @@
 # ADR 0006: Accept Sixel by translating it into Kitty images
 
-- **Status:** Proposed 2026-10-25.
+- **Status:** Accepted 2026-10-25 (owner). Not implemented yet; the checks
+  listed under decision 3 and Accepted risks are still open.
 - **Deciders:** owner. Written by the Claude session on the Windows dev host.
 - **Related:**
   - [ADR 0005](0005-kitty-images.md) (Kitty images: identity variables
