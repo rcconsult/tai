@@ -223,6 +223,8 @@ async fn main() -> Result<()> {
     // screen and makes the shell redraw its prompt, so a run of size steps
     // is applied once, after the last one.
     let mut resize_due: Option<Instant> = None;
+    // Whether mode 2048 (in-band size reports) was set after the last read.
+    let mut in_band_resize = false;
 
     // Spawn a child shell connected to a pseudo-terminal. On Windows this
     // restricts tai's DLL search to its own folder and System32 (ADR 0007),
@@ -430,6 +432,16 @@ async fn main() -> Result<()> {
                         child.mark_exited();
                     }
                 }
+
+                // Send a size report when mode 2048 gets set, as Ghostty's
+                // app does (src/termio/stream_handler.zig, at a887df42);
+                // libghostty-vt only sends one on resize. Textual waits for
+                // it before it reads SGR-Pixels mouse reports as pixels.
+                let reports = terminal.mode(Mode::IN_BAND_RESIZE)?;
+                if reports && !in_band_resize {
+                    pty.write(in_band_size_report(grid_size.get(), cell_pixels.get()).as_bytes());
+                }
+                in_band_resize = reports;
             }
             // Try to reap the child if it had already exited.
             //
@@ -1801,6 +1813,29 @@ impl EventHandler for KeyEvents {
     }
 }
 
+/// Whether `ch` is the character macOS reports for a function key: U+F700
+/// to U+F8FF for the arrows, Home, F1 and so on (NSUpArrowFunctionKey...).
+/// miniquad passes them on as typed characters. Given as the key's text,
+/// the encoder sends that character instead of the key's sequence once a
+/// program enables the Kitty keyboard protocol (ESC[>1u), as ppxaide
+/// does: U+F701 for the down arrow, not ESC[B (see the test). Ghostty's
+/// macOS app drops them
+/// the same way (macos/Sources/Ghostty/NSEvent+Extension.swift,
+/// `ghosttyCharacters`, at a887df42).
+fn is_function_key_char(ch: char) -> bool {
+    ('\u{f700}'..='\u{f8ff}').contains(&ch)
+}
+
+/// The mode 2048 size report, ESC [ 48 ; rows ; cols ; height ; width t,
+/// encoded like Ghostty's src/terminal/size_report.zig (at a887df42).
+fn in_band_size_report((cols, rows): (u16, u16), (cell_w, cell_h): (u32, u32)) -> String {
+    let (height, width) = (
+        u64::from(rows) * u64::from(cell_h),
+        u64::from(cols) * u64::from(cell_w),
+    );
+    format!("\x1b[48;{rows};{cols};{height};{width}t")
+}
+
 fn mods_from(keymods: KeyMods) -> key::Mods {
     let mut mods = key::Mods::empty();
     if keymods.shift {
@@ -1993,7 +2028,7 @@ impl<'alloc> Input<'alloc> {
                     // becomes ESC[3;5u) instead of the control byte, and
                     // ConPTY doesn't treat that as Ctrl+C. The encoder
                     // derives control bytes from the key and mods anyway.
-                    if ch.is_control() {
+                    if ch.is_control() || is_function_key_char(ch) {
                         continue;
                     }
                     if chars_before_keys {
@@ -2215,11 +2250,24 @@ impl<'alloc> Input<'alloc> {
 
         let mods = Self::keyboard_mods();
 
+        // The encoder works in surface pixels, which are physical pixels
+        // (include/ghostty/vt/mouse/encoder.h). macroquad reports logical
+        // points, so scale them. SGR-Pixels reports (mode 1016) then share
+        // units with the window size tai reports (ws_xpixel, CSI 14 t), and
+        // programs that divide one by the other land on the right cell on
+        // Retina displays too. Ghostty's app does the same: its
+        // mouse_encode.zig posToPixels (at a887df42) reports surface pixels.
+        let scale = dims.dpi_scale;
         let (x, y) = mouse_position();
         self.mouse_event
             .set_mods(mods)
-            .set_position(mouse::Position { x, y });
+            .set_position(mouse::Position {
+                x: x * scale,
+                y: y * scale,
+            });
 
+        let (cell_width, cell_height) = dims.cell_pixels();
+        let padding = (PADDING * scale) as u32;
         self.mouse_encoder
             // Sync encoder tracking mode and format from terminal state so
             // mode changes (e.g. applications enabling SGR mouse reporting)
@@ -2228,14 +2276,14 @@ impl<'alloc> Input<'alloc> {
             // Provide the encoder with the current terminal geometry so it
             // can convert pixel positions to cell coordinates.
             .set_size(mouse::EncoderSize {
-                screen_width: dims.window_width as u32,
-                screen_height: dims.window_height as u32,
-                cell_width: dims.cell_width as u32,
-                cell_height: dims.cell_height as u32,
-                padding_top: PADDING as u32,
-                padding_bottom: PADDING as u32,
-                padding_left: PADDING as u32,
-                padding_right: PADDING as u32,
+                screen_width: (dims.window_width * scale) as u32,
+                screen_height: (dims.window_height * scale) as u32,
+                cell_width,
+                cell_height,
+                padding_top: padding,
+                padding_bottom: padding,
+                padding_left: padding,
+                padding_right: padding,
             })
             .set_any_button_pressed(any_pressed)
             // Enable motion deduplication so the encoder suppresses redundant
@@ -3042,6 +3090,71 @@ mod tests {
         assert_eq!((u32::from(w / cols), u32::from(h / rows)), d.cell_pixels());
         assert_eq!((w % cols, h % rows), (0, 0));
         assert!(f32::from(w) <= (800.0 - 2.0 * PADDING) * 2.0);
+    }
+
+    #[test]
+    fn in_band_size_report_matches_resize() {
+        use libghostty_vt::{Terminal, TerminalOptions};
+        use std::{cell::RefCell, rc::Rc};
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let s = sent.clone();
+        terminal
+            .on_pty_write(move |_t, data| s.borrow_mut().extend_from_slice(data))
+            .unwrap();
+        terminal.vt_write(b"\x1b[?2048h");
+        // Setting the mode sends nothing; tai has to.
+        assert!(sent.borrow().is_empty());
+        // libghostty-vt's own report on resize is what tai's must match.
+        terminal.resize(100, 30, 9, 18).unwrap();
+        let expected = super::in_band_size_report((100, 30), (9, 18));
+        assert_eq!(expected, "\x1b[48;30;100;540;900t");
+        assert_eq!(*sent.borrow(), expected.as_bytes());
+    }
+
+    #[test]
+    fn arrow_with_macos_function_key_text() {
+        use libghostty_vt::{
+            Terminal, TerminalOptions,
+            key::{self, Key},
+        };
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        // Kitty keyboard protocol, disambiguate (what ppxaide pushes).
+        terminal.vt_write(b"\x1b[>1u");
+        let mut encoder = key::Encoder::new().unwrap();
+        let mut event = key::Event::new().unwrap();
+        let mut encode = |text: Option<&str>| {
+            event
+                .set_action(key::Action::Press)
+                .set_key(Key::ArrowDown)
+                .set_mods(key::Mods::empty())
+                .set_consumed_mods(key::Mods::empty())
+                .set_unshifted_codepoint('\0')
+                .set_utf8(text);
+            let mut out = Vec::new();
+            encoder
+                .set_options_from_terminal(&terminal)
+                .encode_to_vec(&event, &mut out)
+                .unwrap();
+            out
+        };
+        // Without text the arrow is its CSI sequence; with macOS's function
+        // key character as text it would be that character, which is why
+        // is_function_key_char drops it.
+        assert_eq!(encode(None), b"\x1b[B");
+        assert_eq!(encode(Some("\u{f701}")), "\u{f701}".as_bytes());
+        assert!(super::is_function_key_char('\u{f701}'));
+        assert!(!super::is_function_key_char('a'));
     }
 
     #[test]
