@@ -1245,6 +1245,20 @@ impl Dimensions {
         let rows = ((self.window_height - 2.0 * PADDING) / self.cell_height).max(1.0) as u16;
         (cols, rows)
     }
+
+    /// The grid's size in physical pixels, as the pty reports it: whole
+    /// cells only, without the padding or the leftover part of a cell.
+    /// Programs divide this by the grid size to get the cell size (as
+    /// textual-image does to size images), so it must match `cell_pixels`.
+    /// This is what Ghostty reports with balanced padding
+    /// (`src/renderer/size.zig`, `Size.terminal`, at a887df42).
+    fn grid_pixels(self) -> (u16, u16) {
+        let (cols, rows) = self.grid_size();
+        let (cell_w, cell_h) = self.cell_pixels();
+        let px = |cells: u16, cell: u32| (u32::from(cells) * cell).min(u32::from(u16::MAX)) as u16;
+        (px(cols, cell_w), px(rows, cell_h))
+    }
+
     fn update(&mut self, font: Option<&Font>) -> bool {
         // The DPI scale may not be final on the first frame, or may change
         // when the window moves between displays; re-measure the cells then.
@@ -1262,11 +1276,12 @@ impl Dimensions {
     #[cfg(unix)]
     fn to_winsize(self) -> nix::pty::Winsize {
         let (cols, rows) = self.grid_size();
+        let (xpixel, ypixel) = self.grid_pixels();
         nix::pty::Winsize {
             ws_col: cols,
             ws_row: rows,
-            ws_xpixel: (self.window_width * self.dpi_scale) as u16,
-            ws_ypixel: (self.window_height * self.dpi_scale) as u16,
+            ws_xpixel: xpixel,
+            ws_ypixel: ypixel,
         }
     }
 }
@@ -2534,7 +2549,35 @@ mod pty {
 
 #[cfg(test)]
 mod tests {
-    use super::Input;
+    use super::{Dimensions, Input, PADDING};
+
+    fn dims(window: (f32, f32), cell: (f32, f32), dpi_scale: f32) -> Dimensions {
+        Dimensions {
+            window_width: window.0,
+            window_height: window.1,
+            cell_width: cell.0,
+            cell_height: cell.1,
+            font_size: 16,
+            baseline: 0.0,
+            dpi_scale,
+        }
+    }
+
+    #[test]
+    fn pty_pixels_cover_whole_cells_only() {
+        // An 800x600 window with 6x20 cells and 6 px of padding: 131 cols
+        // (786 px) and 29 rows (580 px), not the window's 800x600.
+        let d = dims((800.0, 600.0), (6.0, 20.0), 1.0);
+        assert_eq!(d.grid_size(), (131, 29));
+        assert_eq!(d.grid_pixels(), (786, 580));
+        // At 2x the pixels double with the cells, and pixels / cells is
+        // exactly the cell size the terminal reports (CSI 16 t).
+        let d = dims((800.0, 600.0), (6.5, 19.5), 2.0);
+        let ((cols, rows), (w, h)) = (d.grid_size(), d.grid_pixels());
+        assert_eq!((u32::from(w / cols), u32::from(h / rows)), d.cell_pixels());
+        assert_eq!((w % cols, h % rows), (0, 0));
+        assert!(f32::from(w) <= (800.0 - 2.0 * PADDING) * 2.0);
+    }
 
     #[test]
     fn ctrl_chords_map_to_c0_controls() {
