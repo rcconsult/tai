@@ -229,11 +229,12 @@ pub enum PtyError {
 
 fn pty_size(dims: Dimensions) -> PtySize {
     let (cols, rows) = dims.grid_size();
+    let (pixel_width, pixel_height) = dims.grid_pixels();
     PtySize {
         rows,
         cols,
-        pixel_width: (dims.window_width * dims.dpi_scale) as u16,
-        pixel_height: (dims.window_height * dims.dpi_scale) as u16,
+        pixel_width,
+        pixel_height,
     }
 }
 
