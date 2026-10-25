@@ -150,3 +150,37 @@ Constraints for a port into the current stack:
   using it instead.
 - tai needs colour glyphs (emoji). Ghostty keeps a separate colour atlas
   for those.
+
+## Notes
+
+- **2026-10-25, prototype measurements on the macOS dev host** (decision 3;
+  Intel HD 5000, OpenGL, the 1x display, 131×29 grid). Medians of three
+  alternating rounds against main 180bfd9. "Immediate" is the prototype
+  build with `TAI_RENDERER=immediate`, which matched main's own binary
+  within noise.
+
+  | Test | Immediate, dev | Cells, dev | Immediate, release | Cells, release |
+  |---|---|---|---|---|
+  | Full-colour fill, CPU | 20.4% | 15.6% | 10.2% | 8.1% |
+  | Same with backgrounds, CPU | 22.4% | 16.4% | 13.1% | 10.0% |
+  | Fill, render time per frame (max) | 2.4 ms (10.8) | 1.5 ms (6.6) | 0.81 ms (3.9) | 0.34 ms (1.6) |
+  | 22 MB `cat` | 0.82 s | 0.69 s | 0.63 s | 0.68 s |
+  | One-row update, render time | 0.06 ms | 0.10 ms | 0.04 ms | 0.05 ms |
+  | Idle, CPU | 4.0% | 4.3% | 4.0% | 4.0% |
+
+  - The release `cat` times overlap (0.51–0.77 s).
+  - A one-row update costs a little more, because every changed frame
+    redraws all rows from the buffers instead of repainting one row.
+  - Typing, measured with a throwaway key-to-echo probe in release builds:
+    zsh echoes in 0.1–0.5 ms on both. In frames over 25 ms during heavy
+    ppxaide redraws, the renderer's CPU side took 1.1 ms on average (at
+    most 3.0) with cells and 2.3–2.8 ms (at most 6.3) with immediate
+    mode. The slow frames were 25–45 ms of
+    `next_frame` (buffer swap and GPU) on both renderers. Removing those
+    stalls needs a different backend, not a different renderer.
+  - A static colourful screen (backgrounds, bold, inverse, icons, true
+    colour) is pixel-identical between the two. On a 1000-glyph screen,
+    1787 edge pixels at the tops of tall accented glyphs differ by up to
+    57/255: macroquad's atlas puts its first row of glyphs against the
+    texture edge, so linear filtering brightens their top pixel.
+  - Not yet checked: the Retina display, font-size steps, Linux, Windows.
