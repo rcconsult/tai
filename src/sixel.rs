@@ -25,6 +25,10 @@ pub const MAX_RGBA: usize = 64 * 1024 * 1024;
 /// bound as the decoded one.
 const MAX_SEQUENCE: usize = MAX_RGBA;
 
+/// The longest DCS head (`ESC P` and its parameters) held back while
+/// waiting for the final byte. Real heads are a few bytes.
+const MAX_HEAD: usize = 256;
+
 /// The largest base64 payload in one Kitty command.
 const KITTY_CHUNK: usize = 4096;
 
@@ -128,7 +132,14 @@ impl Translator {
                     i += 1;
                     run = i;
                     match b {
-                        b'0'..=b'9' | b';' => self.seq.push(b),
+                        b'0'..=b'9' | b';' if self.seq.len() < MAX_HEAD => self.seq.push(b),
+                        b'0'..=b'9' | b';' => {
+                            // Too long for a real head: stop holding it back.
+                            self.seq.push(b);
+                            sink(&self.seq);
+                            self.seq.clear();
+                            self.state = State::Ground;
+                        }
                         b'q' => {
                             self.seq.push(b);
                             self.state = State::Sixel;
@@ -225,6 +236,15 @@ impl Translator {
     fn finish(&mut self, cell_height: u32, sink: &mut dyn FnMut(&[u8])) {
         self.seq.extend_from_slice(b"\x1b\\");
         let seq = std::mem::take(&mut self.seq);
+        // icy_sixel allows up to 64 Mi pixels (256 MB of RGBA), so check the
+        // size the sequence asks for before letting it allocate.
+        let (width, height) = drawn_size(&seq);
+        if width.saturating_mul(height).saturating_mul(4) > MAX_RGBA as u64 {
+            tracing::warn!(
+                "sixel: {width}x{height} image is over {MAX_RGBA} bytes of RGBA, dropped"
+            );
+            return;
+        }
         let image = match SixelImage::decode(&seq) {
             Ok(image) => image,
             Err(e) => {
@@ -253,6 +273,74 @@ impl Translator {
             sink(b"\n");
         }
     }
+}
+
+/// An upper bound on the pixel size a Sixel sequence decodes to, from its
+/// raster attributes (`" Pan;Pad;Ph;Pv`), the columns its sixels and repeats
+/// (`!n`) reach, and its bands (`-`, six pixel rows each). Saturates instead
+/// of overflowing, so a huge repeat count gives a huge size.
+pub fn drawn_size(seq: &[u8]) -> (u64, u64) {
+    let body = match seq.iter().position(|&c| c == b'q') {
+        Some(q) => &seq[q + 1..],
+        None => return (0, 0),
+    };
+    // Up to the terminator: the '\' of ESC \ is in the sixel range.
+    let body = &body[..body
+        .iter()
+        .position(|&c| c == ESC || c == ST_C1)
+        .unwrap_or(body.len())];
+    let number = |bytes: &[u8], i: &mut usize| -> u64 {
+        let mut n: u64 = 0;
+        while let Some(&c) = bytes.get(*i).filter(|c| c.is_ascii_digit()) {
+            n = n.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+            *i += 1;
+        }
+        n
+    };
+    let (mut x, mut max_x, mut bands): (u64, u64, u64) = (0, 0, 1);
+    let (mut raster_w, mut raster_h) = (0, 0);
+    let mut repeat = 1;
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        i += 1;
+        match c {
+            b'"' => {
+                let mut params = [0u64; 4];
+                for (k, param) in params.iter_mut().enumerate() {
+                    *param = number(body, &mut i);
+                    if k < 3 && body.get(i) == Some(&b';') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                raster_w = params[2];
+                raster_h = params[3];
+            }
+            b'#' => {
+                while body
+                    .get(i)
+                    .is_some_and(|c| c.is_ascii_digit() || *c == b';')
+                {
+                    i += 1;
+                }
+            }
+            b'!' => repeat = number(body, &mut i).max(1),
+            b'?'..=b'~' => {
+                x = x.saturating_add(repeat);
+                max_x = max_x.max(x);
+                repeat = 1;
+            }
+            b'$' => x = 0,
+            b'-' => {
+                x = 0;
+                bands = bands.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    (max_x.max(raster_w), bands.saturating_mul(6).max(raster_h))
 }
 
 /// Cell rows an image of `height` pixels covers: ceil(height / cell height).
@@ -463,6 +551,35 @@ mod tests {
         let image = graphics.image(2_147_483_647).expect("image stored");
         assert_eq!(image.width().unwrap(), 3);
         assert_eq!(image.height().unwrap(), 36);
+    }
+
+    #[test]
+    fn drawn_size_bounds_the_decoded_image() {
+        use super::drawn_size;
+        // Three columns, one band.
+        assert_eq!(drawn_size(RED), (3, 6));
+        // Raster attributes larger than what's drawn win.
+        assert_eq!(drawn_size(b"\x1bPq\"1;1;100;50#0~\x1b\\"), (100, 50));
+        // Repeats and bands.
+        assert_eq!(drawn_size(b"\x1bPq#0!20~-!5~$!7~\x1b\\"), (20, 12));
+        // A repeat count past u64 saturates instead of wrapping.
+        let huge = b"\x1bPq!99999999999999999999999~\x1b\\";
+        assert_eq!(drawn_size(huge).0, u64::MAX);
+    }
+
+    #[test]
+    fn oversized_images_are_dropped_before_decoding() {
+        // 20000 x 1200 x 4 bytes is over 64 MB, from a sequence of a few bytes.
+        let big: &[u8] = b"before\x1bPq#0;2;100;0;0#0!20000~\x22\x31;1;20000;1200\x1b\\after";
+        assert_eq!(run(&[big], 20), b"beforeafter");
+    }
+
+    #[test]
+    fn a_long_dcs_head_is_passed_through() {
+        let head = [b"\x1bP".as_slice(), &[b'1'; 400], b"q#0~\x1b\\"].concat();
+        let out = run(&[&head], 20);
+        // Not held back or translated: everything reaches libghostty-vt.
+        assert_eq!(out, head);
     }
 
     #[test]
