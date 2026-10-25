@@ -110,9 +110,9 @@ the warning is logged. fmt, clippy and the 29 tests pass.
 
 - Done: the owner saw a Kitty image (a direct placement) drawn in tai on
   2026-10-25, which only the bundled ConPTY lets through.
-- Not yet reported: resize and large font-size steps with the bundled
-  ConPTY, the ADR 0004 garbling case. The resize-quirk bit is ignored by
-  this ConPTY (see Context), so it's expected to pass.
+- Done: resize and large font-size steps with the bundled ConPTY, the
+  ADR 0004 garbling case, showed no garbling (owner, 2026-10-25; note
+  added 2026-10-25 after acceptance).
 - Older Windows 10 and 11 builds: only Windows 11 26300 has been tried.
 
 ## Triggers to revisit
