@@ -7,6 +7,9 @@
     and virtual placements). This record adds a second way for images to
     reach the same Kitty path; it doesn't replace either of 0005's
     decisions.
+  - [ADR 0007](0007-bundle-conpty.md) (bundled ConPTY). On Windows this
+    record depends on it: Windows' own ConPTY swallows Sixel and answers
+    DA1 itself.
   - [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md):
     libghostty-vt has no renderer, so tai draws images itself.
   - Future: an image and document preview feature (see the last section).
@@ -27,6 +30,16 @@
   the current cell size, plus the pixel offsets), so the protocol's
   sizing keys (`c`, `r`, `X`, `Y`, the source rectangle) already decide
   what's on screen.
+- libghostty-vt honours Kitty's `C=1` (don't move the cursor) and `q=`
+  (quiet), and gives an image sent without `i=` an id of its own, counting
+  up from 2147483647, and sends no reply for it
+  (`src/terminal/kitty/graphics_exec.zig`, `graphics_storage.zig`).
+
+**On Windows, Sixel reaches tai only through the bundled ConPTY**
+([ADR 0007](0007-bundle-conpty.md)). Windows' own ConPTY (Windows 11 build
+26300) swallows Sixel DCS and Kitty APC sequences and answers DA1 itself
+without feature 4, so neither this record nor tai's DA1 reply would have
+any effect there. The bundled ConPTY passes all three through to tai.
 
 **Programs that tai's users run choose Sixel first:**
 
@@ -71,21 +84,36 @@ e2a98e1b, "escape-parser: Fix no_std build and add CI coverage"):
 
 1. **Advertise Sixel.** Add feature 4 to tai's DA1 reply.
 2. **Translate Sixel into a Kitty image.** tai scans the PTY output before
-   `vt_write` for `ESC P … q` sequences that aren't inside another string
-   (the scan state survives read boundaries). For each one:
+   `vt_write` for Sixel DCS sequences (`ESC P … q`, or 8-bit `0x90 … q`)
+   that aren't inside another string. The scan state survives read
+   boundaries, and CAN or SUB aborts a sequence as it does in libghostty-vt's
+   parser. For each one:
    - Decode it with `icy_sixel` into an RGBA buffer, refusing images over
-     tai's size limit (see 4).
+     tai's size limit (see 4). Keep the alpha channel: with `P2=1`, pixels
+     the image doesn't paint are transparent, not background colour.
    - Pass on, in its place, a Kitty transmit-and-display command: `a=T`,
-     `f=32`, `s`/`v` set to the decoded size, base64 payload in chunks of
-     4096 bytes or less with `m=1` on all but the last, and a tai-chosen
-     image id.
+     `f=32`, `q=2`, `s`/`v` set to the decoded size, and base64 payload in
+     chunks of 4096 bytes or less with `m=1` on all but the last.
+   - Send no `i=`. libghostty-vt then picks its own id, from a range
+     programs don't use, so the image can't replace one of the program's
+     own Kitty images. Without `i=` and with `q=2`, nothing is written back
+     to the program, which never asked for a Kitty reply.
    - Everything else in the stream passes through unchanged. Kitty
      sequences go straight to libghostty-vt as today.
-3. **Keep Sixel's cursor semantics.** A Sixel image leaves the cursor on its
-   last row, in its starting column; a Kitty image moves it past the
-   bottom-right corner. The Kitty command carries `C=1` (don't move the
-   cursor), and tai then passes on one line feed per image row but the last,
-   so the text scrolls exactly as it would for Sixel.
+3. **Keep Sixel's cursor semantics, as WezTerm does.** WezTerm leaves the
+   cursor on the image's last cell row, in its starting column. Between rows
+   it issues a line feed that keeps the column, so text scrolls with the
+   image, and it moves past the image only with "Sixel scrolls right" set
+   (`term/src/terminalstate/image.rs`, `assign_image_to_cells`, WezTerm
+   main e2a98e1b). A Kitty image instead moves the cursor past the
+   bottom-right corner.
+   - The Kitty command carries `C=1` (don't move the cursor). tai then
+     passes on one line feed per cell row but the last, keeping the column.
+   - Cell rows are `ceil(pixel height / cell height)` at the current cell
+     size, as in WezTerm.
+   - To check: xterm and the VT340 may leave the cursor on the line below
+     the image instead. That hasn't been checked against xterm's source.
+     If tai's users' programs assume the xterm behaviour, follow xterm.
    - To check: placement and scrolling for an image that starts near the
      bottom of the screen.
    - DECSDM (Sixel display mode) and "Sixel scrolls right" are out of scope
@@ -125,6 +153,15 @@ query tai instead of assuming another terminal's protocol.
   libghostty-vt already does for Kitty placements.
 - **Patch Ghostty to parse Sixel:** a large patch on the pin (see
   `patches/ghostty/`), and Ghostty upstream doesn't have Sixel to backport.
+- **Patch Ghostty to hand unknown DCS sequences to the embedder:** smaller
+  than a Sixel parser, and it would reuse libghostty-vt's string tracking
+  (OSC, APC and DCS, 8-bit C1, CAN and SUB) instead of a second scanner.
+  `dcs.zig`'s `hook` already sees every unknown DCS before dropping it. But
+  it needs a new callback in libghostty-vt's C API, then in the
+  `libghostty-vt-sys` and `libghostty-vt` crates, which tai takes from
+  crates.io. That's three patched layers to carry until upstream accepts
+  such a hook. Revisit if the scanner proves fragile, or upstream adds
+  the hook.
 - **Port WezTerm's decoder instead of using `icy_sixel`:** about 100 lines,
   without `unsafe`, but the tokenizer would have to be ported too, along
   with the bounds that CVE-2022-24130 showed are needed. Revisit if
@@ -137,16 +174,33 @@ query tai instead of assuming another terminal's protocol.
 ## Accepted risks
 
 - The stream scanner is new parsing code in front of libghostty-vt. A bug
-  could swallow or corrupt output. It needs unit tests with sequences
-  split across read boundaries, and with `ESC P` inside OSC or APC strings.
+  could swallow or corrupt output. It needs unit tests with:
+  - sequences split across read boundaries;
+  - `ESC P` inside OSC or APC strings;
+  - 8-bit C1 DCS (`0x90`) and ST (`0x9C`);
+  - sequences aborted by CAN or SUB.
 - `icy_sixel` brings `unsafe` and an unused encoder dependency.
 - Translated images count against the same 64 MB Kitty storage, so heavy
-  Sixel output (video players) evicts older images sooner.
+  Sixel output (video players) evicts older images sooner. One image at
+  the per-image limit fills the whole store and evicts every other image.
+- Advertising Sixel invites XTSMGRAPHICS queries (`CSI ? 1 ; 1 ; 0 S`
+  for colour registers, `CSI ? 2 ; 1 ; 0 S` for geometry), which
+  libghostty-vt doesn't answer. textual-image and Rich don't send them
+  (checked in their installed sources). Other programs, such as chafa,
+  haven't been checked; a program that waits for the answer without a
+  timeout would hang.
+- On Windows, ConPTY keeps its own copy of the screen. If it doesn't move
+  its cursor for a Sixel image the way tai does, the two disagree about
+  where the cursor is. That's the same kind of drift as the resize garbling
+  in ADR 0004. To check: print text after an image, then resize the window
+  so ConPTY repaints.
 
 ## Triggers to revisit
 
 - Ghostty or libghostty-vt gains Sixel, or a DCS callback for the embedder.
 - A program needs DECSDM, "Sixel scrolls right", or XTSMGRAPHICS answers.
+- A program misplaces text after a Sixel image in tai: check the cursor
+  rule in decision 3 against xterm.
 - tai adds iTerm2 inline images: extend the translator rather than adding a
   second path.
 
