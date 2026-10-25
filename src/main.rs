@@ -654,6 +654,17 @@ impl<'alloc> Renderer<'alloc> {
         // cell's background must not paint over it.
         let mut icons: Vec<Icon> = Vec::new();
 
+        // Backgrounds and text are queued and drawn in two passes once all
+        // rows are read, as Ghostty's renderer keeps separate background
+        // and text cell buffers (src/renderer/generic.zig at a887df42).
+        // Drawing each cell's background and then its glyph switched
+        // textures on every cell, and every switch is a separate draw call:
+        // a TUI that colours every cell's background took about a second
+        // per frame on the macOS dev host's Intel GPU.
+        let mut backgrounds = Backgrounds::default();
+        let mut glyphs = Glyphs::default();
+        let mut row_icons: Vec<Icon> = Vec::new();
+
         // Kitty Unicode placeholder runs, by viewport row, drawn once all
         // text is down (ADR 0005), and the current row's placeholder cells.
         let mut virtual_runs: Vec<(u16, placeholders::Placement)> = Vec::new();
@@ -671,7 +682,7 @@ impl<'alloc> Renderer<'alloc> {
                     continue;
                 }
                 // Clear the row, padding included, before drawing it again.
-                draw_rectangle(
+                backgrounds.push(
                     0.0,
                     y,
                     dims.window_width,
@@ -722,7 +733,7 @@ impl<'alloc> Renderer<'alloc> {
                             underline: id_color(style.underline_color),
                         }));
                         if let Some(bg) = bg {
-                            draw_rectangle(x, y, dims.cell_width, dims.cell_height, color(bg));
+                            backgrounds.push(x, y, dims.cell_width, dims.cell_height, color(bg));
                         }
                         x += dims.cell_width;
                         continue;
@@ -732,7 +743,7 @@ impl<'alloc> Renderer<'alloc> {
 
                 if graphemes == 0 {
                     if selected {
-                        draw_rectangle(
+                        backgrounds.push(
                             x,
                             y,
                             dims.cell_width,
@@ -742,7 +753,7 @@ impl<'alloc> Renderer<'alloc> {
                     } else if let Some(bg) = bg {
                         // The cell has no text, but it might have a background
                         // color (e.g. from an erase with a color set).
-                        draw_rectangle(x, y, dims.cell_width, dims.cell_height, color(bg));
+                        backgrounds.push(x, y, dims.cell_width, dims.cell_height, color(bg));
                     }
                 } else {
                     // Resolve foreground and background colors using the new
@@ -776,7 +787,7 @@ impl<'alloc> Renderer<'alloc> {
                     // Draw a background rectangle if the cell has a non-default bg
                     // or if inverse mode forced a swap.
                     if has_bg {
-                        draw_rectangle(x, y, dims.cell_width, dims.cell_height, color(bg));
+                        backgrounds.push(x, y, dims.cell_width, dims.cell_height, color(bg));
                     }
 
                     // Draw the text for the cell, in a fallback font when the
@@ -798,16 +809,7 @@ impl<'alloc> Renderer<'alloc> {
                         });
                         icon_open = true;
                     } else if face == Face::Primary {
-                        let baseline = y + dims.baseline;
-                        draw_glyph(
-                            &text,
-                            x,
-                            baseline,
-                            &fonts.primary,
-                            dims.font_size,
-                            color(fg),
-                            bold,
-                        );
+                        glyphs.push(&text, x, y + dims.baseline, color(fg), bold);
                     }
                 }
 
@@ -815,19 +817,7 @@ impl<'alloc> Renderer<'alloc> {
                 continue;
             }
 
-            for icon in icons.drain(..) {
-                let place = coverage.place(icon.face, dims.font_size, icon.cells);
-                let baseline = icon.y + dims.baseline - place.rise;
-                draw_glyph(
-                    &icon.text,
-                    icon.x,
-                    baseline,
-                    fonts.get(icon.face),
-                    place.font_size,
-                    icon.fg,
-                    icon.bold,
-                );
-            }
+            row_icons.append(&mut icons);
 
             if placeholder_row {
                 let runs = placeholders::row_placements(placeholder_cells.drain(..));
@@ -838,6 +828,23 @@ impl<'alloc> Renderer<'alloc> {
             row.set_dirty(false)?;
             y += dims.cell_height;
             row_index += 1;
+        }
+
+        // The two passes, then the icons, which overhang their cell.
+        backgrounds.draw();
+        glyphs.draw(&fonts.primary, dims.font_size);
+        for icon in row_icons {
+            let place = coverage.place(icon.face, dims.font_size, icon.cells);
+            let baseline = icon.y + dims.baseline - place.rise;
+            draw_glyph(
+                &icon.text,
+                icon.x,
+                baseline,
+                fonts.get(icon.face),
+                place.font_size,
+                icon.fg,
+                icon.bold,
+            );
         }
 
         // --- Layer 2: images below text (i32::MIN / 2 <= z < 0) ---
@@ -1084,6 +1091,63 @@ struct Icon {
     bold: bool,
     /// How many cells it spans: 2 when the next cell is blank.
     cells: u8,
+}
+
+/// Cell backgrounds queued for one frame. Neighbouring cells of the same
+/// colour on a row merge into one rectangle.
+#[derive(Default)]
+struct Backgrounds(Vec<(Rect, Color)>);
+
+impl Backgrounds {
+    fn push(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
+        if let Some((last, c)) = self.0.last_mut()
+            && *c == color
+            && last.y == y
+            && last.h == h
+            && (last.x + last.w - x).abs() < 0.01
+        {
+            last.w += w;
+            return;
+        }
+        self.0.push((Rect::new(x, y, w, h), color));
+    }
+
+    fn draw(&self) {
+        for (r, c) in &self.0 {
+            draw_rectangle(r.x, r.y, r.w, r.h, *c);
+        }
+    }
+}
+
+/// Primary-font text queued for one frame: each cell's text is a range of
+/// one buffer, so queuing doesn't allocate per cell.
+#[derive(Default)]
+struct Glyphs {
+    text: String,
+    cells: Vec<(std::ops::Range<usize>, f32, f32, Color, bool)>,
+}
+
+impl Glyphs {
+    fn push(&mut self, text: &str, x: f32, baseline: f32, fg: Color, bold: bool) {
+        let start = self.text.len();
+        self.text.push_str(text);
+        self.cells
+            .push((start..self.text.len(), x, baseline, fg, bold));
+    }
+
+    fn draw(&self, font: &Font, font_size: u16) {
+        for (range, x, baseline, fg, bold) in &self.cells {
+            draw_glyph(
+                &self.text[range.clone()],
+                *x,
+                *baseline,
+                font,
+                font_size,
+                *fg,
+                *bold,
+            );
+        }
+    }
 }
 
 /// Draw one cell's text with its baseline at `baseline`.
