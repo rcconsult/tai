@@ -35,14 +35,20 @@ const FOREIGN: [&str; 13] = [
     "WT_SESSION",
     "WT_PROFILE_ID",
     "TERM_SESSION_ID",
-    "ITERM_SESSION_ID",
+    "TERM_FEATURES",
     "LC_TERMINAL",
     "LC_TERMINAL_VERSION",
     "TERMINAL_EMULATOR",
 ];
 
 /// Prefixes of whole families of another terminal's variables.
-const FOREIGN_PREFIXES: [&str; 4] = ["WEZTERM_", "KONSOLE_", "GNOME_TERMINAL_", "ALACRITTY_"];
+const FOREIGN_PREFIXES: [&str; 5] = [
+    "ITERM_",
+    "WEZTERM_",
+    "KONSOLE_",
+    "GNOME_TERMINAL_",
+    "ALACRITTY_",
+];
 
 fn is_foreign(name: &OsStr) -> bool {
     // Windows variable names are case-insensitive.
@@ -86,6 +92,9 @@ mod tests {
             "LC_TERMINAL",
             "LC_ALL",
             "KONSOLE_VERSION",
+            "ITERM_PROFILE",
+            "TERM_FEATURES",
+            "TERMINFO_DIRS",
             "HOME",
         ]));
         assert_eq!(
@@ -95,7 +104,9 @@ mod tests {
                 "TMUX",
                 "WEZTERM_PANE",
                 "LC_TERMINAL",
-                "KONSOLE_VERSION"
+                "KONSOLE_VERSION",
+                "ITERM_PROFILE",
+                "TERM_FEATURES"
             ]
             .map(OsString::from)
         );
