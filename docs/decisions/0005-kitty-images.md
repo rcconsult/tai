@@ -2,6 +2,8 @@
 
 - **Status:** Proposed 2026-10-25.
 - **Deciders:** owner. Written by the Claude session on the macOS dev host.
+  The Linux and Windows sessions reviewed it, and their findings widened
+  decision 1.
 - **Related:** [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
   (libghostty-vt has no renderer, so tai draws the screen).
 
@@ -24,9 +26,22 @@ b5e0347 and Ghostty a887df42 (the pin):
   therefore picked iTerm2's OSC 1337 inline images, which libghostty-vt
   doesn't implement.
   - tai sets only `TERM` and `COLORTERM` (`src/main.rs`, the child `exec`;
-    `src/pty_windows.rs`).
+    `src/pty_windows.rs`). Everything else passes through, because
+    `portable-pty`'s `CommandBuilder` on Windows starts from the whole
+    environment too.
   - Ghostty sets `TERM_PROGRAM=ghostty` and `TERM_PROGRAM_VERSION`, and
     removes `VTE_VERSION` (`src/termio/Exec.zig` at a887df42).
+  - The leak is wider than `TERM_PROGRAM`. On Linux, a shell in tai
+    started from a simulated parent terminal saw the parent's
+    `TERM_PROGRAM` and a stale `TERM_PROGRAM_VERSION`. It also saw
+    `VTE_VERSION`, `GNOME_TERMINAL_*`, `KITTY_WINDOW_ID`, `KITTY_PID`,
+    `TMUX`, `TMUX_PANE`, `WEZTERM_PANE`, `KONSOLE_VERSION` and
+    `LC_TERMINAL`.
+  - These variables steer detection:
+    - `KITTY_WINDOW_ID` and `WT_SESSION` are read by ppxai.
+      `WT_SESSION`, set by Windows Terminal, makes it pick Sixel.
+    - `TMUX` and `STY` make programs wrap their escapes for tmux or
+      screen, which tai then receives raw.
 - **Problem 2: tai doesn't draw virtual placements.** With `TERM_PROGRAM`
   out of the way, textual-image 0.8.5's detection inside tai picks Kitty
   graphics (`textual_image.renderable.tgp.Image`). It sends the image with
@@ -52,17 +67,40 @@ b5e0347 and Ghostty a887df42 (the pin):
 
 ## Decision
 
-1. **Identify tai to its child.** On every OS, set `TERM_PROGRAM=tai` and
-   `TERM_PROGRAM_VERSION=<crate version>` for the shell, and remove
-   `VTE_VERSION`, following Ghostty's `Exec.zig`. This is the Unix `exec`
-   in `src/main.rs` and `src/pty_windows.rs`.
+1. **Identify tai to its child.** On every OS, in the Unix `exec` in
+   `src/main.rs` and in `src/pty_windows.rs`:
+   - Always set `TERM_PROGRAM=tai` and `TERM_PROGRAM_VERSION=<crate
+     version>`, overwriting any inherited value. A stale version must never
+     sit next to `TERM_PROGRAM=tai`.
+   - Remove the identity variables of other terminals and multiplexers:
+     - `VTE_VERSION`
+     - `TMUX`, `TMUX_PANE`, `STY`
+     - `KITTY_WINDOW_ID`, `KITTY_PID`
+     - `WT_SESSION`, `WT_PROFILE_ID`
+     - `TERM_SESSION_ID`, `ITERM_SESSION_ID`
+     - `LC_TERMINAL`, `LC_TERMINAL_VERSION`
+     - `TERMINAL_EMULATOR`
+     - every variable starting with `WEZTERM_`, `KONSOLE_`,
+       `GNOME_TERMINAL_` or `ALACRITTY_`
+
+   This goes further than Ghostty, which removes only `VTE_VERSION`. tai
+   is a new terminal, not a pane of whatever started it, so nothing should
+   tell the shell otherwise. Inside tai, `tmux` then starts a normal
+   session instead of believing it's nested.
+
+   On Windows, a WSL shell gets variables through `WSLENV`, and Windows
+   Terminal adds `WT_SESSION` to it. Once tai removes `WT_SESSION` itself,
+   `WSLENV` has nothing to forward. That's expected but not yet verified.
 2. **Draw Kitty virtual placements.** Port Ghostty's placeholder resolution
    into tai's renderer:
    - Scan visible rows that carry the virtual-placeholder flag.
    - Decode each run of U+10EEEE cells: the image id from the foreground
      colour and the third diacritic, the placement id from the underline
      colour, and the row and column from the diacritics.
-   - Draw the matching tile of the image.
+   - Draw the matching tile of the image. Size the image to the
+     placement's rows × cols grid at the current cell size, as
+     `prepKittyVirtualPlacement` does. The cell size changes with font
+     steps, so the visual check includes Cmd/Ctrl+= and +0.
 
    Record the port's source (path, commit) in the code, as for other
    Ghostty ports. Prefer porting `graphics_unicode.zig`'s logic to Rust
@@ -97,6 +135,9 @@ b5e0347 and Ghostty a887df42 (the pin):
 - The Rust port can drift from Ghostty's behaviour as the spec or upstream
   changes. Its tests should reuse Ghostty's cases from
   `graphics_unicode.zig`.
+- The removal list can go stale. A terminal that appears later, or one we
+  missed, can still leak its identity variables. Add to the list when that
+  happens.
 - Programs that keyed on an inherited `TERM_PROGRAM` will see `tai`, which
   they don't recognise, and fall back to their generic path. That's the
   correct result.
@@ -107,3 +148,5 @@ b5e0347 and Ghostty a887df42 (the pin):
   iterator. Then use it instead of the port.
 - Sixel lands in Ghostty or libghostty-vt.
 - ppxai or textual-image change how they detect image support.
+- A program in tai still misdetects the terminal because of an inherited
+  variable that isn't on the removal list.
