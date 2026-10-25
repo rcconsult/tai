@@ -2809,7 +2809,6 @@ mod pty {
         time::{Duration, Instant},
     };
 
-    use libghostty_vt::Terminal;
     use nix::{
         errno::Errno,
         fcntl::{self, OFlag},
