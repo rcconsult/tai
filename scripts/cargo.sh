@@ -47,4 +47,18 @@ if [ "$(cat "$built" 2>/dev/null || true)" != "$ghostty_head" ]; then
     echo "$ghostty_head" >"$built"
 fi
 
+# On Windows, put the bundled ConPTY (ADR 0007) next to tai.exe for both
+# profiles, so `cargo.sh run` and the built binaries use it. A running tai
+# keeps OpenConsole.exe open, so an identical file is left alone.
+"$root/scripts/fetch-conpty.sh" >/dev/null
+if [ -d "$root/.local/conpty" ]; then
+    for profile in debug release; do
+        mkdir -p "$target_dir/$profile"
+        for file in conpty.dll OpenConsole.exe; do
+            cmp -s "$root/.local/conpty/$file" "$target_dir/$profile/$file" ||
+                cp "$root/.local/conpty/$file" "$target_dir/$profile/$file"
+        done
+    done
+fi
+
 PATH="$root/.local/zig:$PATH" exec cargo "$@"

@@ -107,14 +107,31 @@ To see which ConPTY a running tai uses, list its child processes
 (`Get-CimInstance Win32_Process -Filter "ParentProcessId=<tai pid>"`) or
 its loaded modules (`conpty.dll`).
 
-**What tai does:** `use_system_conpty` in `src/pty_windows.rs` restricts
-DLL search to System32 before the pseudo console is created, so
-`portable-pty` falls back to the system ConPTY (ADR 0004,
-`grep -n SetDefaultDllDirectories src/pty_windows.rs`). With WezTerm
-removed from `PATH`, the owner saw no garbling after the same resize
-steps.
+**What tai does:** `restrict_dll_search` in `src/pty_windows.rs` limits
+DLL search to tai's own folder and System32 before the pseudo console is
+created (`grep -n SetDefaultDllDirectories src/pty_windows.rs`). tai
+bundles Microsoft's ConPTY package next to `tai.exe` (ADR 0007, which
+supersedes ADR 0004's "system ConPTY only"), so `portable-pty` loads that
+copy, and falls back to the system ConPTY if it's missing. With the system
+ConPTY and WezTerm removed from `PATH`, the owner saw no garbling after the
+same resize steps.
 
-Even with the system ConPTY, text printed while the grid was narrow stays
+## Windows' own ConPTY swallows image sequences
+
+The ConPTY built into Windows (conhost, checked on Windows 11 26300) drops
+Sixel DCS and Kitty APC sequences from a program's output and answers DA1
+(`ESC[c`) itself, with `ESC[?61;6;7;21;22;23;24;28;32;42c`. So no image
+reaches the terminal behind it, and the terminal's own DA1 reply is never
+seen. Microsoft's ConPTY package (`Microsoft.Windows.Console.ConPTY`
+1.25.260930003) passes all three through. Windows Terminal, WezTerm and VS
+Code each ship their own ConPTY for this kind of reason. That's why tai
+bundles the package (ADR 0007); `scripts/fetch-conpty.sh` pins it.
+
+To see which ConPTY a running tai uses, read its log (`ConPTY: bundled …`
+or a warning), or list its child processes: `OpenConsole.exe` from tai's
+folder, or `conhost.exe --headless`.
+
+Even with a rewritten ConPTY, text printed while the grid was narrow stays
 narrow after it widens. On 2026-10-25, `ls` run at the largest font size
 left each file name one character per line after Ctrl+0, in order and not
 garbled. The rewritten ConPTY turns some line wraps into hard line breaks

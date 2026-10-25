@@ -45,11 +45,12 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
 
 - Font fallback covers Nerd Font icons and general symbols. Emoji and CJK show as boxes.
 - macroquad is vendored with a clipboard fix (`vendor/macroquad/TAI-PATCHES.md`).
-- Windows: tai uses Windows' own ConPTY (ADR 0004). Another program's
-  older ConPTY, such as WezTerm's, garbled the screen after a large
-  resize. If lines ever show out of order after a resize, press Ctrl+L or
-  run `clear` to redraw. Details: `docs/lessons/windows-pitfalls.md`,
-  "tai may run another app's ConPTY".
+- Windows: tai bundles Microsoft's ConPTY (`conpty.dll` and
+  `OpenConsole.exe`, next to `tai.exe`; ADR 0007), because Windows' own
+  swallows image sequences. Without those files tai still works, without
+  images, and logs a warning. If lines ever show out of order after a
+  resize, press Ctrl+L or run `clear` to redraw. Details:
+  `docs/lessons/windows-pitfalls.md`.
 - Windows: piping `wsl.exe` output (for example `wsl --help | more`)
   shows one character per line, in any terminal, because `wsl.exe`
   writes UTF-16 into pipes. Set `$env:WSL_UTF8 = '1'` first. Details:
@@ -63,3 +64,6 @@ License (`fonts/OFL.txt`). The bundled Symbols Nerd Font Mono, used as the
 fallback for icons, is MIT, and its icon sets carry their own licences
 (`fonts/README.md`). The bundled Iosevka Fixed, the fallback for general
 symbols, is under the SIL Open Font License (`fonts/Iosevka-LICENSE.md`).
+On Windows, tai bundles Microsoft's ConPTY (`conpty.dll`, `OpenConsole.exe`)
+from the `Microsoft.Windows.Console.ConPTY` package, under the MIT licence
+(`docs/third-party/microsoft-terminal-LICENSE`).
