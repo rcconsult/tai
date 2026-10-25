@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build
 
-Always build through `scripts/cargo.sh`, never plain `cargo`. libghostty-vt's build script runs whichever `zig` is on `PATH`. The pinned Ghostty needs an exact Zig major.minor, 0.15.x, and that's not the system Zig. On first use, the wrapper fetches Zig into `.local/zig/` (`scripts/fetch-zig.sh`, checked against ziglang.org's sha256) and Ghostty into `.local/ghostty/` (`scripts/fetch-ghostty.sh`). `.cargo/config.toml` points `GHOSTTY_SOURCE_DIR` at that checkout.
+Always build through `scripts/cargo.sh`, never plain `cargo`. libghostty-vt's build script runs whichever `zig` is on `PATH`. The pinned Ghostty needs an exact Zig major.minor, 0.15.x, and that's not the system Zig. On first use, the wrapper fetches Zig into `.local/zig/` (`scripts/fetch-zig.sh`, checked against ziglang.org's sha256) and Ghostty into `.local/ghostty/` (`scripts/fetch-ghostty.sh`). `.cargo/config.toml` points `GHOSTTY_SOURCE_DIR` at that checkout. On Windows it also fetches Microsoft's ConPTY package into `.local/conpty/` (`scripts/fetch-conpty.sh`, sha256-pinned) and copies it next to `tai.exe` in `target/debug` and `target/release` (ADR 0007).
 
 - Build: `scripts/cargo.sh build` (the first build fetches Zig and Ghostty and compiles libghostty-vt, a few minutes)
 - Run: `scripts/cargo.sh run` (opens a window running `$SHELL`). On macOS, `TAI_APPLE_GFX=metal` selects Metal instead of OpenGL. Keep it opt-in: Metal leaked GPU memory on the macOS dev host.

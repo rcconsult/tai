@@ -9,11 +9,12 @@ Status is summarised; the record itself is authoritative.
 | [0001](0001-stack-rust-libghostty-vt-ppxai-server.md) | Rust + libghostty-vt for the UI, ppxai-server as a child process for the engine | ✅ Accepted 2026-10-24, not yet implemented |
 | [0002](0002-windows-11-support.md) | Windows 11 support: MSVC, ConPTY via portable-pty, loopback TCP to the engine | ✅ Accepted 2026-10-24; engine link waits for milestone (b) |
 | [0003](0003-utf-8-everywhere.md) | UTF-8 everywhere, with the locale sensed per OS | ✅ Accepted 2026-10-24 |
-| [0004](0004-windows-system-conpty.md) | Use Windows' own ConPTY, not whatever `conpty.dll` the DLL search finds | ✅ Accepted 2026-10-25 |
-| [0005](0005-kitty-images.md) | Kitty images: identify tai with `TERM_PROGRAM`, and draw virtual placements | 📝 Proposed 2026-10-25 |
+| [0004](0004-windows-system-conpty.md) | Use Windows' own ConPTY, not whatever `conpty.dll` the DLL search finds | ✅ Accepted 2026-10-25; superseded by 0007 |
+| [0005](0005-kitty-images.md) | Kitty images: identify tai with `TERM_PROGRAM`, and draw virtual placements | ✅ Accepted 2026-10-25 |
 | [0006](0006-sixel-to-kitty.md) | Accept Sixel by translating it into Kitty images | 📝 Proposed 2026-10-25 |
+| [0007](0007-bundle-conpty.md) | Bundle Microsoft's ConPTY with tai on Windows, so image sequences and DA1 reach tai | ✅ Accepted 2026-10-25 |
 
-Numbering is sequential. The next record is `0007`.
+Numbering is sequential. The next record is `0008`.
 
 ## About these records
 

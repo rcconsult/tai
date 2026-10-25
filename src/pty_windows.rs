@@ -43,10 +43,11 @@ impl Pty {
     ///   2. %COMSPEC%
     ///   3. cmd.exe
     pub fn new(dims: Dimensions) -> std::io::Result<(Self, Child)> {
-        use_system_conpty();
+        restrict_dll_search();
         let pair = native_pty_system()
             .openpty(pty_size(dims))
             .map_err(std::io::Error::other)?;
+        log_conpty();
 
         let mut cmd = CommandBuilder::new(default_shell());
         // portable-pty starts in %USERPROFILE% unless told otherwise; inherit
@@ -55,6 +56,14 @@ impl Pty {
             cmd.cwd(dir);
         }
         cmd.env("COLORTERM", "truecolor");
+        // Identify tai, not the terminal that started it (ADR 0005). A
+        // WT_SESSION from Windows Terminal would make programs send Sixel.
+        for name in crate::identity::foreign_vars(std::env::vars_os()) {
+            cmd.env_remove(name);
+        }
+        for (name, value) in crate::identity::vars() {
+            cmd.env(name, value);
+        }
         // Give the shell default Ctrl+C handling. The "ignore Ctrl+C" flag is
         // inherited, so if whatever launched tai set it, ConPTY would never
         // turn the 0x03 we write into a CTRL_C_EVENT and Ctrl+C would never
@@ -228,28 +237,53 @@ fn pty_size(dims: Dimensions) -> PtySize {
     }
 }
 
-/// Make portable-pty use Windows' own ConPTY. It first tries
-/// `LoadLibraryW("conpty.dll")` by bare name, which searches tai's folder,
+/// Make portable-pty use the ConPTY bundled next to tai.exe (ADR 0007), or
+/// Windows' own if it isn't there. portable-pty tries
+/// `LoadLibraryW("conpty.dll")` by bare name, which normally also searches
 /// the current directory and PATH, so it could load another app's older
 /// ConPTY (WezTerm's garbles the screen after a resize) or a planted DLL.
-/// Restricting DLL search to System32, which has no conpty.dll, makes it
-/// fall back to the ConPTY in kernel32.dll. This applies to every later
-/// LoadLibrary in tai; the window and OpenGL are set up before this runs.
-/// See docs/lessons/windows-pitfalls.md.
+/// Restricting DLL search to tai's folder and System32 (which has no
+/// conpty.dll) leaves the bundled copy or the ConPTY in kernel32.dll. This
+/// applies to every later LoadLibrary in tai; the window and OpenGL are set
+/// up before this runs. See docs/lessons/windows-pitfalls.md.
 #[allow(unsafe_code)]
-fn use_system_conpty() {
+fn restrict_dll_search() {
     use windows_sys::Win32::System::LibraryLoader::{
-        LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
     };
     // SAFETY: SetDefaultDllDirectories only changes the process's DLL
-    // search path; it takes a flag and touches no memory of ours.
-    let ok = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    // search path; it takes flags and touches no memory of ours.
+    let ok = unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)
+    };
     if ok == 0 {
         tracing::warn!(
             "SetDefaultDllDirectories failed: {}",
             std::io::Error::last_os_error()
         );
     }
+}
+
+/// Log which ConPTY portable-pty loaded. Only the bundled one passes image
+/// sequences (Sixel, Kitty) and DA1 queries through to tai.
+#[allow(unsafe_code)]
+fn log_conpty() {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+    let name: Vec<u16> = "conpty.dll\0".encode_utf16().collect();
+    // SAFETY: name is a NUL-terminated UTF-16 string. GetModuleHandleW only
+    // looks the module up; it takes no reference that needs releasing.
+    let module = unsafe { GetModuleHandleW(name.as_ptr()) };
+    if module.is_null() {
+        tracing::warn!(
+            "ConPTY: Windows' own (no conpty.dll next to tai.exe); images won't reach tai"
+        );
+        return;
+    }
+    let mut path = [0u16; 1024];
+    // SAFETY: path is a writable buffer of the length passed in.
+    let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    let path = String::from_utf16_lossy(&path[..len as usize]);
+    tracing::info!("ConPTY: bundled {path}");
 }
 
 /// Clear this process's inherited "ignore Ctrl+C" flag, which children

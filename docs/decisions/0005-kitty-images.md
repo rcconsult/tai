@@ -1,11 +1,17 @@
 # ADR 0005: Kitty images, from detection to drawing
 
-- **Status:** Proposed 2026-10-25.
+- **Status:** Accepted 2026-10-25 (owner). Implemented in `src/identity.rs`
+  (decision 1) and `src/placeholders.rs` (decision 2); checked on Linux,
+  macOS (1x and Retina 2x) and Windows (through the bundled ConPTY of
+  ADR 0007).
 - **Deciders:** owner. Written by the Claude session on the macOS dev host.
   The Linux and Windows sessions reviewed it, and their findings widened
   decision 1.
 - **Related:** [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
-  (libghostty-vt has no renderer, so tai draws the screen).
+  (libghostty-vt has no renderer, so tai draws the screen);
+  [ADR 0006](0006-sixel-to-kitty.md) (Sixel translated into Kitty images);
+  [ADR 0007](0007-bundle-conpty.md) (the bundled ConPTY that lets image
+  sequences reach tai on Windows).
 
 ## Context
 
@@ -37,16 +43,27 @@ b5e0347 and Ghostty a887df42 (the pin):
     `VTE_VERSION`, `GNOME_TERMINAL_*`, `KITTY_WINDOW_ID`, `KITTY_PID`,
     `TMUX`, `TMUX_PANE`, `WEZTERM_PANE`, `KONSOLE_VERSION` and
     `LC_TERMINAL`.
+  - On macOS, a shell in tai started from iTerm2 also saw
+    `ITERM_PROFILE`, `ITERM_INJECT_SHELL_INTEGRATION`, `TERM_FEATURES`
+    (iTerm2's list of the features it supports) and a `TERMINFO_DIRS`
+    pointing into the iTerm2 app.
   - These variables steer detection:
     - `KITTY_WINDOW_ID` and `WT_SESSION` are read by ppxai.
       `WT_SESSION`, set by Windows Terminal, makes it pick Sixel.
     - `TMUX` and `STY` make programs wrap their escapes for tmux or
       screen, which tai then receives raw.
+    - `TERM_FEATURES` tells programs which iTerm2 features they can use.
 - **Problem 2: tai doesn't draw virtual placements.** With `TERM_PROGRAM`
   out of the way, textual-image 0.8.5's detection inside tai picks Kitty
   graphics (`textual_image.renderable.tgp.Image`). It sends the image with
   `U=1` and fills cells with U+10EEEE placeholders whose diacritics and
   colours pick the image tile.
+  - textual-image checks Sixel first (DA1 feature 4) and tries Kitty
+    graphics only when that fails (`textual_image/renderable/__init__.py`).
+    It picks Kitty in tai only because tai doesn't advertise Sixel. If
+    ADR 0006 lands, ppxai's Rich TUI would send Sixel instead, and
+    decision 2 would serve other placeholder clients, such as
+    `kitty icat --unicode-placeholder`.
   - libghostty-vt reports virtual placements as not visible and gives them
     no position (`include/ghostty/vt/kitty_graphics.h`, render info
     `viewport_visible`; `src/terminal/c/kitty_graphics.zig`).
@@ -64,6 +81,9 @@ b5e0347 and Ghostty a887df42 (the pin):
 - **Windows Terminal doesn't use Kitty at all.** There, ppxai falls through
   to textual-image's detection, and Windows Terminal advertises Sixel in
   DA1. Ghostty, and so libghostty-vt, has no Sixel.
+- **On Windows, no image reaches tai through Windows' own ConPTY.** It
+  swallows Kitty graphics sequences and answers DA1 itself. Both decisions
+  below depend on the bundled ConPTY of ADR 0007 there.
 
 ## Decision
 
@@ -77,11 +97,15 @@ b5e0347 and Ghostty a887df42 (the pin):
      - `TMUX`, `TMUX_PANE`, `STY`
      - `KITTY_WINDOW_ID`, `KITTY_PID`
      - `WT_SESSION`, `WT_PROFILE_ID`
-     - `TERM_SESSION_ID`, `ITERM_SESSION_ID`
+     - `TERM_SESSION_ID`, `TERM_FEATURES`
      - `LC_TERMINAL`, `LC_TERMINAL_VERSION`
      - `TERMINAL_EMULATOR`
-     - every variable starting with `WEZTERM_`, `KONSOLE_`,
+     - every variable starting with `ITERM_`, `WEZTERM_`, `KONSOLE_`,
        `GNOME_TERMINAL_` or `ALACRITTY_`
+
+   `TERMINFO_DIRS` stays, even when it points into another terminal's app:
+   it only says where to look up `TERM`'s description, and
+   `xterm-256color` is in the system terminfo anyway.
 
    This goes further than Ghostty, which removes only `VTE_VERSION`. tai
    is a new terminal, not a pane of whatever started it, so nothing should

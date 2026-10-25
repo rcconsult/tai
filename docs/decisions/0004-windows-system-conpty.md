@@ -1,5 +1,8 @@
 # ADR 0004: Use Windows' own ConPTY
 
+- **Superseded by:** [ADR 0007](0007-bundle-conpty.md) (2026-10-25): Windows'
+  own ConPTY swallows image sequences, so tai bundles Microsoft's ConPTY.
+  The DLL-search restriction stays, widened to tai's own folder.
 - **Status:** Accepted 2026-10-25 (owner), implemented in
   `src/pty_windows.rs` (`use_system_conpty`) and checked on Windows 11.
 - **Deciders:** owner. Written by the Claude session on the Windows dev host.

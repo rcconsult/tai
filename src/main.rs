@@ -45,7 +45,7 @@ use libghostty_vt::{
         FormatOptions,
         gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     },
-    style::RgbColor,
+    style::{RgbColor, StyleColor},
     terminal::{
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
         PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
@@ -59,7 +59,9 @@ use crate::shortcuts::Action;
 
 mod clipboard;
 mod fonts;
+mod identity;
 mod locale;
+mod placeholders;
 #[cfg(windows)]
 #[path = "pty_windows.rs"]
 mod pty;
@@ -215,8 +217,9 @@ async fn main() -> Result<()> {
     let mut resize_due: Option<Instant> = None;
 
     // Spawn a child shell connected to a pseudo-terminal. On Windows this
-    // restricts tai's DLL search to System32 (ADR 0004), so keep it after
-    // the window and GL context exist, as it is here inside macroquad::main.
+    // restricts tai's DLL search to its own folder and System32 (ADR 0007),
+    // so keep it after the window and GL context exist, as it is here inside
+    // macroquad::main.
     let (pty, mut child) = Pty::new(dims)?;
 
     // Install the PNG decoder so the terminal can handle PNG images in the
@@ -630,6 +633,12 @@ impl<'alloc> Renderer<'alloc> {
         // cell's background must not paint over it.
         let mut icons: Vec<Icon> = Vec::new();
 
+        // Kitty Unicode placeholder runs, by viewport row, drawn once all
+        // text is down (ADR 0005), and the current row's placeholder cells.
+        let mut virtual_runs: Vec<(u16, placeholders::Placement)> = Vec::new();
+        let mut placeholder_cells: Vec<Option<placeholders::PlaceholderCell>> = Vec::new();
+        let mut row_index: u16 = 0;
+
         // For convenience, `next` gives you the same iteration back only
         // as a shared pointer, so you can simultaneously iterate through
         // all rows while having a handle to query data for each row.
@@ -637,6 +646,9 @@ impl<'alloc> Renderer<'alloc> {
             let mut x = PADDING;
             // Whether the last icon is waiting to learn if the next cell is blank.
             let mut icon_open = false;
+            // libghostty-vt flags rows holding a U+10EEEE placeholder.
+            let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
+            placeholder_cells.clear();
 
             // Cell iterators work similarly as they create a cell *iteration*
             // from a row iteration, which can then be used in a similar pattern.
@@ -659,6 +671,27 @@ impl<'alloc> Renderer<'alloc> {
                     && let Some(icon) = icons.last_mut()
                 {
                     icon.cells = 2;
+                }
+
+                // A placeholder cell shows part of an image, drawn later; its
+                // own character has no glyph.
+                if placeholder_row {
+                    let cp = (graphemes > 0).then(|| cell.graphemes()).transpose()?;
+                    if let Some(cps) = cp.filter(|c| c.first() == Some(&placeholders::PLACEHOLDER))
+                    {
+                        let style = cell.style()?;
+                        placeholder_cells.push(Some(placeholders::PlaceholderCell {
+                            diacritics: cps[1..].to_vec(),
+                            fg: id_color(style.fg_color),
+                            underline: id_color(style.underline_color),
+                        }));
+                        if let Some(bg) = bg {
+                            draw_rectangle(x, y, dims.cell_width, dims.cell_height, color(bg));
+                        }
+                        x += dims.cell_width;
+                        continue;
+                    }
+                    placeholder_cells.push(None);
                 }
 
                 if graphemes == 0 {
@@ -760,9 +793,15 @@ impl<'alloc> Renderer<'alloc> {
                 );
             }
 
+            if placeholder_row {
+                let runs = placeholders::row_placements(placeholder_cells.drain(..));
+                virtual_runs.extend(runs.into_iter().map(|run| (row_index, run)));
+            }
+
             // Clear per-row dirty flag after rendering it.
             row.set_dirty(false)?;
             y += dims.cell_height;
+            row_index += 1;
         }
 
         // --- Layer 2: images below text (i32::MIN / 2 <= z < 0) ---
@@ -777,7 +816,16 @@ impl<'alloc> Renderer<'alloc> {
                 graphics,
                 Layer::BelowText,
                 dims,
-            )?
+            )?;
+            // Images shown through Unicode placeholders (ADR 0005).
+            if !virtual_runs.is_empty() {
+                Self::render_virtual_placements(
+                    &mut self.placement_it,
+                    graphics,
+                    &virtual_runs,
+                    dims,
+                )?;
+            }
         }
 
         // Draw the cursor if visible.
@@ -832,6 +880,85 @@ impl<'alloc> Renderer<'alloc> {
             },
         );
         gl_use_default_material();
+    }
+
+    /// Draw the image slices that Unicode placeholder runs show. Each run's
+    /// image and grid come from its virtual placement; the slice and its
+    /// position are worked out as in Ghostty (`src/placeholders.rs`).
+    fn render_virtual_placements(
+        placement_it: &mut PlacementIterator<'_>,
+        graphics: &Graphics<'_>,
+        runs: &[(u16, placeholders::Placement)],
+        dims: Dimensions,
+    ) -> Result<()> {
+        // Virtual placements' grids (`c`, `r`): by image and placement id,
+        // and the first one of each image for runs that name no placement.
+        let mut by_id = std::collections::HashMap::new();
+        let mut first = std::collections::HashMap::new();
+        let mut placements = placement_it.update(graphics)?;
+        placements.set_layer(Layer::All)?;
+        while let Some(placement) = placements.next() {
+            if !placement.is_virtual()? {
+                continue;
+            }
+            let image_id = placement.image_id()?;
+            let grid = (placement.columns()?, placement.rows()?);
+            by_id.insert((image_id, placement.placement_id()?), grid);
+            first.entry(image_id).or_insert(grid);
+        }
+
+        // The protocol's sizes are in physical pixels; tai draws in logical
+        // units.
+        let scale = dims.dpi_scale;
+        let cell_w = (dims.cell_width * scale).round().max(1.0) as u32;
+        let cell_h = (dims.cell_height * scale).round().max(1.0) as u32;
+        let mut textures = std::collections::HashMap::new();
+
+        for (row, run) in runs {
+            let grid = if run.placement_id > 0 {
+                by_id.get(&(run.image_id, run.placement_id))
+            } else {
+                first.get(&run.image_id)
+            };
+            let (Some(&(columns, rows)), Some(image)) = (grid, graphics.image(run.image_id)) else {
+                continue;
+            };
+            if image.format()? != graphics::ImageFormat::Rgba {
+                continue;
+            }
+            let (img_w, img_h) = (image.width()?, image.height()?);
+            let data = image.data()?;
+            if data.len() < (img_w * img_h * 4) as usize {
+                continue;
+            }
+            let grid = placeholders::grid(columns, rows, img_w, img_h, cell_w, cell_h);
+            let Some(slice) = placeholders::render(run, grid, img_w, img_h, cell_w, cell_h) else {
+                continue;
+            };
+            let tex = textures
+                .entry(run.image_id)
+                .or_insert_with(|| Texture2D::from_rgba8(img_w as u16, img_h as u16, data));
+            draw_texture_ex(
+                tex,
+                PADDING + f32::from(run.x) * dims.cell_width + slice.offset_x as f32 / scale,
+                PADDING + f32::from(*row) * dims.cell_height + slice.offset_y as f32 / scale,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(
+                        slice.dest_width as f32 / scale,
+                        slice.dest_height as f32 / scale,
+                    )),
+                    source: Some(Rect {
+                        x: slice.source_x as f32,
+                        y: slice.source_y as f32,
+                        w: slice.source_width as f32,
+                        h: slice.source_height as f32,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
     }
 
     fn render_kitty_images<'t>(
@@ -956,6 +1083,16 @@ fn draw_glyph(
 fn color(rgb: RgbColor) -> Color {
     let RgbColor { r, g, b } = rgb;
     color_u8!(r, g, b, 255)
+}
+
+/// A style colour as the Kitty placeholder protocol reads it: the raw value,
+/// not the colour it resolves to.
+fn id_color(c: StyleColor) -> placeholders::IdColor {
+    match c {
+        StyleColor::None => placeholders::IdColor::None,
+        StyleColor::Palette(index) => placeholders::IdColor::Palette(index.0),
+        StyleColor::Rgb(RgbColor { r, g, b }) => placeholders::IdColor::Rgb(r, g, b),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2025,6 +2162,8 @@ mod pty {
             // Work out the shell's locale before forking: it may run
             // `defaults` on macOS, and it logs (ADR 0003).
             let locale = crate::locale::child_env();
+            // Other terminals' identity variables to drop (ADR 0005).
+            let foreign = crate::identity::foreign_vars(std::env::vars_os());
 
             // forkpty() combines openpty + fork + login_tty into one call.
             // In the child it sets up the slave side as stdin/stdout/stderr.
@@ -2076,9 +2215,15 @@ mod pty {
                     arg0.push(name);
 
                     // Replace the child process with the user's shell via `exec`.
-                    _ = Command::new(&shell)
+                    let mut command = Command::new(&shell);
+                    for name in &foreign {
+                        command.env_remove(name);
+                    }
+                    _ = command
                         .env("TERM", "xterm-256color")
                         .env("COLORTERM", "truecolor")
+                        // Identify tai, not the terminal that started it.
+                        .envs(crate::identity::vars())
                         // A UTF-8 character type; see src/locale.rs.
                         .envs(locale.iter().map(|(k, v)| (k, v)))
                         .arg0(arg0)
