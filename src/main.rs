@@ -346,6 +346,8 @@ async fn main() -> Result<()> {
     );
     tracing::info!("Initialized terminal with size {cols}x{rows}");
 
+    let mut stats = FrameStats::new();
+
     // Each frame: handle resize → read pty → process input → render.
     loop {
         let frame_start = Instant::now();
@@ -454,8 +456,64 @@ async fn main() -> Result<()> {
             || [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
                 .into_iter()
                 .any(|b| is_mouse_button_down(b) || is_mouse_button_released(b));
+        let render_start = Instant::now();
         renderer.render_terminal(&terminal, dims, &fonts, &coverage, mouse_active)?;
-        next_frame().await
+        let render_end = Instant::now();
+        next_frame().await;
+        if let Some(stats) = stats.as_mut() {
+            stats.record(frame_start, render_start, render_end, Instant::now());
+        }
+    }
+}
+
+/// Per-second frame timings, logged when `TAI_FRAME_STATS=1`, for comparing
+/// renderers (ADR 0008).
+struct FrameStats {
+    since: Instant,
+    frames: u32,
+    /// Sums and maxima, in seconds: the whole frame, the renderer's CPU
+    /// side, and `next_frame` (macroquad's own draws and the buffer swap).
+    total: (f64, f64),
+    render: (f64, f64),
+    present: (f64, f64),
+}
+
+impl FrameStats {
+    fn new() -> Option<Self> {
+        (std::env::var("TAI_FRAME_STATS").as_deref() == Ok("1")).then(|| Self {
+            since: Instant::now(),
+            frames: 0,
+            total: (0.0, 0.0),
+            render: (0.0, 0.0),
+            present: (0.0, 0.0),
+        })
+    }
+
+    fn record(&mut self, start: Instant, render: Instant, rendered: Instant, end: Instant) {
+        let add = |acc: &mut (f64, f64), d: Duration| {
+            acc.0 += d.as_secs_f64();
+            acc.1 = acc.1.max(d.as_secs_f64());
+        };
+        add(&mut self.total, end - start);
+        add(&mut self.render, rendered - render);
+        add(&mut self.present, end - rendered);
+        self.frames += 1;
+        if end - self.since >= Duration::from_secs(1) {
+            let n = f64::from(self.frames);
+            let ms = |acc: (f64, f64)| (acc.0 / n * 1000.0, acc.1 * 1000.0);
+            let (t, r, p) = (ms(self.total), ms(self.render), ms(self.present));
+            tracing::info!(
+                "frames {} | frame avg {:.2} max {:.2} ms | render avg {:.2} max {:.2} ms | next_frame avg {:.2} max {:.2} ms",
+                self.frames,
+                t.0,
+                t.1,
+                r.0,
+                r.1,
+                p.0,
+                p.1
+            );
+            *self = Self::new().expect("stats are on");
+        }
     }
 }
 
