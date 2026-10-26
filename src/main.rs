@@ -610,13 +610,28 @@ struct RowCells {
 }
 
 impl CellGrid {
+    /// `None` for the immediate renderer. Logs which renderer draws and,
+    /// when it's the immediate one, why.
     fn new() -> Option<Self> {
-        if use_metal() || std::env::var("TAI_RENDERER").as_deref() == Ok("immediate") {
+        if use_metal() {
+            tracing::info!("renderer: immediate (Metal; the cell renderer needs OpenGL)");
             return None;
         }
+        if std::env::var("TAI_RENDERER").as_deref() == Ok("immediate") {
+            tracing::info!("renderer: immediate (TAI_RENDERER=immediate)");
+            return None;
+        }
+        let text = cells::TextPass::new()
+            .map_err(|why| tracing::warn!("renderer: immediate ({why})"))
+            .ok()?;
+        let atlas_height = cells::ATLAS_MAX_HEIGHT.min(text.max_texture_size);
+        tracing::info!(
+            "renderer: cells (GLSL {}, glyph atlas up to {atlas_height} px)",
+            text.glsl
+        );
         Some(Self {
-            text: cells::TextPass::new()?,
-            atlas: cells::GlyphAtlas::new(),
+            atlas: cells::GlyphAtlas::new(atlas_height),
+            text,
             rows: Vec::new(),
             dims: None,
             bg_texture: None,

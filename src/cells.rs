@@ -18,7 +18,7 @@ use macroquad::{
         BlendFactor, BlendState, BlendValue, BufferId, BufferLayout, BufferSource, BufferType,
         BufferUsage, Equation, PassAction, Pipeline, PipelineParams, RenderPass, ShaderMeta,
         ShaderSource, UniformBlockLayout, UniformDesc, UniformType, UniformsSource,
-        VertexAttribute, VertexFormat, VertexStep,
+        VertexAttribute, VertexFormat, VertexStep, gl,
     },
     texture::{FilterMode, Texture2D},
     window::get_internal_gl,
@@ -35,6 +35,10 @@ pub struct Instance {
     src: [f32; 4],
     color: [u8; 4],
 }
+
+// The text pass's vertex layout (dest, src: Float4; color0: Byte4) reads
+// instances at this stride.
+const _: () = assert!(std::mem::size_of::<Instance>() == 36);
 
 /// A rasterized glyph: its place in the atlas and fontdue's metrics, in
 /// physical pixels.
@@ -55,7 +59,9 @@ struct Glyph {
 /// row at the top edge.
 const GAP: u32 = 2;
 const ATLAS_WIDTH: u32 = 1024;
-const ATLAS_MAX_HEIGHT: u32 = 8192;
+/// The tallest the atlas grows, unless the driver's texture limit is lower
+/// (`TextPass::max_texture_size`).
+pub const ATLAS_MAX_HEIGHT: u32 = 8192;
 
 /// All faces' glyphs in one RGBA texture, packed in shelves.
 ///
@@ -65,6 +71,8 @@ const ATLAS_MAX_HEIGHT: u32 = 8192;
 /// placed, so cell buffers built in earlier frames stay valid.
 pub struct GlyphAtlas {
     height: u32,
+    /// The tallest it may grow: `ATLAS_MAX_HEIGHT` or the driver's limit.
+    max_height: u32,
     pixels: Vec<u8>,
     glyphs: HashMap<(Face, char, u16), Option<Glyph>>,
     shelf_x: u32,
@@ -76,10 +84,11 @@ pub struct GlyphAtlas {
 }
 
 impl GlyphAtlas {
-    pub fn new() -> Self {
+    pub fn new(max_height: u32) -> Self {
         let height = 256;
         Self {
             height,
+            max_height,
             pixels: vec![0; (ATLAS_WIDTH * height * 4) as usize],
             glyphs: HashMap::new(),
             shelf_x: 0,
@@ -94,7 +103,7 @@ impl GlyphAtlas {
     pub fn clear(&mut self) {
         *self = Self {
             texture: self.texture.take(),
-            ..Self::new()
+            ..Self::new(self.max_height)
         };
     }
 
@@ -122,7 +131,7 @@ impl GlyphAtlas {
             self.shelf_h = 0;
         }
         while self.shelf_y + h + GAP > self.height {
-            if self.height * 2 > ATLAS_MAX_HEIGHT {
+            if self.height * 2 > self.max_height {
                 tracing::warn!("glyph atlas is full; {ch:?} at {px}px isn't drawn");
                 return None;
             }
@@ -264,27 +273,43 @@ pub struct TextPass {
     instances: BufferId,
     /// How many instances `instances` holds.
     capacity: usize,
+    /// The GLSL version the shaders were built for, as "3.30" or "1.50".
+    pub glsl: &'static str,
+    /// The driver's GL_MAX_TEXTURE_SIZE.
+    pub max_texture_size: u32,
 }
 
 impl TextPass {
-    /// `None` when the context can't run it: Metal (no MSL port yet), or an
-    /// OpenGL without instancing or GLSL 1.50.
-    pub fn new() -> Option<Self> {
+    /// Why not, when the context can't run it: an OpenGL without
+    /// instancing or GLSL 1.50, or a shader that didn't compile. (Metal
+    /// never gets here; there's no MSL port yet.)
+    pub fn new() -> Result<Self, String> {
         // SAFETY: macroquad's context exists for the program's lifetime once
         // macroquad::main runs, and tai uses it from the main thread only.
         #[allow(unsafe_code)]
         let gl = unsafe { get_internal_gl() };
         let ctx = gl.quad_context;
         let info = ctx.info();
-        let version = if info.glsl_support.v330 {
-            "#version 330\n"
+        let (version, glsl) = if info.glsl_support.v330 {
+            ("#version 330\n", "3.30")
         } else if info.glsl_support.v150 {
-            "#version 150\n"
+            ("#version 150\n", "1.50")
         } else {
-            return None;
+            return Err("no GLSL 3.30 or 1.50".into());
         };
         if !info.features.instancing {
-            return None;
+            return Err("no instancing".into());
+        }
+        let mut max_texture_size = 0;
+        // SAFETY: the context is current on this thread (see above), and
+        // GL_MAX_TEXTURE_SIZE writes one integer.
+        #[allow(unsafe_code)]
+        unsafe {
+            gl::glGetIntegerv(gl::GL_MAX_TEXTURE_SIZE, &mut max_texture_size)
+        };
+        let max_texture_size = u32::try_from(max_texture_size).unwrap_or(0);
+        if max_texture_size < ATLAS_WIDTH {
+            return Err(format!("GL_MAX_TEXTURE_SIZE is {max_texture_size}"));
         }
         let vertex = format!("{version}{VERTEX}");
         let fragment = format!("{version}{FRAGMENT}");
@@ -304,8 +329,7 @@ impl TextPass {
                     images: vec!["Atlas".to_string()],
                 },
             )
-            .map_err(|e| tracing::warn!("cell text shader: {e:?}"))
-            .ok()?;
+            .map_err(|e| format!("the text shader didn't compile: {e:?}"))?;
         let pipeline = ctx.new_pipeline(
             &[
                 BufferLayout::default(),
@@ -349,12 +373,14 @@ impl TextPass {
             BufferUsage::Stream,
             BufferSource::empty::<Instance>(capacity),
         );
-        Some(Self {
+        Ok(Self {
             pipeline,
             corners,
             indices,
             instances,
             capacity,
+            glsl,
+            max_texture_size,
         })
     }
 
