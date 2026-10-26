@@ -40,7 +40,7 @@ use libghostty_vt::{
     key::{self, Key},
     kitty::graphics::{self, DecodePng, DecodedImage, Graphics, Layer, PlacementIterator},
     mouse,
-    render::{CellIterator, Dirty, RenderState, RowIterator},
+    render::{CellIteration, CellIterator, Colors, Dirty, RenderState, RowIterator},
     selection::{
         FormatOptions,
         gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
@@ -859,132 +859,29 @@ impl<'alloc> Renderer<'alloc> {
                     color(colors.background),
                 );
             }
-            let mut x = PADDING;
-            // Whether the last icon is waiting to learn if the next cell is blank.
-            let mut icon_open = false;
             // libghostty-vt flags rows holding a U+10EEEE placeholder.
             let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
-            placeholder_cells.clear();
 
             // Cell iterators work similarly as they create a cell *iteration*
             // from a row iteration, which can then be used in a similar pattern.
             let mut cell_it = self.cell_it.update(row)?;
-
-            while let Some(cell) = cell_it.next() {
-                // Selection membership is computed by libghostty from the
-                // terminal-owned selection.  Ghostling only chooses the visual
-                // policy: selected cells use reverse-video colors, matching the
-                // common terminal behavior and avoiding a separate theme knob.
-                let selected = cell.is_selected()?;
-                let graphemes = cell.graphemes_len()?;
-                let bg = cell.bg_color()?;
-                if graphemes > 0 {
-                    // Convert read grapheme codepoints into UTF-8 text.
-                    cell.graphemes_utf8(&mut text)?;
-                }
-                if std::mem::take(&mut icon_open)
-                    && (graphemes == 0 || text.chars().next().is_some_and(is_space))
-                    && let Some(icon) = icons.last_mut()
-                {
-                    icon.cells = 2;
-                }
-
-                // A placeholder cell shows part of an image, drawn later; its
-                // own character has no glyph.
-                if placeholder_row {
-                    let cp = (graphemes > 0).then(|| cell.graphemes()).transpose()?;
-                    if let Some(cps) = cp.filter(|c| c.first() == Some(&placeholders::PLACEHOLDER))
-                    {
-                        let style = cell.style()?;
-                        placeholder_cells.push(Some(placeholders::PlaceholderCell {
-                            diacritics: cps[1..].to_vec(),
-                            fg: id_color(style.fg_color),
-                            underline: id_color(style.underline_color),
-                        }));
-                        if let Some(bg) = bg {
-                            backgrounds.push(x, y, dims.cell_width, dims.cell_height, color(bg));
-                        }
-                        x += dims.cell_width;
-                        continue;
-                    }
-                    placeholder_cells.push(None);
-                }
-
-                if graphemes == 0 {
-                    if selected {
-                        backgrounds.push(
-                            x,
-                            y,
-                            dims.cell_width,
-                            dims.cell_height,
-                            color(colors.foreground),
-                        );
-                    } else if let Some(bg) = bg {
-                        // The cell has no text, but it might have a background
-                        // color (e.g. from an erase with a color set).
-                        backgrounds.push(x, y, dims.cell_width, dims.cell_height, color(bg));
-                    }
-                } else {
-                    // Resolve foreground and background colors using the new
-                    // per-cell color queries. These flatten style colors,
-                    // content-tag colors, and palette lookups into a single RGB
-                    // value, returning `None` when the cell has no explicit color
-                    // (in which case we use the terminal default).
-                    let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-                    let mut has_bg = bg.is_some();
-                    let mut bg = bg.unwrap_or(colors.background);
-                    let mut bold = false;
-
-                    if cell.has_styling()? {
-                        // Read the style for flags (inverse, bold, italic) — color
-                        // resolution is handled above via the new API.
-                        let style = cell.style()?;
-
-                        // Inverse (reverse video): swap foreground and background colors.
-                        if style.inverse {
-                            std::mem::swap(&mut fg, &mut bg);
-                            has_bg = true;
-                        }
-                        bold = style.bold;
-                    }
-
-                    if selected {
-                        std::mem::swap(&mut fg, &mut bg);
-                        has_bg = true;
-                    }
-
-                    // Draw a background rectangle if the cell has a non-default bg
-                    // or if inverse mode forced a swap.
-                    if has_bg {
-                        backgrounds.push(x, y, dims.cell_width, dims.cell_height, color(bg));
-                    }
-
-                    // Draw the text for the cell, in a fallback font when the
-                    // primary lacks the glyph (e.g. Nerd Font icons). The first
-                    // codepoint decides for the whole grapheme.
-                    let face = text
-                        .chars()
-                        .next()
-                        .map_or(Face::Primary, |ch| coverage.face_for(ch));
-                    if face == Face::Symbols || face == Face::Iosevka {
-                        icons.push(Icon {
-                            text: text.clone(),
-                            face,
-                            x,
-                            y,
-                            fg: color(fg),
-                            bold,
-                            cells: 1,
-                        });
-                        icon_open = true;
-                    } else if face == Face::Primary {
-                        glyphs.push(&text, x, y + dims.baseline, color(fg), bold);
-                    }
-                }
-
-                x += dims.cell_width;
-                continue;
-            }
+            walk_row(
+                &mut cell_it,
+                placeholder_row,
+                y,
+                dims,
+                &colors,
+                coverage,
+                &mut text,
+                &mut icons,
+                &mut placeholder_cells,
+                &mut ImmediateRow {
+                    backgrounds: &mut backgrounds,
+                    glyphs: &mut glyphs,
+                    y,
+                    dims,
+                },
+            )?;
 
             row_icons.append(&mut icons);
 
@@ -1165,8 +1062,6 @@ impl<'alloc> Renderer<'alloc> {
         let mut placeholder_cells: Vec<Option<placeholders::PlaceholderCell>> = Vec::new();
         let mut row_index = 0;
         let mut y = PADDING;
-        let transparent = [0; 4];
-        let rgba = |c: RgbColor| [c.r, c.g, c.b, 255];
 
         while let Some(row) = row_it.next() {
             if rows.len() <= row_index {
@@ -1181,100 +1076,26 @@ impl<'alloc> Renderer<'alloc> {
             built.bg.clear();
             built.text.clear();
             built.virtual_runs.clear();
-            let mut x = PADDING;
-            let mut icon_open = false;
             let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
-            placeholder_cells.clear();
-
             let mut cell_it = self.cell_it.update(row)?;
-            while let Some(cell) = cell_it.next() {
-                let selected = cell.is_selected()?;
-                let graphemes = cell.graphemes_len()?;
-                let bg = cell.bg_color()?;
-                if graphemes > 0 {
-                    cell.graphemes_utf8(&mut text)?;
-                }
-                if std::mem::take(&mut icon_open)
-                    && (graphemes == 0 || text.chars().next().is_some_and(is_space))
-                    && let Some(icon) = icons.last_mut()
-                {
-                    icon.cells = 2;
-                }
-
-                if placeholder_row {
-                    let cp = (graphemes > 0).then(|| cell.graphemes()).transpose()?;
-                    if let Some(cps) = cp.filter(|c| c.first() == Some(&placeholders::PLACEHOLDER))
-                    {
-                        let style = cell.style()?;
-                        placeholder_cells.push(Some(placeholders::PlaceholderCell {
-                            diacritics: cps[1..].to_vec(),
-                            fg: id_color(style.fg_color),
-                            underline: id_color(style.underline_color),
-                        }));
-                        built.bg.push(bg.map_or(transparent, rgba));
-                        x += dims.cell_width;
-                        continue;
-                    }
-                    placeholder_cells.push(None);
-                }
-
-                if graphemes == 0 {
-                    built.bg.push(if selected {
-                        rgba(colors.foreground)
-                    } else {
-                        bg.map_or(transparent, rgba)
-                    });
-                } else {
-                    let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-                    let mut has_bg = bg.is_some();
-                    let mut bg = bg.unwrap_or(colors.background);
-                    let mut bold = false;
-                    if cell.has_styling()? {
-                        let style = cell.style()?;
-                        if style.inverse {
-                            std::mem::swap(&mut fg, &mut bg);
-                            has_bg = true;
-                        }
-                        bold = style.bold;
-                    }
-                    if selected {
-                        std::mem::swap(&mut fg, &mut bg);
-                        has_bg = true;
-                    }
-                    built.bg.push(if has_bg { rgba(bg) } else { transparent });
-
-                    let face = text
-                        .chars()
-                        .next()
-                        .map_or(Face::Primary, |ch| coverage.face_for(ch));
-                    if face == Face::Symbols || face == Face::Iosevka {
-                        icons.push(Icon {
-                            text: text.clone(),
-                            face,
-                            x,
-                            y,
-                            fg: color(fg),
-                            bold,
-                            cells: 1,
-                        });
-                        icon_open = true;
-                    } else if face == Face::Primary {
-                        atlas.push_text(
-                            &mut built.text,
-                            coverage.font(face),
-                            face,
-                            &text,
-                            x,
-                            y + dims.baseline,
-                            dims.font_size,
-                            dims.dpi_scale,
-                            color(fg),
-                            bold,
-                        );
-                    }
-                }
-                x += dims.cell_width;
-            }
+            walk_row(
+                &mut cell_it,
+                placeholder_row,
+                y,
+                dims,
+                &colors,
+                coverage,
+                &mut text,
+                &mut icons,
+                &mut placeholder_cells,
+                &mut GridRow {
+                    atlas,
+                    row: built,
+                    font: coverage.font(Face::Primary),
+                    y,
+                    dims,
+                },
+            )?;
 
             // Icons go after the row's text, so one that overhangs into a
             // blank next cell isn't covered by it.
@@ -1583,6 +1404,196 @@ impl<'alloc> Renderer<'alloc> {
         }
 
         Ok(())
+    }
+}
+
+/// Where `walk_row` sends what a row's cells show. The two renderers
+/// differ only in how they queue it.
+trait CellSink {
+    /// The next cell's background, at `x`; `None` where the terminal's
+    /// own background shows.
+    fn background(&mut self, x: f32, bg: Option<RgbColor>);
+    /// A cell's text in the primary font, at `x`.
+    fn text(&mut self, text: &str, x: f32, fg: RgbColor, bold: bool);
+}
+
+/// Read one row's cells and work out what each shows, for both renderers:
+/// colours (inverse and selection swap them), Kitty placeholder cells, and
+/// which font draws each grapheme. Backgrounds and primary-font text go to
+/// `sink` as they're read. Fallback-font icons go to `icons`, complete once
+/// the row is read, because an icon spreads into the next cell when that
+/// one is blank. On a placeholder row, every cell's placeholder or `None`
+/// goes to `placeholder_cells`.
+#[allow(clippy::too_many_arguments)]
+fn walk_row(
+    cell_it: &mut CellIteration<'_, '_>,
+    placeholder_row: bool,
+    y: f32,
+    dims: Dimensions,
+    colors: &Colors,
+    coverage: &Coverage,
+    text: &mut String,
+    icons: &mut Vec<Icon>,
+    placeholder_cells: &mut Vec<Option<placeholders::PlaceholderCell>>,
+    sink: &mut impl CellSink,
+) -> Result<()> {
+    placeholder_cells.clear();
+    let mut x = PADDING;
+    // Whether the last icon is waiting to learn if the next cell is blank.
+    let mut icon_open = false;
+    while let Some(cell) = cell_it.next() {
+        // Selection membership is computed by libghostty from the
+        // terminal-owned selection. Selected cells use reverse-video colors,
+        // matching the common terminal behavior.
+        let selected = cell.is_selected()?;
+        let graphemes = cell.graphemes_len()?;
+        let bg = cell.bg_color()?;
+        if graphemes > 0 {
+            // Convert read grapheme codepoints into UTF-8 text.
+            cell.graphemes_utf8(text)?;
+        }
+        if std::mem::take(&mut icon_open)
+            && (graphemes == 0 || text.chars().next().is_some_and(is_space))
+            && let Some(icon) = icons.last_mut()
+        {
+            icon.cells = 2;
+        }
+
+        // A placeholder cell shows part of an image, drawn later; its own
+        // character has no glyph.
+        if placeholder_row {
+            let cp = (graphemes > 0).then(|| cell.graphemes()).transpose()?;
+            if let Some(cps) = cp.filter(|c| c.first() == Some(&placeholders::PLACEHOLDER)) {
+                let style = cell.style()?;
+                placeholder_cells.push(Some(placeholders::PlaceholderCell {
+                    diacritics: cps[1..].to_vec(),
+                    fg: id_color(style.fg_color),
+                    underline: id_color(style.underline_color),
+                }));
+                sink.background(x, bg);
+                x += dims.cell_width;
+                continue;
+            }
+            placeholder_cells.push(None);
+        }
+
+        if graphemes == 0 {
+            // No text, but maybe a background (e.g. from an erase with a
+            // colour set), or the selection's.
+            sink.background(
+                x,
+                if selected {
+                    Some(colors.foreground)
+                } else {
+                    bg
+                },
+            );
+        } else {
+            // fg_color and bg_color flatten style colours, content-tag
+            // colours and palette lookups into one RGB value, `None` when
+            // the cell uses the terminal default.
+            let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
+            let mut has_bg = bg.is_some();
+            let mut bg = bg.unwrap_or(colors.background);
+            let mut bold = false;
+            if cell.has_styling()? {
+                let style = cell.style()?;
+                // Inverse (reverse video) swaps foreground and background.
+                if style.inverse {
+                    std::mem::swap(&mut fg, &mut bg);
+                    has_bg = true;
+                }
+                bold = style.bold;
+            }
+            if selected {
+                std::mem::swap(&mut fg, &mut bg);
+                has_bg = true;
+            }
+            sink.background(x, has_bg.then_some(bg));
+
+            // A fallback font draws what the primary lacks (e.g. Nerd Font
+            // icons). The first codepoint decides for the whole grapheme.
+            let face = text
+                .chars()
+                .next()
+                .map_or(Face::Primary, |ch| coverage.face_for(ch));
+            if face == Face::Symbols || face == Face::Iosevka {
+                icons.push(Icon {
+                    text: text.clone(),
+                    face,
+                    x,
+                    y,
+                    fg: color(fg),
+                    bold,
+                    cells: 1,
+                });
+                icon_open = true;
+            } else if face == Face::Primary {
+                sink.text(text, x, fg, bold);
+            }
+        }
+        x += dims.cell_width;
+    }
+    Ok(())
+}
+
+/// The immediate renderer's row: rectangles and glyph runs for this frame.
+struct ImmediateRow<'a> {
+    backgrounds: &'a mut Backgrounds,
+    glyphs: &'a mut Glyphs,
+    y: f32,
+    dims: Dimensions,
+}
+
+impl CellSink for ImmediateRow<'_> {
+    fn background(&mut self, x: f32, bg: Option<RgbColor>) {
+        if let Some(bg) = bg {
+            let Dimensions {
+                cell_width,
+                cell_height,
+                ..
+            } = self.dims;
+            self.backgrounds
+                .push(x, self.y, cell_width, cell_height, color(bg));
+        }
+    }
+
+    fn text(&mut self, text: &str, x: f32, fg: RgbColor, bold: bool) {
+        self.glyphs
+            .push(text, x, self.y + self.dims.baseline, color(fg), bold);
+    }
+}
+
+/// The cell renderer's row buffers (ADR 0008).
+struct GridRow<'a> {
+    atlas: &'a mut cells::GlyphAtlas,
+    row: &'a mut RowCells,
+    font: &'a fontdue::Font,
+    y: f32,
+    dims: Dimensions,
+}
+
+impl CellSink for GridRow<'_> {
+    fn background(&mut self, _x: f32, bg: Option<RgbColor>) {
+        // One texel per cell; transparent shows the terminal's background.
+        self.row
+            .bg
+            .push(bg.map_or([0; 4], |c| [c.r, c.g, c.b, 255]));
+    }
+
+    fn text(&mut self, text: &str, x: f32, fg: RgbColor, bold: bool) {
+        self.atlas.push_text(
+            &mut self.row.text,
+            self.font,
+            Face::Primary,
+            text,
+            x,
+            self.y + self.dims.baseline,
+            self.dims.font_size,
+            self.dims.dpi_scale,
+            color(fg),
+            bold,
+        );
     }
 }
 
