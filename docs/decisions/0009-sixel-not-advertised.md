@@ -1,9 +1,10 @@
-# ADR 0009: Translate Sixel, but don't advertise it by default
+# ADR 0009: Translate Sixel as xterm draws it, but don't advertise it by default
 
 - **Status:** Accepted 2026-10-26 (owner).
 - **Deciders:** owner. Written by the Claude session on the Windows dev host.
-- **Supersedes:** decision 1 of [ADR 0006](0006-sixel-to-kitty.md)
-  ("Advertise Sixel"). ADR 0006's other decisions stand.
+- **Supersedes:** decisions 1 ("Advertise Sixel") and 3 ("Keep Sixel's
+  cursor semantics, as WezTerm does") of [ADR 0006](0006-sixel-to-kitty.md).
+  ADR 0006's other decisions stand.
 - **Related:** [ADR 0005](0005-kitty-images.md) (Kitty virtual
   placements), [ADR 0007](0007-bundle-conpty.md) (bundled ConPTY).
 
@@ -33,6 +34,19 @@ speak Sixel.
    5), whether or not it advertised Sixel.
 2. tai's DA1 reply lists feature 4 only when `TAI_SIXEL=1` is set in its
    environment. By default, programs that ask see no Sixel and choose Kitty.
+3. **Sixel follows xterm; Kitty follows libghostty-vt.** xterm is the de
+   facto Sixel reference, and libghostty-vt implements the Kitty protocol
+   in full, so tai doesn't second-guess either.
+   - After a Sixel image, the cursor goes to the start of the row below
+     it, as in xterm. The translated Kitty command still carries `C=1`,
+     and tai follows it with one line feed per cell row the image covers,
+     then a carriage return.
+   - Checked 2026-10-26 in XTerm 372 (`-ti vt340`, by the Linux session):
+     text printed right after an image starts at column 0 of the row
+     below it. WezTerm, which ADR 0006 followed, leaves the cursor on the
+     image's last row instead. In tai, images draw above text, so text
+     printed there was hidden under the image.
+   - Kitty images keep whatever libghostty-vt does with them.
 
 A fact correction to ADR 0006 decision 2, which mentions 8-bit DCS
 (`0x90`): libghostty-vt decodes the stream as UTF-8 and prints any

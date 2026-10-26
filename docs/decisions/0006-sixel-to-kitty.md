@@ -3,7 +3,8 @@
 - **Status:** Accepted 2026-10-25 (owner). Not implemented yet; the checks
   listed under decision 3 and Accepted risks are still open.
 - **Superseded in part by:** [ADR 0009](0009-sixel-not-advertised.md)
-  replaces decision 1: Sixel is advertised only with `TAI_SIXEL=1`.
+  replaces decision 1 (Sixel is advertised only with `TAI_SIXEL=1`) and
+  decision 3 (the cursor follows xterm, not WezTerm).
 - **Deciders:** owner. Written by the Claude session on the Windows dev host.
 - **Related:**
   - [ADR 0005](0005-kitty-images.md) (Kitty images: identity variables

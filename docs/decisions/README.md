@@ -11,10 +11,10 @@ Status is summarised; the record itself is authoritative.
 | [0003](0003-utf-8-everywhere.md) | UTF-8 everywhere, with the locale sensed per OS | ✅ Accepted 2026-10-24 |
 | [0004](0004-windows-system-conpty.md) | Use Windows' own ConPTY, not whatever `conpty.dll` the DLL search finds | ✅ Accepted 2026-10-25; superseded by 0007 |
 | [0005](0005-kitty-images.md) | Kitty images: identify tai with `TERM_PROGRAM`, and draw virtual placements | ✅ Accepted 2026-10-25 |
-| [0006](0006-sixel-to-kitty.md) | Accept Sixel by translating it into Kitty images | ✅ Accepted 2026-10-25; decision 1 superseded by 0009 |
+| [0006](0006-sixel-to-kitty.md) | Accept Sixel by translating it into Kitty images | ✅ Accepted 2026-10-25; decisions 1 and 3 superseded by 0009 |
 | [0007](0007-bundle-conpty.md) | Bundle Microsoft's ConPTY with tai on Windows, so image sequences and DA1 reach tai | ✅ Accepted 2026-10-25 |
 | [0008](0008-gpu-cell-renderer.md) | Draw the grid from GPU cell buffers, as Ghostty does, in milestone (a) | ✅ Accepted 2026-10-25; prototype on a branch |
-| [0009](0009-sixel-not-advertised.md) | Translate Sixel, but don't advertise it unless `TAI_SIXEL=1` | ✅ Accepted 2026-10-26 |
+| [0009](0009-sixel-not-advertised.md) | Translate Sixel as xterm draws it, but don't advertise it unless `TAI_SIXEL=1` | ✅ Accepted 2026-10-26 |
 
 Numbering is sequential. The next record is `0010`.
 

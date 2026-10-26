@@ -10,9 +10,9 @@
 //! The Kitty command carries `q=2` and no image id, so libghostty-vt picks
 //! its own id and writes nothing back to the program (`graphics_exec.zig`,
 //! Ghostty a887df42). It carries `C=1` and is followed by one line feed per
-//! cell row but the last, which leaves the cursor on the image's last row in
-//! its starting column, as WezTerm does for Sixel
-//! (`term/src/terminalstate/image.rs`, WezTerm e2a98e1b).
+//! cell row and a carriage return, which leaves the cursor at the start of
+//! the row below the image, as xterm does (checked in XTerm 372 with
+//! `-ti vt340`; ADR 0009).
 
 use icy_sixel::SixelImage;
 
@@ -266,12 +266,13 @@ impl Translator {
         for command in kitty_commands(&image.pixels, image.width, image.height) {
             sink(&command);
         }
-        // Kitty's C=1 left the cursor at the image's top left. Sixel leaves
-        // it on the image's last row, in the same column.
+        // Kitty's C=1 left the cursor at the image's top left. xterm leaves
+        // it at the start of the row below the image (ADR 0009).
         let rows = cell_rows(image.height, cell_height);
-        for _ in 1..rows {
+        for _ in 0..rows {
             sink(b"\n");
         }
+        sink(b"\r");
     }
 }
 
@@ -445,7 +446,7 @@ mod tests {
     fn sixel_becomes_a_quiet_kitty_image() {
         let out = run(&[b"before ", RED, b" after"], 20);
         assert!(out.starts_with(b"before \x1b_Ga=T,f=32,q=2,C=1,s=3,v=6,m=0;"));
-        assert!(out.ends_with(b"\x1b\\ after"));
+        assert!(out.ends_with(b"\x1b\\\n\r after"));
         assert!(!contains(&out, b"\x1bP"));
         // 3x6 RGBA is 72 bytes: 96 base64 characters.
         let start = out.iter().position(|&c| c == b';').unwrap() + 1;
@@ -454,12 +455,13 @@ mod tests {
     }
 
     #[test]
-    fn cursor_moves_down_to_the_last_row() {
-        // Six bands of six pixels: 36 px tall, two 20 px rows, one line feed.
+    fn cursor_moves_below_the_image() {
+        // Six bands of six pixels: 36 px tall, two 20 px rows: two line
+        // feeds and a carriage return.
         let tall = b"\x1bPq#0;2;0;0;100#0~-~-~-~-~-~\x1b\\";
         let out = run(&[tall.as_slice()], 20);
-        assert!(out.ends_with(b"\x1b\\\n"));
-        assert_eq!(out.iter().filter(|&&c| c == b'\n').count(), 1);
+        assert!(out.ends_with(b"\x1b\\\n\n\r"));
+        assert_eq!(out.iter().filter(|&&c| c == b'\n').count(), 2);
     }
 
     #[test]
@@ -543,9 +545,9 @@ mod tests {
         t.feed(b"AB", 20, &mut write);
         t.feed(tall, 20, &mut write);
 
-        // Sixel leaves the cursor on the image's last row, same column.
-        assert_eq!(term.cursor_x().unwrap(), 2);
-        assert_eq!(term.cursor_y().unwrap(), 1);
+        // As in xterm, the cursor ends at the start of the row below.
+        assert_eq!(term.cursor_x().unwrap(), 0);
+        assert_eq!(term.cursor_y().unwrap(), 2);
         // No id was sent, so libghostty-vt numbered it from 2147483647.
         let graphics = term.kitty_graphics().unwrap();
         let image = graphics.image(2_147_483_647).expect("image stored");
