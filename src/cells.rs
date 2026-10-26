@@ -78,8 +78,8 @@ pub struct GlyphAtlas {
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
-    /// Glyphs were added since the last upload.
-    dirty: bool,
+    /// The rows (start, end) holding glyphs added since the last upload.
+    dirty_rows: Option<(u32, u32)>,
     texture: Option<Texture2D>,
 }
 
@@ -94,7 +94,7 @@ impl GlyphAtlas {
             shelf_x: 0,
             shelf_y: GAP,
             shelf_h: 0,
-            dirty: true,
+            dirty_rows: Some((0, height)),
             texture: None,
         }
     }
@@ -150,7 +150,10 @@ impl GlyphAtlas {
         }
         self.shelf_x += w + 2 * GAP;
         self.shelf_h = self.shelf_h.max(h);
-        self.dirty = true;
+        self.dirty_rows = Some(match self.dirty_rows {
+            Some((start, end)) => (start.min(y), end.max(y + h)),
+            None => (y, y + h),
+        });
         Some(Glyph {
             x,
             y,
@@ -206,7 +209,10 @@ impl GlyphAtlas {
         }
     }
 
-    /// The atlas texture with every glyph placed so far.
+    /// The atlas texture with every glyph placed so far. Uploads only the
+    /// rows that changed since the last call, unless the atlas grew: a
+    /// first screen of CJK or a font-size step adds glyphs for several
+    /// frames, and the whole atlas can be 32 MB.
     fn texture(&mut self) -> &Texture2D {
         let size_changed = self
             .texture
@@ -217,12 +223,23 @@ impl GlyphAtlas {
                 Texture2D::from_rgba8(ATLAS_WIDTH as u16, self.height as u16, &self.pixels);
             texture.set_filter(FilterMode::Linear);
             self.texture = Some(texture);
-        } else if self.dirty
+        } else if let Some((start, end)) = self.dirty_rows
             && let Some(texture) = &self.texture
         {
-            texture.update_from_bytes(ATLAS_WIDTH, self.height, &self.pixels);
+            let row_bytes = (ATLAS_WIDTH * 4) as usize;
+            // SAFETY: as in `TextPass::new`.
+            #[allow(unsafe_code)]
+            let gl = unsafe { get_internal_gl() };
+            gl.quad_context.texture_update_part(
+                texture.raw_miniquad_id(),
+                0,
+                start as i32,
+                ATLAS_WIDTH as i32,
+                (end - start) as i32,
+                &self.pixels[start as usize * row_bytes..end as usize * row_bytes],
+            );
         }
-        self.dirty = false;
+        self.dirty_rows = None;
         self.texture.as_ref().expect("texture was just created")
     }
 }
@@ -273,6 +290,8 @@ pub struct TextPass {
     instances: BufferId,
     /// How many instances `instances` holds.
     capacity: usize,
+    /// The driver's GL_VERSION string.
+    pub gl_version: String,
     /// The GLSL version the shaders were built for, as "3.30" or "1.50".
     pub glsl: &'static str,
     /// The driver's GL_MAX_TEXTURE_SIZE.
@@ -295,7 +314,10 @@ impl TextPass {
         } else if info.glsl_support.v150 {
             ("#version 150\n", "1.50")
         } else {
-            return Err("no GLSL 3.30 or 1.50".into());
+            return Err(format!(
+                "no GLSL 3.30 or 1.50 in OpenGL {}",
+                info.gl_version_string
+            ));
         };
         if !info.features.instancing {
             return Err("no instancing".into());
@@ -379,6 +401,7 @@ impl TextPass {
             indices,
             instances,
             capacity,
+            gl_version: info.gl_version_string.clone(),
             glsl,
             max_texture_size,
         })

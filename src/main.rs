@@ -626,7 +626,8 @@ impl CellGrid {
             .ok()?;
         let atlas_height = cells::ATLAS_MAX_HEIGHT.min(text.max_texture_size);
         tracing::info!(
-            "renderer: cells (GLSL {}, glyph atlas up to {atlas_height} px)",
+            "renderer: cells (OpenGL {}, GLSL {}, glyph atlas up to {atlas_height} px)",
+            text.gl_version,
             text.glsl
         );
         Some(Self {
