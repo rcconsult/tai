@@ -77,18 +77,16 @@ by z and then by image id, so that with equal z the newer image (the
 higher id) draws on top (`src/renderer/image.zig`, the `sortUnstable` call
 and `Id.zLessThan`, a887df42).
 
-tai draws placements in the iterator's order (`src/main.rs`,
-`render_kitty_images`), without that sort. Where two images overlap at the
-same z, as when a program redraws a carousel or swaps a picture in place,
-the older one can end up drawn over the newer one. This affects translated
-Sixel images and Kitty images with a fixed placement, but not Unicode
-placeholders, which are cells. Found by reading the code on 2026-10-26; not
-yet reproduced in tai.
+Drawn in the iterator's order, two images that overlap at the same z, as
+when a program redraws a carousel or swaps a picture in place, can show
+the older one over the newer one. This affects translated Sixel images
+and Kitty images with a fixed placement, but not Unicode placeholders,
+which are cells. tai sorts as Ghostty does (`src/main.rs`,
+`kitty_image_draws`). The test `overlapping_images_draw_oldest_first`
+draws eight images on one cell. Without the sort, the iterator returned
+them as ...647, 649, 648, 650, 654, 653, 651, 652.
 
 Translated Sixel images also carry no image id the program could delete
 them by (`src/sixel.rs`, `kitty_commands`), so a replaced image stays in
 storage underneath the new one. It's hidden only if the new one is opaque
 and at least as large.
-
-The fix is to collect a layer's placements and sort them as Ghostty does
-before drawing.

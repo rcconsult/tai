@@ -1516,6 +1516,41 @@ impl<'alloc> Renderer<'alloc> {
         layer: Layer,
         dims: Dimensions,
     ) -> Result<()> {
+        for draw in Self::kitty_image_draws(terminal, placement_it, graphics, layer, dims)? {
+            let Some(image) = graphics.image(draw.image_id) else {
+                continue;
+            };
+            let tex =
+                Texture2D::from_rgba8(image.width()? as u16, image.height()? as u16, image.data()?);
+            draw_texture_ex(
+                &tex,
+                draw.pos.x,
+                draw.pos.y,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(draw.dest_size),
+                    source: Some(draw.source),
+                    ..Default::default()
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    /// One layer's visible placements, in drawing order. libghostty-vt's
+    /// iterator walks a hash map, so Ghostty's renderer sorts placements by
+    /// z and then image id, which puts the newer of two overlapping images
+    /// on top (`src/renderer/image.zig`, `sortUnstable` and `Id.zLessThan`,
+    /// a887df42). tai sorts the same way.
+    fn kitty_image_draws<'t>(
+        terminal: &'t Terminal<'_, '_>,
+        placement_it: &mut PlacementIterator<'_>,
+        graphics: &Graphics<'t>,
+        layer: Layer,
+        dims: Dimensions,
+    ) -> Result<Vec<ImageDraw>> {
+        let mut draws = Vec::new();
         let mut placements = placement_it.update(graphics)?;
         placements.set_layer(layer)?;
 
@@ -1562,27 +1597,25 @@ impl<'alloc> Renderer<'alloc> {
             let x_offset = placement.x_offset()? as f32 / dims.dpi_scale;
             let y_offset = placement.y_offset()? as f32 / dims.dpi_scale;
 
-            let tex = Texture2D::from_rgba8(image_width as u16, image_height as u16, data);
-
-            draw_texture_ex(
-                &tex,
-                PADDING + info.viewport_col as f32 * dims.cell_width + x_offset,
-                PADDING + info.viewport_row as f32 * dims.cell_height + y_offset,
-                WHITE,
-                DrawTextureParams {
-                    dest_size: Some(dest_size),
-                    source: Some(Rect {
-                        x: info.source_x as f32,
-                        y: info.source_y as f32,
-                        w: info.source_width as f32,
-                        h: info.source_height as f32,
-                    }),
-                    ..Default::default()
+            draws.push(ImageDraw {
+                z: placement.z()?,
+                image_id,
+                pos: vec2(
+                    PADDING + info.viewport_col as f32 * dims.cell_width + x_offset,
+                    PADDING + info.viewport_row as f32 * dims.cell_height + y_offset,
+                ),
+                dest_size,
+                source: Rect {
+                    x: info.source_x as f32,
+                    y: info.source_y as f32,
+                    w: info.source_width as f32,
+                    h: info.source_height as f32,
                 },
-            );
+            });
         }
 
-        Ok(())
+        draws.sort_by_key(|d| (d.z, d.image_id));
+        Ok(draws)
     }
 }
 
@@ -1713,6 +1746,16 @@ fn id_color(c: StyleColor) -> placeholders::IdColor {
         StyleColor::Palette(index) => placeholders::IdColor::Palette(index.0),
         StyleColor::Rgb(RgbColor { r, g, b }) => placeholders::IdColor::Rgb(r, g, b),
     }
+}
+
+/// One Kitty image placement, ready to draw.
+#[derive(Debug)]
+struct ImageDraw {
+    z: i32,
+    image_id: u32,
+    pos: Vec2,
+    dest_size: Vec2,
+    source: Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3111,6 +3154,37 @@ mod tests {
             baseline: 0.0,
             dpi_scale,
         }
+    }
+
+    #[test]
+    fn overlapping_images_draw_oldest_first() {
+        use super::Renderer;
+        use libghostty_vt::kitty::graphics::{Layer, PlacementIterator};
+        use libghostty_vt::{Terminal, TerminalOptions};
+
+        let mut term = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        term.resize(80, 24, 10, 20).unwrap();
+        term.set_kitty_image_storage_limit(64 * 1024 * 1024)
+            .unwrap();
+        // Eight 1x1 RGBA images at the same cell, as a carousel would
+        // draw them. With no i=, libghostty-vt numbers them in order.
+        for _ in 0..8 {
+            term.vt_write(b"\x1b_Ga=T,f=32,q=2,C=1,s=1,v=1;/wAA/w==\x1b\\");
+        }
+
+        let graphics = term.kitty_graphics().unwrap();
+        let mut it = PlacementIterator::new().unwrap();
+        let d = dims((800.0, 600.0), (10.0, 20.0), 1.0);
+        let draws = Renderer::kitty_image_draws(&term, &mut it, &graphics, Layer::All, d).unwrap();
+        let ids: Vec<u32> = draws.iter().map(|d| d.image_id).collect();
+        assert_eq!(ids.len(), 8);
+        // The newest image draws last, so it ends up on top.
+        assert!(ids.is_sorted(), "draw order {ids:?}");
     }
 
     #[test]
