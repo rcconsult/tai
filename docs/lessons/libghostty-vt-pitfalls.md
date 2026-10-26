@@ -65,3 +65,30 @@ in `target/`. `scripts/cargo.sh` therefore keeps the Ghostty checkout's
 HEAD in `<target dir>/.tai-ghostty-head` and runs
 `cargo clean -p libghostty-vt-sys` when it differs. Plain `cargo` skips
 that check.
+
+## Overlapping Kitty images draw in no fixed order
+
+libghostty-vt's placement iterator walks the image storage's hash map
+(`src/terminal/c/kitty_graphics.zig`, `storage.placements.iterator()`,
+a887df42), so it returns placements in no particular order. Its layer
+filter only sorts them into the three z ranges (below the background,
+below the text, above the text). Ghostty's own renderer sorts them first,
+by z and then by image id, so that with equal z the newer image (the
+higher id) draws on top (`src/renderer/image.zig`, the `sortUnstable` call
+and `Id.zLessThan`, a887df42).
+
+tai draws placements in the iterator's order (`src/main.rs`,
+`render_kitty_images`), without that sort. Where two images overlap at the
+same z, as when a program redraws a carousel or swaps a picture in place,
+the older one can end up drawn over the newer one. This affects translated
+Sixel images and Kitty images with a fixed placement, but not Unicode
+placeholders, which are cells. Found by reading the code on 2026-10-26; not
+yet reproduced in tai.
+
+Translated Sixel images also carry no image id the program could delete
+them by (`src/sixel.rs`, `kitty_commands`), so a replaced image stays in
+storage underneath the new one. It's hidden only if the new one is opaque
+and at least as large.
+
+The fix is to collect a layer's placements and sort them as Ghostty does
+before drawing.
