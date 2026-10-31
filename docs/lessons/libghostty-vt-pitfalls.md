@@ -90,3 +90,31 @@ Translated Sixel images also carry no image id the program could delete
 them by (`src/sixel.rs`, `kitty_commands`), so a replaced image stays in
 storage underneath the new one. It's hidden only if the new one is opaque
 and at least as large.
+
+## Grapheme clustering (mode 2027) is off on purpose
+
+Ghostty's app turns on mode 2027 by default (`src/termio/Termio.zig`,
+`grapheme-width-method = unicode`, at a887df42). tai doesn't. With 2027
+on, VS16 makes a narrow symbol such as ☸️ two cells wide, and a ZWJ
+sequence such as 👨‍👩‍👧 takes two cells instead of six. Shells don't
+count it that way: bash's readline and zsh's line editor use `wcwidth`,
+which gives ☸️ one cell and 👨‍👩‍👧 six. On 2026-11-01, with 2027 on,
+editing a recalled line over those emoji in bash (Linux, and WSL under
+ConPTY) put the cursor in the middle of a glyph, made Backspace redraw
+the wrong cells, and ran a line that differed from what the screen
+showed. Ghostty has the same behaviour and calls it the shells' bug:
+ghostty-org/ghostty#2027, "Grapheme clusters and backspace cause
+incorrect cursor positioning".
+
+The cost of leaving it off is cosmetic. "☸️ helm" draws as "☸helm",
+because a narrow symbol may grow into a blank next cell, as in Ghostty
+(`src/renderer/cell.zig`, `constraintWidth`). Programs that handle
+grapheme widths can still turn 2027 on themselves; tai honours it.
+
+Branch `grapheme-cluster` turns it on at startup. Before reviving it,
+tai also needs to shape ZWJ sequences, flags and skin tones into one
+glyph: with 2027 on, each such sequence gets two cells, and tai draws
+every codepoint in them, so they overlap the next cells. The bundled Noto
+Emoji has GSUB ligatures for these sequences. A full reset (`ESC c`)
+would also turn the mode off, because libghostty-vt's C API has no
+default-modes option.
