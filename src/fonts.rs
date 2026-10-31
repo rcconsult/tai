@@ -1,11 +1,11 @@
 //! Bundled fonts and per-codepoint fallback.
 //!
 //! Text is drawn with JetBrains Mono. Codepoints it lacks fall back, in
-//! order, to Symbols Nerd Font Mono (the Nerd Font icons in shell prompts)
-//! and Iosevka Fixed (general symbols such as ⎈ and ⏵, and braille). All
-//! three fonts are bundled (`fonts/README.md` records where they come
-//! from). Unicode spaces draw blank without a font. System-font discovery
-//! for emoji and CJK is left for later.
+//! order, to Symbols Nerd Font Mono (the Nerd Font icons in shell prompts),
+//! Iosevka Fixed (general symbols such as ⎈ and ⏵, and braille) and Noto
+//! Emoji (monochrome emoji). All four fonts are bundled (`fonts/README.md`
+//! records where they come from). Unicode spaces draw blank without a font.
+//! Colour emoji and system-font discovery for CJK are left for later.
 
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ use macroquad::text::{Font, load_ttf_font_from_fontdue};
 pub const PRIMARY_BYTES: &[u8] = include_bytes!("../fonts/JetBrainsMono-Medium.ttf");
 pub const SYMBOLS_BYTES: &[u8] = include_bytes!("../fonts/SymbolsNerdFontMono-Regular.ttf");
 pub const IOSEVKA_BYTES: &[u8] = include_bytes!("../fonts/IosevkaFixedSS01-Medium.ttf");
+pub const EMOJI_BYTES: &[u8] = include_bytes!("../fonts/NotoEmoji-Regular.ttf");
 
 /// How a codepoint is drawn: with one of the bundled fonts, or not at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -21,6 +22,7 @@ pub enum Face {
     Primary,
     Symbols,
     Iosevka,
+    Emoji,
     /// A Unicode space: the cell keeps its background and draws no glyph.
     Blank,
 }
@@ -55,9 +57,11 @@ pub struct Coverage {
     primary: Arc<fontdue::Font>,
     symbols: Arc<fontdue::Font>,
     iosevka: Arc<fontdue::Font>,
+    emoji: Arc<fontdue::Font>,
     primary_mid: f32,
     symbols_fit: Fit,
     iosevka_fit: Fit,
+    emoji_fit: Fit,
 }
 
 /// How to draw a glyph in a cell: the font size to draw at and how far to
@@ -72,6 +76,7 @@ pub struct Placement {
 const PRIMARY_PROBE: char = 'M';
 const SYMBOLS_PROBE: char = '\u{f113}';
 const IOSEVKA_PROBE: char = 'M';
+const EMOJI_PROBE: char = '\u{1f600}';
 const PROBE_PX: f32 = 100.0;
 
 fn line_metrics(font: &fontdue::Font) -> Result<fontdue::LineMetrics, &'static str> {
@@ -106,20 +111,23 @@ impl Coverage {
         let primary = fontdue::Font::from_bytes(PRIMARY_BYTES, settings)?;
         let symbols = fontdue::Font::from_bytes(SYMBOLS_BYTES, settings)?;
         let iosevka = fontdue::Font::from_bytes(IOSEVKA_BYTES, settings)?;
+        let emoji = fontdue::Font::from_bytes(EMOJI_BYTES, settings)?;
         Ok(Self {
             primary_mid: mid(line_metrics(&primary)?),
             symbols_fit: Fit::new(&primary, &symbols, SYMBOLS_PROBE)?,
             iosevka_fit: Fit::new(&primary, &iosevka, IOSEVKA_PROBE)?,
+            emoji_fit: Fit::new(&primary, &emoji, EMOJI_PROBE)?,
             primary: Arc::new(primary),
             symbols: Arc::new(symbols),
             iosevka: Arc::new(iosevka),
+            emoji: Arc::new(emoji),
         })
     }
 
     /// How to draw `ch`. Unicode spaces are blank. Otherwise the first font
     /// in the chain that has a glyph for it (glyph index ≠ 0): primary,
-    /// then Symbols, then Iosevka. When none has it, the primary draws its
-    /// missing-glyph box.
+    /// then Symbols, then Iosevka, then Noto Emoji. When none has it, the
+    /// primary draws its missing-glyph box.
     pub fn face_for(&self, ch: char) -> Face {
         let has = |font: &fontdue::Font| font.lookup_glyph_index(ch) != 0;
         if is_space(ch) {
@@ -130,6 +138,8 @@ impl Coverage {
             Face::Symbols
         } else if has(&self.iosevka) {
             Face::Iosevka
+        } else if has(&self.emoji) {
+            Face::Emoji
         } else {
             Face::Primary
         }
@@ -142,6 +152,7 @@ impl Coverage {
             Face::Primary | Face::Blank => &self.primary,
             Face::Symbols => &self.symbols,
             Face::Iosevka => &self.iosevka,
+            Face::Emoji => &self.emoji,
         }
     }
 
@@ -158,6 +169,7 @@ impl Coverage {
             }
             Face::Symbols => &self.symbols_fit,
             Face::Iosevka => &self.iosevka_fit,
+            Face::Emoji => &self.emoji_fit,
         };
         let scale = (fit.scale * f32::from(cells)).min(fit.max_scale);
         let size = (f32::from(font_size) * scale).round().max(1.0);
@@ -175,17 +187,19 @@ pub struct Fonts {
     pub primary: Font,
     pub symbols: Font,
     pub iosevka: Font,
+    pub emoji: Font,
 }
 
 impl Fonts {
     /// The drawing fonts, sharing the parsed font data with `coverage`.
     /// fontdue keeps every glyph's outline, so a second parse would cost
-    /// about 100 MB more for the three bundled fonts.
+    /// about 100 MB more for the bundled fonts.
     pub fn load(coverage: &Coverage) -> Self {
         Self {
             primary: load_ttf_font_from_fontdue(coverage.primary.clone()),
             symbols: load_ttf_font_from_fontdue(coverage.symbols.clone()),
             iosevka: load_ttf_font_from_fontdue(coverage.iosevka.clone()),
+            emoji: load_ttf_font_from_fontdue(coverage.emoji.clone()),
         }
     }
 
@@ -201,6 +215,7 @@ impl Fonts {
             primary: self.primary.with_fresh_cache(),
             symbols: self.symbols.with_fresh_cache(),
             iosevka: self.iosevka.with_fresh_cache(),
+            emoji: self.emoji.with_fresh_cache(),
         }
     }
 
@@ -210,6 +225,7 @@ impl Fonts {
             Face::Primary | Face::Blank => &self.primary,
             Face::Symbols => &self.symbols,
             Face::Iosevka => &self.iosevka,
+            Face::Emoji => &self.emoji,
         }
     }
 }
@@ -290,11 +306,29 @@ mod tests {
     }
 
     #[test]
+    fn emoji_use_noto_emoji() {
+        let c = Coverage::new().unwrap();
+        // Textual's file-tree icons 📁 📄, ppxai's 💭 📊, and U+2638 ☸
+        // (kube-ps1's alternative symbol).
+        for ch in [
+            '\u{1f4c1}',
+            '\u{1f4c4}',
+            '\u{1f4ad}',
+            '\u{1f4ca}',
+            '\u{2638}',
+        ] {
+            assert_eq!(c.face_for(ch), Face::Emoji, "U+{:04X}", ch as u32);
+        }
+        // One cell is 12 px at size 20, and Noto Emoji's glyphs are about
+        // 1.3 em wide. Two cells would allow 24 px, but its 1.4 em line
+        // caps it at about 0.95x of the primary's 1.32 em line.
+        assert_eq!(c.place(Face::Emoji, 20, 1).font_size, 9);
+        assert_eq!(c.place(Face::Emoji, 20, 2).font_size, 19);
+    }
+
+    #[test]
     fn missing_everywhere_stays_primary() {
         let c = Coverage::new().unwrap();
-        // U+2638 ☸ (kube-ps1's alternative symbol) needs an emoji font.
-        for ch in ['\u{2638}', '\u{10fffd}'] {
-            assert_eq!(c.face_for(ch), Face::Primary, "U+{:04X}", ch as u32);
-        }
+        assert_eq!(c.face_for('\u{10fffd}'), Face::Primary);
     }
 }

@@ -1,11 +1,12 @@
 # Bundled fonts
 
-All three fonts are compiled into the binary (`src/fonts.rs`).
+All four fonts are compiled into the binary (`src/fonts.rs`).
 
 | File | Source | Licence |
 |---|---|---|
 | `JetBrainsMono-Medium.ttf` | uzaaft/libghostty-rs `example/ghostling_rs/`, tag v0.2.2 (a3a9676, "release: 0.2.2") | SIL OFL 1.1 (`OFL.txt`) |
 | `SymbolsNerdFontMono-Regular.ttf` | ryanoasis/nerd-fonts release v3.5.1, asset `NerdFontsSymbolsOnly.tar.xz` | Font: MIT (`SymbolsNerdFont-LICENSE`). Icons: per set, see below |
+| `NotoEmoji-Regular.ttf` | ghostty-org/ghostty `src/font/res/`, at a887df42 ("terminal: bound page map probe lengths without tombstones (#13294)"); upstream googlefonts/noto-emoji | SIL OFL 1.1 (`NotoEmoji-LICENSE`) |
 | `IosevkaFixedSS01-Medium.ttf` | be5invis/Iosevka release v34.9.0 (2487637, "Release 34.9.0"), asset `PkgTTF-Unhinted-IosevkaFixedSS01-34.9.0.zip` | SIL OFL 1.1 (`Iosevka-LICENSE.md`, the repo's `LICENSE.md` at that tag) |
 
 sha256:
@@ -16,6 +17,7 @@ fe471e538392f51910faab985fa8e192a39dd3426125edd15b71b3680df0e749  SymbolsNerdFon
 01172f37db8543edb102e5cb5c64101c9f4686630804d49b419aa07b23a69996  NerdFontsSymbolsOnly.tar.xz (the release asset)
 999c3254e382082f1d37eb6e390a60feeff47f204b0366afdac06f977315c1a4  IosevkaFixedSS01-Medium.ttf
 0e4b5fb8b5346272b9751340dae8ca61eddf9f1b390d6d429834987f552871e1  PkgTTF-Unhinted-IosevkaFixedSS01-34.9.0.zip (the release asset)
+84a38f2f02374efb72cac2b7eb5589102e06fffc33f7b531ed708f4a08236c91  NotoEmoji-Regular.ttf
 ```
 
 `SymbolsNerdFont-README.md` is the README from the same archive. Its
@@ -37,12 +39,21 @@ JetBrains Mono's weight.
 Unicode spaces (U+00A0, U+2000-200A, U+202F, U+205F, U+3000) draw as
 empty cells with no font lookup. Otherwise JetBrains Mono draws
 everything it has. A codepoint it lacks is drawn with the first of
-Symbols Nerd Font Mono and Iosevka Fixed that has a glyph for it (glyph
-index not 0). Fallback glyphs are scaled to one cell, or to two when
+Symbols Nerd Font Mono, Iosevka Fixed and Noto Emoji that has a glyph
+for it (glyph index not 0). Fallback glyphs are scaled to one cell, or to two when
 the next cell is blank (Ghostty does the same), never taller than
 JetBrains Mono's line, and centred on the row. Iosevka's line height
-caps its glyphs at one cell.
+caps its glyphs at one cell; Noto Emoji's caps them at just under its
+line height.
 
 Iosevka covers general symbols such as ⎈ U+2388 (kube-ps1) and ⏵ U+23F5,
-and all of braille (U+2800-28FF). Still missing: emoji, including
-☸ U+2638, and CJK. System-font discovery for those isn't handled yet.
+and all of braille (U+2800-28FF).
+
+Noto Emoji draws emoji, such as Textual's file-tree icons 📁 📄 and
+☸ U+2638, in one colour (the text's). It is the monochrome font Ghostty
+bundles as its last emoji fallback, after a colour emoji font. Ghostty's
+colour fallback is Apple Color Emoji on macOS and the bundled Noto Color
+Emoji elsewhere; tai has no colour glyphs yet, because fontdue only
+rasterizes outlines. VS15 and VS16 (U+FE0E, U+FE0F), which pick text or
+emoji presentation, aren't drawn, as in Ghostty. Still missing: colour
+emoji and CJK.

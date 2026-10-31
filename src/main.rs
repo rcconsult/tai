@@ -1485,6 +1485,12 @@ fn walk_row(
         if graphemes > 0 {
             // Convert read grapheme codepoints into UTF-8 text.
             cell.graphemes_utf8(text)?;
+            // VS15/VS16 only choose text or emoji presentation; no font
+            // draws them, so they'd show as missing-glyph boxes. Ghostty
+            // drops them before shaping too (`src/font/shaper/run.zig`, "Do
+            // not send presentation modifiers", at a887df4 "terminal: bound
+            // page map probe lengths without tombstones (#13294)").
+            text.retain(|ch| !matches!(ch, '\u{fe0e}' | '\u{fe0f}'));
         }
         if std::mem::take(&mut icon_open)
             && (graphemes == 0 || text.chars().next().is_some_and(is_space))
@@ -1551,7 +1557,7 @@ fn walk_row(
                 .chars()
                 .next()
                 .map_or(Face::Primary, |ch| coverage.face_for(ch));
-            if face == Face::Symbols || face == Face::Iosevka {
+            if matches!(face, Face::Symbols | Face::Iosevka | Face::Emoji) {
                 icons.push(Icon {
                     text: text.clone(),
                     face,
