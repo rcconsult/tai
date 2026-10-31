@@ -106,6 +106,13 @@ showed. Ghostty has the same behaviour and calls it the shells' bug:
 ghostty-org/ghostty#2027, "Grapheme clusters and backspace cause
 incorrect cursor positioning".
 
+ConPTY isn't a factor on Windows: asked from inside tai
+(`GetConsoleScreenBufferInfo`), the bundled OpenConsole moved the cursor
+by mode 2027's widths in every case tried (☸️ 2, ☸︎ 1, 👨‍👩‍👧 2).
+PowerShell's PSReadLine misaligns with 2027 off as well as on, because it
+does its own width arithmetic and steps by UTF-16 unit. Leaving 2027 off
+keeps bash and zsh right; it doesn't fix PowerShell.
+
 The cost of leaving it off is cosmetic. "☸️ helm" draws as "☸helm",
 because a narrow symbol may grow into a blank next cell, as in Ghostty
 (`src/renderer/cell.zig`, `constraintWidth`). Programs that handle
