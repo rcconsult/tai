@@ -1,7 +1,8 @@
 # ADR 0008: Draw the grid from GPU cell buffers, as Ghostty does
 
 - **Status:** Accepted 2026-10-25 (owner). The prototype and its macOS
-  measurements follow on their own branch (decision 3).
+  measurements follow on their own branch (decision 3). (2026-10-31: merged
+  to main on 2026-10-25 as 36d27d3; see Notes.)
 - **Deciders:** owner. Written by the Claude session on the macOS dev host.
 - **Related:** [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
   (milestone (a) renders with macroquad; milestone (b) moves to winit +
@@ -184,3 +185,20 @@ Constraints for a port into the current stack:
     57/255: macroquad's atlas puts its first row of glyphs against the
     texture edge, so linear filtering brightens their top pixel.
   - Not yet checked: the Retina display, font-size steps, Linux, Windows.
+
+- **2026-10-31, the checks listed above as not yet done** (facts only; the
+  decision is unchanged).
+  - Linux (Xvfb, Mesa llvmpipe), popos-tai: pixel-identical (AE 0) between
+    cells, immediate and main for the torture test, a coloured prompt, font
+    steps, mouse selection and both kinds of Kitty image. The later shared
+    cell walk (3b3cd50) and partial atlas uploads (e96813e) stayed AE 0,
+    including a 2,950-glyph stream. During a flood, render time per frame
+    went from 5.1 ms to 1.4 ms.
+  - Windows (WGL, OpenGL 3.2 core, so GLSL 1.50), the owner on screen:
+    ppxaide looks the same on both renderers at normal and enlarged font,
+    and a 1,331-glyph test redraws cleanly after each font step. In
+    release, a full-screen repaint renders in 0.18–0.26 ms against
+    0.40–0.50 ms.
+  - macOS: the owner has used ppxaide on the cell renderer since the mouse
+    fixes (8133901). No pixel comparison has been made at 2x, and font
+    steps on the Retina panel haven't been checked separately.
