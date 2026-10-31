@@ -265,6 +265,14 @@ async fn main() -> Result<()> {
         .set_kitty_image_from_temp_file_allowed(true)?
         .set_kitty_image_from_shared_mem_allowed(true)?;
 
+    // Grapheme clustering (mode 2027) on by default, as in Ghostty's app
+    // (`src/termio/Termio.zig`, `grapheme-width-method = unicode`, at
+    // a887df4 "terminal: bound page map probe lengths without tombstones
+    // (#13294)"): VS16 makes a narrow symbol such as ☸ two cells wide, and
+    // ZWJ sequences share one cell pair. libghostty-vt's C API has no
+    // default-modes option, so unlike Ghostty a full reset (RIS) turns it off.
+    terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
+
     // Whether DA1 lists Sixel (ADR 0009). tai translates Sixel either way.
     let advertise_sixel = std::env::var("TAI_SIXEL").as_deref() == Ok("1");
 
@@ -3244,6 +3252,24 @@ mod tests {
         let expected = super::in_band_size_report((100, 30), (9, 18));
         assert_eq!(expected, "\x1b[48;30;100;540;900t");
         assert_eq!(*sent.borrow(), expected.as_bytes());
+    }
+
+    #[test]
+    fn grapheme_cluster_widens_vs16() {
+        use libghostty_vt::{Terminal, TerminalOptions, terminal::Mode};
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        // ☸ (U+2638) is one cell; with VS16 under mode 2027 it's two.
+        terminal.vt_write("\u{2638}\u{fe0f}".as_bytes());
+        assert_eq!(terminal.cursor_x().unwrap(), 1);
+        terminal.vt_write(b"\r\x1b[?2027h");
+        terminal.vt_write("\u{2638}\u{fe0f}".as_bytes());
+        assert!(terminal.mode(Mode::GRAPHEME_CLUSTER).unwrap());
+        assert_eq!(terminal.cursor_x().unwrap(), 2);
     }
 
     #[test]
