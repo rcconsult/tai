@@ -5,8 +5,11 @@
 //! Iosevka Fixed (general symbols such as ⎈ and ⏵, and braille) and Noto
 //! Emoji (monochrome emoji). All four fonts are bundled (`fonts/README.md`
 //! records where they come from). Unicode spaces draw blank without a font.
-//! Colour emoji and system-font discovery for CJK are left for later.
+//! Noto Emoji is parsed only when a codepoint none of the others has first
+//! shows up. Colour emoji and system-font discovery for CJK are left for
+//! later.
 
+use std::cell::OnceCell;
 use std::sync::Arc;
 
 use macroquad::text::{Font, load_ttf_font_from_fontdue};
@@ -50,6 +53,12 @@ struct Fit {
     mid: f32,
 }
 
+/// A parsed fallback font and how it fits the primary's cells.
+struct Fallback {
+    font: Arc<fontdue::Font>,
+    fit: Fit,
+}
+
 /// Which codepoints each bundled font covers. This doesn't depend on the
 /// font size, so it's built once. fontdue keeps a codepoint → glyph map, so
 /// a lookup is a hash lookup with no rasterizing.
@@ -57,11 +66,14 @@ pub struct Coverage {
     primary: Arc<fontdue::Font>,
     symbols: Arc<fontdue::Font>,
     iosevka: Arc<fontdue::Font>,
-    emoji: Arc<fontdue::Font>,
     primary_mid: f32,
     symbols_fit: Fit,
     iosevka_fit: Fit,
-    emoji_fit: Fit,
+    /// Noto Emoji, parsed on first use. fontdue prepares every glyph's
+    /// outline when it parses a font, which costs about 30–40 MB for
+    /// Noto Emoji, so sessions that never show a codepoint the other fonts
+    /// lack don't pay for it. `None` inside means it failed to parse.
+    emoji: OnceCell<Option<Fallback>>,
 }
 
 /// How to draw a glyph in a cell: the font size to draw at and how far to
@@ -111,17 +123,41 @@ impl Coverage {
         let primary = fontdue::Font::from_bytes(PRIMARY_BYTES, settings)?;
         let symbols = fontdue::Font::from_bytes(SYMBOLS_BYTES, settings)?;
         let iosevka = fontdue::Font::from_bytes(IOSEVKA_BYTES, settings)?;
-        let emoji = fontdue::Font::from_bytes(EMOJI_BYTES, settings)?;
         Ok(Self {
             primary_mid: mid(line_metrics(&primary)?),
             symbols_fit: Fit::new(&primary, &symbols, SYMBOLS_PROBE)?,
             iosevka_fit: Fit::new(&primary, &iosevka, IOSEVKA_PROBE)?,
-            emoji_fit: Fit::new(&primary, &emoji, EMOJI_PROBE)?,
             primary: Arc::new(primary),
             symbols: Arc::new(symbols),
             iosevka: Arc::new(iosevka),
-            emoji: Arc::new(emoji),
+            emoji: OnceCell::new(),
         })
+    }
+
+    /// Noto Emoji, parsed on the first call.
+    fn emoji(&self) -> Option<&Fallback> {
+        self.emoji
+            .get_or_init(|| {
+                let parsed =
+                    fontdue::Font::from_bytes(EMOJI_BYTES, fontdue::FontSettings::default())
+                        .and_then(|font| {
+                            let fit = Fit::new(&self.primary, &font, EMOJI_PROBE)?;
+                            Ok(Fallback {
+                                font: Arc::new(font),
+                                fit,
+                            })
+                        });
+                parsed
+                    .inspect_err(|e| tracing::warn!("emoji font: {e}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// The parsed emoji font, if it has been loaded and parsed, for the
+    /// drawing fonts to share.
+    fn loaded_emoji(&self) -> Option<Arc<fontdue::Font>> {
+        self.emoji.get()?.as_ref().map(|e| e.font.clone())
     }
 
     /// How to draw `ch`. Unicode spaces are blank. Otherwise the first font
@@ -138,7 +174,7 @@ impl Coverage {
             Face::Symbols
         } else if has(&self.iosevka) {
             Face::Iosevka
-        } else if has(&self.emoji) {
+        } else if self.emoji().is_some_and(|e| has(&e.font)) {
             Face::Emoji
         } else {
             Face::Primary
@@ -152,7 +188,8 @@ impl Coverage {
             Face::Primary | Face::Blank => &self.primary,
             Face::Symbols => &self.symbols,
             Face::Iosevka => &self.iosevka,
-            Face::Emoji => &self.emoji,
+            // face_for only returns Emoji once the font has parsed.
+            Face::Emoji => self.emoji().map_or(&self.primary, |e| &e.font),
         }
     }
 
@@ -169,7 +206,10 @@ impl Coverage {
             }
             Face::Symbols => &self.symbols_fit,
             Face::Iosevka => &self.iosevka_fit,
-            Face::Emoji => &self.emoji_fit,
+            Face::Emoji => match self.emoji() {
+                Some(e) => &e.fit,
+                None => return self.place(Face::Primary, font_size, cells),
+            },
         };
         let scale = (fit.scale * f32::from(cells)).min(fit.max_scale);
         let size = (f32::from(font_size) * scale).round().max(1.0);
@@ -187,7 +227,8 @@ pub struct Fonts {
     pub primary: Font,
     pub symbols: Font,
     pub iosevka: Font,
-    pub emoji: Font,
+    /// Built from `Coverage`'s emoji font on first use.
+    emoji: OnceCell<Font>,
 }
 
 impl Fonts {
@@ -199,7 +240,7 @@ impl Fonts {
             primary: load_ttf_font_from_fontdue(coverage.primary.clone()),
             symbols: load_ttf_font_from_fontdue(coverage.symbols.clone()),
             iosevka: load_ttf_font_from_fontdue(coverage.iosevka.clone()),
-            emoji: load_ttf_font_from_fontdue(coverage.emoji.clone()),
+            emoji: OnceCell::new(),
         }
     }
 
@@ -215,17 +256,26 @@ impl Fonts {
             primary: self.primary.with_fresh_cache(),
             symbols: self.symbols.with_fresh_cache(),
             iosevka: self.iosevka.with_fresh_cache(),
-            emoji: self.emoji.with_fresh_cache(),
+            emoji: self
+                .emoji
+                .get()
+                .map(Font::with_fresh_cache)
+                .map(OnceCell::from)
+                .unwrap_or_default(),
         }
     }
 
     /// The font that draws `face`. `Blank` draws nothing, so any font will do.
-    pub fn get(&self, face: Face) -> &Font {
+    pub fn get(&self, face: Face, coverage: &Coverage) -> &Font {
         match face {
             Face::Primary | Face::Blank => &self.primary,
             Face::Symbols => &self.symbols,
             Face::Iosevka => &self.iosevka,
-            Face::Emoji => &self.emoji,
+            // face_for only returns Emoji once the font has parsed.
+            Face::Emoji => match coverage.loaded_emoji() {
+                Some(font) => self.emoji.get_or_init(|| load_ttf_font_from_fontdue(font)),
+                None => &self.primary,
+            },
         }
     }
 }
@@ -303,6 +353,19 @@ mod tests {
         // A second cell doesn't make it any bigger.
         assert_eq!(c.place(Face::Iosevka, 20, 1).font_size, 21);
         assert_eq!(c.place(Face::Iosevka, 20, 2).font_size, 21);
+    }
+
+    #[test]
+    fn emoji_font_loads_on_first_use() {
+        let c = Coverage::new().unwrap();
+        assert!(c.emoji.get().is_none());
+        // Codepoints the other fonts have don't load it.
+        for ch in ['A', '\u{f113}', '\u{2388}', ' '] {
+            c.face_for(ch);
+        }
+        assert!(c.emoji.get().is_none());
+        assert_eq!(c.face_for('\u{1f4c1}'), Face::Emoji);
+        assert!(c.loaded_emoji().is_some());
     }
 
     #[test]

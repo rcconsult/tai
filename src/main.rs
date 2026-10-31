@@ -903,7 +903,7 @@ impl<'alloc> Renderer<'alloc> {
         // Cache every icon glyph before drawing any: see cache_glyphs.
         for icon in &row_icons {
             let place = coverage.place(icon.face, dims.font_size, icon.cells);
-            cache_glyphs(&icon.text, fonts.get(icon.face), place.font_size);
+            cache_glyphs(&icon.text, fonts.get(icon.face, coverage), place.font_size);
         }
         for icon in row_icons {
             let place = coverage.place(icon.face, dims.font_size, icon.cells);
@@ -912,7 +912,7 @@ impl<'alloc> Renderer<'alloc> {
                 &icon.text,
                 icon.x,
                 baseline,
-                fonts.get(icon.face),
+                fonts.get(icon.face, coverage),
                 place.font_size,
                 icon.fg,
                 icon.bold,
