@@ -243,6 +243,12 @@ fn main() -> eframe::Result {
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
         setup.power_preference = eframe::wgpu::PowerPreference::from_env()
             .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+        // ADR 0011: on Windows, GL by default. Vulkan cost about 300 MB
+        // more on the AMD host (531 against 224 MB) and DX12 didn't start
+        // there (DxcCreateInstance fails). WGPU_BACKEND overrides.
+        if cfg!(windows) && eframe::wgpu::Backends::from_env().is_none() {
+            setup.instance_descriptor.backends = eframe::wgpu::Backends::GL;
+        }
     }
     let result = eframe::run_native(
         "tai",
