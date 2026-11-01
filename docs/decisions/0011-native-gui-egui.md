@@ -262,9 +262,48 @@ tai's intended shape, the same flow natively:
 - **Attention:** a run waiting for consent marks its card, its tab and
   the workspace tab.
 
-Questions for the RFC:
-- whether tai may rely on these routes before `/v1/agent/*` is sealed;
-- how a session lists the runs it started, so cards survive a restart;
-- whether runs started by the model mid-chat are announced on the
-  `/chat` stream;
-- what a run waiting for consent looks like when tai isn't watching it.
+What ppxai has today, from the ppxai session (`b3433545`, 2026-11-01),
+and what the RFC has to settle:
+
+- **Sealing `/v1/agent/*`:** no date and no planned changes
+  (`docs/api-gateway.md`, "NOT yet sealed"). Additive drift already
+  exists: `RunMetaResponse` gained `kind`, `waiting`, `acked_at` and
+  `workdir`, plus `GET /runs?kind=` and `POST /runs/{id}/ack`
+  (`ppxai/server/routes/agent_v1.py`).
+- **A session's runs:** not supported. Run records carry no session id,
+  and `GET /v1/agent/runs` filters only by owner and kind. A restarted
+  client can only list all runs and match them itself. **RFC item.**
+- **Runs started mid-chat:** chat doesn't start runs. `spawn_subagent`
+  is a task-tier tool only (`engine/task_runner.py`), and its
+  `subagent_spawned` and `subagent_finished` events go on the parent
+  run's events stream, not on `/chat`. Runs start explicitly: by
+  `POST /v1/agent/run` or `/task`, or by the slash commands. The chat
+  event `agent_run_start` (`engine/chat.py`) is the chat tool loop and
+  has no run id.
+- **A run waiting for consent with nobody watching:**
+  - **Timeout:** after `execution.task.consent.consent_ttl_s` (default
+    300 s) it's denied, fail-closed (`{"approved": false, "via":
+    "timeout"}`), with no notification.
+  - **A later client** finds it through `GET /runs` or `/runs/{id}`
+    (status `waiting`, with the token) and answers it with
+    `POST /runs/{id}/respond`. `agent_waiting` is replayed on the events
+    stream.
+  - **After a server restart** the timer is gone; `POST /runs/{id}/resume`
+    restarts the run.
+  - **How the TUIs do it:** they poll every 2 s (`tui/run_consent.py`).
+  - **Docs:** `docs/agent-task-lifecycle.html`, ppxai ADR 0003 §8,
+    `docs/consent-contract.md`.
+  - **For tai:** a session's waiting run must be visible even when its
+    tab isn't open, so tai polls or listens for every run it started.
+- **Collect:** documented and implemented (`docs/task-agent-guide.md`,
+  ppxai ADR 0011; `ppxai/server/routes/sessions.py`: 403 under `no` or
+  for a non-owner, 404 for an unknown run, 409 with no result; results
+  kept `result_retention_s`, default 3600 s).
+  - **What a merge does:** it appends a user (task) plus assistant
+    (result) pair to the caller's **active** session.
+  - **What it doesn't check:** the run id is its only input. It isn't
+    tied to the session that started the run, and nothing on the server
+    stops a second merge.
+  - **Under `auto`:** the client merges, not the server. So tai must
+    target the right session and remember merged runs itself, or the
+    RFC moves both to the server. **RFC item.**
