@@ -83,17 +83,33 @@ fn main() -> eframe::Result {
         )
         .init();
 
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("tai")
             .with_inner_size([1200.0, 760.0]),
         ..Default::default()
     };
+    // egui-wgpu prefers the high-performance GPU, which on a laptop with two
+    // wakes the discrete one for a mostly idle window. A terminal doesn't
+    // need it, so prefer the integrated GPU; WGPU_POWER_PREF=high overrides.
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        setup.power_preference = eframe::wgpu::PowerPreference::from_env()
+            .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+    }
     eframe::run_native(
         "tai",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            if let Some(render) = &cc.wgpu_render_state {
+                let info = render.adapter.get_info();
+                tracing::info!(
+                    "GPU: {} ({:?}, {:?})",
+                    info.name,
+                    info.backend,
+                    info.device_type
+                );
+            }
             Ok(Box::new(App {
                 dock: initial_layout(),
             }))
