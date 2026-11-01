@@ -20,6 +20,7 @@ use libghostty_vt::{
     Terminal, TerminalOptions,
     key::{self, Key},
     render::{CellIterator, Dirty, RenderState, RowIterator},
+    screen::CellWide,
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     style::RgbColor,
     terminal::{Mode, Point, PointCoordinate, ScrollViewport, SizeReportSize},
@@ -576,7 +577,13 @@ impl TerminalPane {
                             .next()
                             .map_or(Face::Primary, |ch| self.coverage.face_for(ch));
                         if face != Face::Blank && !text.is_empty() {
-                            let place = self.coverage.place(face, dims.font_size, 1);
+                            // A wide character is drawn two cells wide, as
+                            // Ghostty's constraintWidth does for grid width 2
+                            // (src/renderer/cell.zig at a887df42).
+                            let wide = cell.raw_cell()?.wide()? == CellWide::Wide;
+                            let place =
+                                self.coverage
+                                    .place(face, dims.font_size, if wide { 2 } else { 1 });
                             let fg = rgba(fg);
                             self.atlas.push_text(
                                 &mut cached.text,
