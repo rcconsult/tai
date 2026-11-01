@@ -1,9 +1,9 @@
 //! A terminal pane: a libghostty-vt terminal on tai's pty, drawn by the
 //! wgpu cell pass (`gpu.rs`), typed into through egui's events.
 //!
-//! Prototype scope (ADR 0011, step 2): text, colours, the cursor, typing,
-//! paste, scrollback with the wheel, and resizing with the pane. Images,
-//! selection and mouse reporting stay in the macroquad build for now.
+//! Text, colours, the cursor, typing, paste, scrollback with the wheel,
+//! resizing with the pane, and mouse selection with copy and the corner
+//! badge. Images and mouse reporting stay in the macroquad build for now.
 
 use std::{
     cell::Cell,
@@ -20,8 +20,9 @@ use libghostty_vt::{
     Terminal, TerminalOptions,
     key::{self, Key},
     render::{CellIterator, Dirty, RenderState, RowIterator},
+    selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     style::RgbColor,
-    terminal::{Mode, ScrollViewport, SizeReportSize},
+    terminal::{Mode, Point, PointCoordinate, ScrollViewport, SizeReportSize},
 };
 use macroquad::color::Color;
 
@@ -30,7 +31,7 @@ use crate::{
     fonts::{Coverage, Face},
     gpu::{AtlasUpload, CellFrame},
     pty::{Child, Pty, PtyError},
-    shortcuts,
+    selection, shortcuts,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -134,6 +135,23 @@ pub struct TerminalPane {
     response: Vec<u8>,
     /// Set by the pty's reader when it has woken egui, cleared by pump.
     wake_pending: Arc<AtomicBool>,
+    /// Mouse selection, through libghostty-vt's gesture API as in the
+    /// macroquad build (`SelectionState` in src/main.rs).
+    gesture: Gesture<'static>,
+    press: PressEvent<'static>,
+    release: ReleaseEvent<'static>,
+    drag: DragEvent<'static>,
+    /// Gesture times count from here.
+    epoch: Instant,
+    /// Whether a press in the pane started a selection drag.
+    selecting: bool,
+    /// The selection changed this frame, so the cells must be redrawn: the
+    /// render state's dirty flags track contents, not the selection.
+    selection_changed: bool,
+    /// The selection badge's text, while there is a selection.
+    badge: Option<String>,
+    /// Copy was asked for; done in `ui`, which has the egui context.
+    copy_requested: bool,
 }
 
 impl TerminalPane {
@@ -202,6 +220,19 @@ impl TerminalPane {
             built_for: None,
             response: Vec::new(),
             wake_pending,
+            gesture: Gesture::new()?,
+            press: {
+                let mut press = PressEvent::new()?;
+                press.set_repeat_interval(Duration::from_millis(500))?;
+                press
+            },
+            release: ReleaseEvent::new()?,
+            drag: DragEvent::new()?,
+            epoch: Instant::now(),
+            selecting: false,
+            selection_changed: false,
+            badge: None,
+            copy_requested: false,
         })
     }
 
@@ -239,7 +270,7 @@ impl TerminalPane {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
-        let response = ui.allocate_rect(rect, egui::Sense::click());
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         if response.clicked() || !ui.ctx().memory(|m| m.focused().is_some()) {
             response.request_focus();
         }
@@ -269,6 +300,13 @@ impl TerminalPane {
             self.resize(dims);
         }
 
+        if let Err(e) = self.handle_pointer(ui, rect) {
+            tracing::warn!("selection: {e}");
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        }
+
         if response.has_focus() && !self.exited() {
             let (events, held) = ui.input(|i| (i.events.clone(), i.modifiers));
             for event in &events {
@@ -285,6 +323,13 @@ impl TerminalPane {
                 self.pump();
             }
         }
+        if std::mem::take(&mut self.copy_requested) {
+            match selection::text(&self.terminal) {
+                Ok(Some(text)) => ui.ctx().copy_text(text),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("copy: {e}"),
+            }
+        }
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             let lines = (scroll / self.dims.cell_height).round() as isize;
@@ -293,8 +338,17 @@ impl TerminalPane {
             }
         }
 
-        match self.build() {
-            Ok(()) => {}
+        let selection_changed = std::mem::take(&mut self.selection_changed);
+        match self.build(selection_changed) {
+            Ok(rebuilt) => {
+                if rebuilt {
+                    // Output can move or clear the selection too.
+                    self.badge = selection::text(&self.terminal)
+                        .ok()
+                        .flatten()
+                        .map(|text| selection::summary(&text));
+                }
+            }
             Err(e) => tracing::warn!("render: {e}"),
         }
         let atlas = self.atlas.take_dirty_rows().map(|(start, end)| {
@@ -316,6 +370,9 @@ impl TerminalPane {
                     atlas,
                 },
             ));
+        if let Some(badge) = &self.badge {
+            draw_badge(ui, rect, badge);
+        }
         if self.exited() {
             ui.painter().text(
                 rect.center(),
@@ -342,8 +399,90 @@ impl TerminalPane {
         self.pty.resize(dims);
     }
 
-    /// Rebuild the instances when the screen, the pane or the cursor changed.
-    fn build(&mut self) -> Result<()> {
+    /// Start, extend and end a selection from the primary button, as the
+    /// macroquad build does. While a program tracks the mouse the buttons
+    /// are its, except with Shift held; this pane doesn't report the mouse
+    /// to programs yet, so without Shift nothing happens there.
+    fn handle_pointer(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Result<()> {
+        let (pos, pressed, down, released, moved, held) = ui.input(|i| {
+            (
+                i.pointer.interact_pos(),
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+                i.pointer.delta() != egui::Vec2::ZERO,
+                i.modifiers,
+            )
+        });
+        let Some(pos) = pos else {
+            return Ok(());
+        };
+        let local = pos - rect.min;
+        if pressed && rect.contains(pos) {
+            if self.terminal.is_mouse_tracking()? && !held.shift {
+                return Ok(());
+            }
+            let grid_ref = self.terminal.grid_ref(self.viewport_point(local)?)?;
+            let selection = self
+                .press
+                .set_repeat_distance(self.dims.cell_width.into())?
+                .set_time(self.epoch.elapsed())?
+                .set_position(local.x.into(), local.y.into())?
+                .apply(&mut self.gesture, &self.terminal, grid_ref)?;
+            self.terminal.set_selection(selection.as_ref())?;
+            self.selecting = true;
+            self.selection_changed = true;
+        } else if self.selecting && down && moved {
+            let grid_ref = self.terminal.grid_ref(self.viewport_point(local)?)?;
+            let geometry = Geometry {
+                columns: self.terminal.cols()?.into(),
+                cell_width: self.dims.cell_width as u32,
+                padding_left: PADDING as u32,
+                screen_height: self.dims.height as u32,
+            };
+            let selection = self
+                .drag
+                .set_rectangle(rectangle_mods(mods_from(held)))?
+                .set_position(local.x.into(), local.y.into())?
+                .apply(&mut self.gesture, &self.terminal, grid_ref, geometry)?;
+            self.terminal.set_selection(selection.as_ref())?;
+            self.selection_changed = true;
+        } else if self.selecting && released {
+            // Released outside the grid is fine: no cell, no change.
+            let grid_ref = self
+                .viewport_point(local)
+                .ok()
+                .and_then(|p| self.terminal.grid_ref(p).ok());
+            self.release
+                .apply(&mut self.gesture, &self.terminal, grid_ref)?;
+            self.selecting = false;
+            self.selection_changed = true;
+        }
+        Ok(())
+    }
+
+    /// The viewport cell under a point in the pane, clamped to the grid as
+    /// the macroquad build's `mouse_viewport_point` does: grid_ref rejects
+    /// a point one past the last row or column.
+    fn viewport_point(&self, local: egui::Vec2) -> Result<Point> {
+        let cols = self.terminal.cols()?;
+        let rows = self.terminal.rows()?;
+        let cell = |v: f32, size: f32, count: u32| {
+            if v > PADDING {
+                ((v - PADDING) / size).clamp(0.0, count.saturating_sub(1) as f32) as u32
+            } else {
+                0
+            }
+        };
+        Ok(Point::Viewport(PointCoordinate {
+            x: cell(local.x, self.dims.cell_width, u32::from(cols)) as u16,
+            y: cell(local.y, self.dims.cell_height, u32::from(rows)),
+        }))
+    }
+
+    /// Rebuild the instances when the screen, the pane, the cursor or the
+    /// selection changed. Returns whether it rebuilt.
+    fn build(&mut self, force: bool) -> Result<bool> {
         let snapshot = self.render_state.update(&self.terminal)?;
         let cursor = if snapshot.cursor_visible()? {
             snapshot.cursor_viewport()?.map(|vp| (vp.x, vp.y))
@@ -351,8 +490,8 @@ impl TerminalPane {
             None
         };
         let key = Some((self.dims, cursor));
-        if snapshot.dirty()? == Dirty::Clean && self.built_for == key {
-            return Ok(());
+        if !force && snapshot.dirty()? == Dirty::Clean && self.built_for == key {
+            return Ok(false);
         }
         self.built_for = key;
         let dims = self.dims;
@@ -375,6 +514,7 @@ impl TerminalPane {
             let mut col: u16 = 0;
             while let Some(cell) = cell_it.next() {
                 let graphemes = cell.graphemes_len()?;
+                let selected = cell.is_selected()?;
                 let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
                 let bg = cell.bg_color()?;
                 let mut has_bg = bg.is_some();
@@ -387,6 +527,12 @@ impl TerminalPane {
                         has_bg = true;
                     }
                     bold = style.bold;
+                }
+                // Selected cells are drawn in reverse video, as in the
+                // macroquad build (walk_row in src/main.rs).
+                if selected {
+                    std::mem::swap(&mut fg, &mut bg);
+                    has_bg = true;
                 }
                 if cursor == Some((col, row_index)) {
                     out.push(Instance::solid(
@@ -443,7 +589,7 @@ impl TerminalPane {
             );
         }
         self.instances = Arc::new(out);
-        Ok(())
+        Ok(true)
     }
 
     fn handle_event(&mut self, event: &egui::Event, held: egui::Modifiers) -> Result<()> {
@@ -462,7 +608,10 @@ impl TerminalPane {
             // events with no key event. Off macOS, Ctrl+C belongs to the
             // shell (shortcuts.rs), so send it on. Copying needs a
             // selection, which this prototype doesn't have yet.
-            egui::Event::Copy if !macos => self.encode_key(Key::C, 'c', key::Mods::CTRL, None)?,
+            // Copy is Ctrl+Shift+C off macOS and Cmd+C on it (shortcuts.rs);
+            // egui reports both, and plain Ctrl+C, as Copy.
+            egui::Event::Copy if macos || held.shift => self.copy_requested = true,
+            egui::Event::Copy => self.encode_key(Key::C, 'c', key::Mods::CTRL, None)?,
             egui::Event::Cut if !macos => self.encode_key(Key::X, 'x', key::Mods::CTRL, None)?,
             egui::Event::Key {
                 key,
@@ -528,6 +677,37 @@ impl TerminalPane {
         }
         Ok(())
     }
+}
+
+/// Whether a drag selects a rectangle: Alt on macOS, Ctrl+Alt or
+/// Super+Alt elsewhere, as in the macroquad build.
+fn rectangle_mods(mods: key::Mods) -> bool {
+    let alt = mods.contains(key::Mods::ALT);
+    if cfg!(target_os = "macos") {
+        alt
+    } else {
+        alt && mods.intersects(key::Mods::CTRL | key::Mods::SUPER)
+    }
+}
+
+/// The selection badge in the pane's bottom-right corner: a dark box with
+/// a grey outline, as in the macroquad build.
+fn draw_badge(ui: &egui::Ui, rect: egui::Rect, text: &str) {
+    let painter = ui.painter_at(rect);
+    let font = egui::FontId::monospace(12.0);
+    let galley = painter.layout_no_wrap(text.to_string(), font, egui::Color32::WHITE);
+    let pad = egui::vec2(8.0, 4.0);
+    let size = galley.size() + 2.0 * pad;
+    let min = rect.max - size - egui::vec2(PADDING + 4.0, PADDING + 4.0);
+    let badge = egui::Rect::from_min_size(min, size);
+    painter.rect(
+        badge,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
+        egui::Stroke::new(1.0, egui::Color32::GRAY),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(badge.min + pad, galley, egui::Color32::WHITE);
 }
 
 fn rgba(c: RgbColor) -> [u8; 4] {

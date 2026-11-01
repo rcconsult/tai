@@ -38,6 +38,8 @@ mod pty;
 mod pty;
 #[path = "../../pty_input.rs"]
 mod pty_input;
+#[path = "../../selection.rs"]
+mod selection;
 #[path = "../../shortcuts.rs"]
 #[allow(dead_code)]
 mod shortcuts;
