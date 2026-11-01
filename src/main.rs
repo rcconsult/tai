@@ -55,6 +55,7 @@ use crate::shortcuts::Action;
 
 mod cells;
 mod clipboard;
+mod discovery;
 mod fonts;
 mod identity;
 mod locale;
