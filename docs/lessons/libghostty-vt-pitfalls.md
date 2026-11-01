@@ -42,8 +42,8 @@ crashed in `Terminal.print` within seconds of
 `ls -R --hyperlink=always /usr/share`, right after the log line "error
 reallocating for more hyperlink space". Upstream fixed it in 33cda4dc5
 "terminal: reload cell pointers when print grows a page", which needs Zig
-0.16. `patches/ghostty/0001-reload-cell-pointers-when-print-grows-a-page.patch`
-backports its code hunks, and `scripts/fetch-ghostty.sh` applies it.
+0.16. Until the pin moved to 521cf2c5, which contains it, tai backported
+its code hunks as a patch in `patches/ghostty/`.
 
 `scripts/repro-hyperlink-ls.sh target/debug/tai` reproduces it. It runs
 the listing inside tai and prints whether tai finished, froze or crashed,

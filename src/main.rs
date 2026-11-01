@@ -33,7 +33,7 @@ use macroquad::{
 };
 
 use libghostty_vt::{
-    Terminal, TerminalOptions,
+    Terminal,
     alloc::Bytes,
     build_info,
     key::{self, Key},
@@ -161,7 +161,9 @@ async fn main() -> Result<()> {
         .init();
 
     // Make libghostty-vt emit through the same tracing subscriber.
-    libghostty_vt::set_logger(Some(Box::new(libghostty_vt::log::TracingLogger)))?;
+    // SAFETY: no other thread exists yet, so none is inside libghostty.
+    #[allow(unsafe_code)]
+    unsafe { libghostty_vt::set_logger(Some(Box::new(libghostty_vt::log::TracingLogger))) }?;
 
     // Font sizes are in logical (screen) points; the glyph atlas rasterizes
     // glyphs at font_size * dpi_scale, so they stay crisp on HiDPI / Retina
@@ -199,16 +201,21 @@ async fn main() -> Result<()> {
     // Install the PNG decoder so the terminal can handle PNG images in the
     // Kitty Graphics Protocol. This is a process-global setting and must be
     // done before any terminal is created.
-    graphics::set_png_decoder(Some(Box::new(PngDecoder)))?;
+    // SAFETY: the pty's reader thread never calls libghostty (its types are
+    // !Send), and no terminal exists yet.
+    #[allow(unsafe_code)]
+    unsafe { graphics::set_png_decoder(Some(Box::new(PngDecoder))) }?;
 
     // Create a ghostty virtual terminal with the computed grid and 1000
     // lines of scrollback.  This holds all the parsed screen state (cells,
     // cursor, styles, modes) but knows nothing about the pty or the window.
-    let mut terminal = Terminal::new(TerminalOptions {
-        cols,
-        rows,
-        max_scrollback: 1000,
-    })?;
+    let mut terminal = Terminal::new(cols, rows)?;
+    terminal.set_scrollback_max_lines(Some(1000))?;
+    // ConPTY keeps its own screen and can't take scrollback back, so on
+    // Windows a resize mustn't pull scrollback into the active screen
+    // (docs/lessons/from-libghostty-projects.md, section 1).
+    #[cfg(windows)]
+    terminal.set_resize_pull_scrollback(Some(false))?;
 
     // The terminal options don't include cell pixel dimensions, so
     // issue an initial resize to set them.  Without this, Kitty
@@ -224,8 +231,10 @@ async fn main() -> Result<()> {
         .set_kitty_image_storage_limit(64 * 1024 * 1024)?
         // Allow images to be transmitted via file, temp file, and shared
         // memory mediums in addition to the default inline (direct) medium.
+        // Temp files must be in the OS temp directory, which is what
+        // Ghostty's own app allows (src/os/file.zig, tmpDir).
         .set_kitty_image_from_file_allowed(true)?
-        .set_kitty_image_from_temp_file_allowed(true)?
+        .set_kitty_image_temp_file_dir(Some(&std::env::temp_dir()))?
         .set_kitty_image_from_shared_mem_allowed(true)?;
 
     // Whether DA1 lists Sixel (ADR 0009). tai translates Sixel either way.
@@ -1006,7 +1015,9 @@ impl<'alloc> Renderer<'alloc> {
                 continue;
             }
             let (img_w, img_h) = (image.width()?, image.height()?);
-            let data = image.data()?;
+            let Some(data) = image.data()? else {
+                continue;
+            };
             if data.len() < (img_w * img_h * 4) as usize {
                 continue;
             }
@@ -1051,8 +1062,10 @@ impl<'alloc> Renderer<'alloc> {
             let Some(image) = graphics.image(draw.image_id) else {
                 continue;
             };
-            let tex =
-                Texture2D::from_rgba8(image.width()? as u16, image.height()? as u16, image.data()?);
+            let Some(data) = image.data()? else {
+                continue;
+            };
+            let tex = Texture2D::from_rgba8(image.width()? as u16, image.height()? as u16, data);
             draw_texture_ex(
                 &tex,
                 draw.pos.x,
@@ -1112,7 +1125,9 @@ impl<'alloc> Renderer<'alloc> {
 
             let image_width = image.width()?;
             let image_height = image.height()?;
-            let data = image.data()?;
+            let Some(data) = image.data()? else {
+                continue;
+            };
             if data.len() < (image_width * image_height * 4) as usize {
                 continue;
             }
@@ -2470,15 +2485,11 @@ mod tests {
     #[test]
     fn overlapping_images_draw_oldest_first() {
         use super::Renderer;
+        use libghostty_vt::Terminal;
         use libghostty_vt::kitty::graphics::{Layer, PlacementIterator};
-        use libghostty_vt::{Terminal, TerminalOptions};
 
-        let mut term = Terminal::new(TerminalOptions {
-            cols: 80,
-            rows: 24,
-            max_scrollback: 100,
-        })
-        .unwrap();
+        let mut term = Terminal::new(80, 24).unwrap();
+        term.set_scrollback_max_lines(Some(100)).unwrap();
         term.resize(80, 24, 10, 20).unwrap();
         term.set_kitty_image_storage_limit(64 * 1024 * 1024)
             .unwrap();
@@ -2516,14 +2527,10 @@ mod tests {
 
     #[test]
     fn in_band_size_report_matches_resize() {
-        use libghostty_vt::{Terminal, TerminalOptions};
+        use libghostty_vt::Terminal;
         use std::{cell::RefCell, rc::Rc};
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: 80,
-            rows: 24,
-            max_scrollback: 0,
-        })
-        .unwrap();
+        let mut terminal = Terminal::new(80, 24).unwrap();
+        terminal.set_scrollback_max_lines(Some(0)).unwrap();
         let sent = Rc::new(RefCell::new(Vec::new()));
         let s = sent.clone();
         terminal
@@ -2547,16 +2554,12 @@ mod tests {
         clustering: bool,
     ) -> Vec<(String, libghostty_vt::screen::CellWide)> {
         use libghostty_vt::{
-            Terminal, TerminalOptions,
+            Terminal,
             render::{CellIterator, RenderState, RowIterator},
             terminal::Mode,
         };
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: 40,
-            rows: 2,
-            max_scrollback: 0,
-        })
-        .unwrap();
+        let mut terminal = Terminal::new(40, 2).unwrap();
+        terminal.set_scrollback_max_lines(Some(0)).unwrap();
         terminal
             .set_mode(Mode::GRAPHEME_CLUSTER, clustering)
             .unwrap();
@@ -2640,17 +2643,35 @@ mod tests {
     }
 
     #[test]
+    fn resize_pull_scrollback_can_be_turned_off() {
+        use libghostty_vt::Terminal;
+        // Fill a 5-row screen past its height, then grow it to 10 rows. By
+        // default Ghostty pulls 5 scrollback lines down into the new rows,
+        // so the cursor moves to the bottom; with the pull off (tai on
+        // Windows, for ConPTY) the screen keeps its rows and the cursor stays.
+        let cursor_after_growing = |pull: bool| {
+            let mut terminal = Terminal::new(20, 5).unwrap();
+            terminal.set_scrollback_max_lines(Some(100)).unwrap();
+            terminal.set_resize_pull_scrollback(Some(pull)).unwrap();
+            for n in 0..20 {
+                terminal.vt_write(format!("line {n}\r\n").as_bytes());
+            }
+            assert_eq!(terminal.cursor_y().unwrap(), 4);
+            terminal.resize(20, 10, 9, 18).unwrap();
+            terminal.cursor_y().unwrap()
+        };
+        assert_eq!(cursor_after_growing(true), 9);
+        assert_eq!(cursor_after_growing(false), 4);
+    }
+
+    #[test]
     fn arrow_with_macos_function_key_text() {
         use libghostty_vt::{
-            Terminal, TerminalOptions,
+            Terminal,
             key::{self, Key},
         };
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: 80,
-            rows: 24,
-            max_scrollback: 0,
-        })
-        .unwrap();
+        let mut terminal = Terminal::new(80, 24).unwrap();
+        terminal.set_scrollback_max_lines(Some(0)).unwrap();
         // Kitty keyboard protocol, disambiguate (what ppxaide pushes).
         terminal.vt_write(b"\x1b[>1u");
         let mut encoder = key::Encoder::new().unwrap();
@@ -2682,15 +2703,11 @@ mod tests {
     #[test]
     fn a_key_queued_after_other_bytes_isnt_lost() {
         use libghostty_vt::{
-            Terminal, TerminalOptions,
+            Terminal,
             key::{self, Key},
         };
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: 80,
-            rows: 24,
-            max_scrollback: 0,
-        })
-        .unwrap();
+        let mut terminal = Terminal::new(80, 24).unwrap();
+        terminal.set_scrollback_max_lines(Some(0)).unwrap();
         // Every Kitty keyboard flag, for a long sequence.
         terminal.vt_write(b"\x1b[>31u");
         let mut encoder = key::Encoder::new().unwrap();

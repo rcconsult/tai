@@ -527,13 +527,9 @@ mod tests {
 
     #[test]
     fn libghostty_stores_the_image_and_the_cursor_lands_on_its_last_row() {
-        use libghostty_vt::{Terminal, TerminalOptions};
-        let mut term = Terminal::new(TerminalOptions {
-            cols: 80,
-            rows: 24,
-            max_scrollback: 100,
-        })
-        .unwrap();
+        use libghostty_vt::Terminal;
+        let mut term = Terminal::new(80, 24).unwrap();
+        term.set_scrollback_max_lines(Some(100)).unwrap();
         term.resize(80, 24, 10, 20).unwrap();
         term.set_kitty_image_storage_limit(64 * 1024 * 1024)
             .unwrap();
