@@ -32,17 +32,26 @@ Read in ppxai `feature/v1.19.5` at `b3433545` ("docs(changelog): Python
   (`ppxai/server/auth.py`, `_is_loopback_ui_request`). That includes
   `/chat`, which can run tools, and `/v1/oneshot`. It's by design, for the
   local web UI.
-- Only `_run_announced` forces the env token first. With a `file`
-  provider in the user's config, the token tai puts in the child's
-  environment can be ignored (`_provider_enforces_auth`).
+- Only `_run_announced` forces the env token first. Otherwise the chain
+  is exactly `server.secrets.providers` from the user's config, and the
+  env provider on `PPXAI_API_TOKEN` is added only when that list is empty
+  (`ppxai/server/secrets/__init__.py`, `build_chain_from_config`). So a
+  config that lists providers without an `env` entry on
+  `PPXAI_API_TOKEN` (a `file` store alone, say) ignores the token tai
+  puts in the child's environment. A `file` store with such an `env`
+  entry beside it still accepts it: the Linux host's own config is
+  `[file, env PPXAI_API_TOKEN]`, and its probe below ran with it.
 - Nothing reports a port-0 bind back to the parent, so a parent-chosen
   port can be taken first.
 - ppxai's own desktop app (`ppxai-desktop.py`) already runs the server
   this way on Windows: bare, on port 54320, with no token.
 
-Probes of the installed one-file `ppxai-server` 1.19.5, started with
+Probes of `ppxai-server` 1.19.5, started with
 `--host 127.0.0.1 --port <free port>` and `PPXAI_API_TOKEN` in its
-environment:
+environment. Windows and macOS ran the installed one-file build; Linux
+ran b3433545 from source under `uvx`, where the two processes are `uvx`
+and python, split the same way as a one-file build's bootloader and
+child:
 
 | | Windows 11 | macOS 12 | Pop!_OS (b3433545 via uvx) |
 |---|---|---|---|
@@ -61,11 +70,19 @@ environment:
    `PPXAI_API_TOKEN` in the child's environment. It sends that token as
    `Authorization: Bearer` on every request.
 2. **Readiness and token check at startup.** tai polls `GET /health`
-   with the bearer until it answers 200. It then checks that
-   `GET /v1/agent/runs` without the token answers 401. If it doesn't, the
-   token isn't enforced (a `file` provider, for example), and tai logs it
-   and stops using that server. A bind failure (the port was taken) means
-   a new port and a new start.
+   with the bearer until it answers.
+   - **200:** the server is up and accepts tai's token.
+   - **401:** the server doesn't accept tai's token, because the user's
+     `server.secrets.providers` has no `env` entry on `PPXAI_API_TOKEN`.
+     A request that carries a bearer never gets the loopback exemption,
+     so this answer comes at once. tai stops the server and says why,
+     instead of waiting for a timeout.
+
+   tai then checks that `GET /v1/agent/runs` without the token answers
+   401. That guards against auth being off entirely; it can't happen
+   while tai sets the token and the chain includes `env` on it, but it
+   costs one request. A bind failure (the port was taken) means a new
+   port and a new start.
 3. **tai owns the whole process tree.** On Unix the server starts in its
    own session (`setsid`), and tai stops it with `killpg`. On Windows it
    starts in a job object with kill-on-close, so the bootloader's children
@@ -113,8 +130,8 @@ their contract test pins a commit and expects churn.
   and this record gets a dated note.
 - tai is to run on shared multi-user machines before the strict mode
   ships.
-- The startup check in decision 2 starts failing for real users (a
-  `file` provider is common), or `/v1/agent/runs` stops being protected
+- The 401 in decision 2 turns up for real users (configs without an
+  `env` entry are common), or `/v1/agent/runs` stops being protected
   from loopback.
 - Startup time (4–7 s) gets in the way. Then start the server earlier or
   share one between tai windows.
