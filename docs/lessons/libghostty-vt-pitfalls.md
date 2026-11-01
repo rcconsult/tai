@@ -137,8 +137,9 @@ Amortised growth hides it most of the time.
 
 tai-gui hit it on Windows, logged as "input: out of space, 16 bytes
 required", when typed text and a special key landed in the same buffer
-in one frame. Both binaries now reserve `ENCODE_ROOM` (64 bytes) before
-every encode (`src/main.rs`, `src/bin/tai-gui/terminal.rs`). The test
+in one frame. Both binaries now reserve 64 bytes before every encode
+(`ENCODE_ROOM` in `src/main.rs`; `encode_key` in
+`src/bin/tai-gui/terminal.rs`). The test in `src/main.rs`
 `a_key_queued_after_other_bytes_isnt_lost` reproduces the drop with seven
 bytes queued in an 8-byte buffer, and fails once the crate is fixed; drop
 the workaround then. Still present upstream (libghostty-rs) at 575ed6b8ce.
