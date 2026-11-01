@@ -63,6 +63,7 @@ These rules come from `../ppxai/CLAUDE.md` and the owner's global `~/.claude/CLA
   - When you port from Ghostty, record the path and the pinned commit in the code or the commit message, as for the sister projects.
   - Ghostty doesn't run on Windows. For ConPTY and Windows input, use Windows Terminal (`microsoft/terminal`) as the reference.
   - Quirks of macroquad and miniquad are tai's own; see `docs/lessons/`.
+  - Other apps on libghostty have met the same gaps (IME, grapheme clusters, ConPTY resize, font fallback); `docs/lessons/from-libghostty-projects.md` records what they learned and what licence their code is under.
 - **No release actions without explicit permission each time.** That covers tagging, creating releases, force-pushing, rewriting pushed history and merging to the default branch.
 - **Python code taken from ppxai keeps ppxai's rules:**
   - Python 3.10+ with type hints, dataclasses, `async` for I/O, and pytest.
