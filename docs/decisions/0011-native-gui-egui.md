@@ -1,8 +1,8 @@
 # ADR 0011: A Rust-native GUI on egui, with terminals as panes
 
-- **Status:** Proposed 2026-11-01. The owner agreed to try the direction;
-  a prototype decides. The prototype is built (branch `gui-proto`) and
-  measured; see "Prototype results". Awaiting the owner's decision.
+- **Status:** Accepted 2026-11-01 (owner), after the prototype (branch
+  `gui-proto`; see "Prototype results"). On Windows, wgpu uses its GL
+  backend by default until the Vulkan memory cost or DX12 is resolved.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host.
 - **Amends:** decision 3 of [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
