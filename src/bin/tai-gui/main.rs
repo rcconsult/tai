@@ -20,6 +20,8 @@ use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer, tab_viewer::On
 #[path = "../../cells.rs"]
 #[allow(dead_code)]
 mod cells;
+#[path = "../../discovery.rs"]
+mod discovery;
 #[path = "../../fonts.rs"]
 #[allow(dead_code)]
 mod fonts;

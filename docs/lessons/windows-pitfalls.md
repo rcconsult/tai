@@ -114,7 +114,9 @@ bundles Microsoft's ConPTY package next to `tai.exe` (ADR 0007, which
 supersedes ADR 0004's "system ConPTY only"), so `portable-pty` loads that
 copy, and falls back to the system ConPTY if it's missing. With the system
 ConPTY and WezTerm removed from `PATH`, the owner saw no garbling after the
-same resize steps.
+same resize steps. A second cause remains possible: Ghostty pulls
+scrollback back in on resize and ConPTY can't, which newer Ghostty lets a
+Windows host turn off (`from-libghostty-projects.md`, lesson 1).
 
 ## Windows' own ConPTY swallows image sequences
 

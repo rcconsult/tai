@@ -52,9 +52,10 @@ After 60 s on Metal, `heap` showed 273 live `MTLIGAccelCommandBuffer` and
 the growth was about 1.2 MB/s and showed up as GPU regions. Reported
 upstream as not-fl3/miniquad#697.
 
-**What tai does:** OpenGL is the macOS default, and `TAI_APPLE_GFX=metal`
-is opt-in (`macroquad_conf` in `src/main.rs`). Before making Metal the
-default, check that miniquad drains an autorelease pool each frame.
+**What tai does:** OpenGL on every platform (`macroquad_conf` in
+`src/main.rs`). The `TAI_APPLE_GFX=metal` opt-in was removed with the
+immediate renderer (ADR 0012). Before bringing Metal back, check that
+miniquad drains an autorelease pool each frame.
 
 **Upstream status (checked 2026-10-25):**
 

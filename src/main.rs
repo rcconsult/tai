@@ -2,10 +2,10 @@
 //!
 //! Taken from uzaaft/libghostty-rs `example/ghostling_rs/src/main.rs` at tag
 //! v0.2.2 (a3a9676, "release: 0.2.2"), licensed MIT OR Apache-2.0. tai's
-//! changes: window title, XTVERSION and log name, `TAI_APPLE_GFX` (gl|metal),
-//! `COLORTERM`, a login shell on macOS, default signal handling for the
+//! changes: window title, XTVERSION and log name, `COLORTERM`, a login shell on macOS, default signal handling for the
 //! shell, HiDPI and baseline fixes, the copy/paste/font-size shortcuts in
-//! `shortcuts.rs`, and icon font fallback in `fonts.rs`.
+//! `shortcuts.rs`, icon font fallback in `fonts.rs`, and the grid drawn
+//! from cell buffers and tai's own glyph atlas (ADRs 0008 and 0012).
 //!
 //! Original description follows.
 //!
@@ -49,12 +49,13 @@ use libghostty_vt::{
     },
 };
 
-use crate::fonts::{Coverage, Face, Fonts, is_space};
+use crate::fonts::{Coverage, Face, Typeface, is_space};
 use crate::pty::{Child, Pty, PtyError};
 use crate::shortcuts::Action;
 
 mod cells;
 mod clipboard;
+mod discovery;
 mod fonts;
 mod identity;
 mod locale;
@@ -77,11 +78,6 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// lost ("out of space, 16 bytes required", seen in tai-gui). Every key and
 /// mouse sequence fits in this.
 const ENCODE_ROOM: usize = 64;
-
-/// Whether `TAI_APPLE_GFX=metal` asks for Metal. Other platforms ignore it.
-fn use_metal() -> bool {
-    cfg!(target_vendor = "apple") && std::env::var("TAI_APPLE_GFX").as_deref() == Ok("metal")
-}
 
 /// A material that copies a texture to the screen without blending.
 ///
@@ -116,49 +112,9 @@ fn present_material() -> Result<Material> {
     void main() {
         gl_FragColor = color * texture2D(Texture, uv);
     }"#;
-    const METAL: &str = r#"#include <metal_stdlib>
-    using namespace metal;
-
-    struct Uniforms
-    {
-        float4x4 Model;
-        float4x4 Projection;
-    };
-
-    struct Vertex
-    {
-        float3 position    [[attribute(0)]];
-        float2 texcoord    [[attribute(1)]];
-        float4 color0      [[attribute(2)]];
-    };
-
-    struct RasterizerData
-    {
-        float4 position [[position]];
-        float4 color [[user(locn0)]];
-        float2 uv [[user(locn1)]];
-    };
-
-    vertex RasterizerData vertexShader(Vertex v [[stage_in]], constant Uniforms& uniforms [[buffer(0)]])
-    {
-        RasterizerData out;
-        out.position = uniforms.Model * uniforms.Projection * float4(v.position, 1);
-        out.color = v.color0 / 255.0;
-        out.uv = v.texcoord;
-        return out;
-    }
-
-    fragment float4 fragmentShader(RasterizerData in [[stage_in]], texture2d<float> tex [[texture(0)]], sampler texSmplr [[sampler(0)]])
-    {
-        return in.color * tex.sample(texSmplr, in.uv);
-    }"#;
-    let shader = if use_metal() {
-        ShaderSource::Msl { program: METAL }
-    } else {
-        ShaderSource::Glsl {
-            vertex: VERTEX,
-            fragment: FRAGMENT,
-        }
+    let shader = ShaderSource::Glsl {
+        vertex: VERTEX,
+        fragment: FRAGMENT,
     };
     // The default pipeline params have blending off.
     Ok(load_material(shader, MaterialParams::default())?)
@@ -206,15 +162,14 @@ async fn main() -> Result<()> {
     // Make libghostty-vt emit through the same tracing subscriber.
     libghostty_vt::set_logger(Some(Box::new(libghostty_vt::log::TracingLogger)))?;
 
-    // Font sizes are in logical (screen) points; macroquad rasterizes glyphs
-    // at font_size * dpi_scale itself, so they stay crisp on HiDPI / Retina
+    // Font sizes are in logical (screen) points; the glyph atlas rasterizes
+    // glyphs at font_size * dpi_scale, so they stay crisp on HiDPI / Retina
     // displays without scaling here.
     let coverage = Coverage::new()?;
-    let mut fonts = Fonts::load(&coverage);
 
     // Compute the initial grid from the window size
     // and measured cell metrics.
-    let mut dims = Dimensions::new(Some(&fonts.primary), shortcuts::DEFAULT_FONT_SIZE);
+    let mut dims = Dimensions::new(&coverage, shortcuts::DEFAULT_FONT_SIZE);
     let (cols, rows) = dims.grid_size();
 
     // Track window size so we only recalculate the grid on actual changes.
@@ -384,7 +339,7 @@ async fn main() -> Result<()> {
         // We update both the ghostty terminal (so it reflows text) and the
         // pty's winsize (so the child shell knows about the new size and
         // can send SIGWINCH to its foreground process group).
-        if dims.update(Some(&fonts.primary)) {
+        if dims.update(&coverage) {
             apply_dims(dims, &grid_size, &cell_pixels, &mut terminal, &pty)?;
             resize_due = None;
         } else if resize_due.is_some_and(|due| Instant::now() >= due) {
@@ -426,10 +381,9 @@ async fn main() -> Result<()> {
                         Action::FontBigger | Action::FontSmaller | Action::FontReset => {
                             let size = shortcuts::next_font_size(dims.font_size, action);
                             if size != dims.font_size {
-                                // Start empty glyph caches so the old size's
-                                // atlases are dropped instead of growing per size.
-                                fonts = fonts.fresh_caches();
-                                dims = Dimensions::new(Some(&fonts.primary), size);
+                                // The renderer starts an empty glyph atlas for
+                                // the new size.
+                                dims = Dimensions::new(&coverage, size);
                                 // Draw at the new size right away; resize the
                                 // grid once the steps stop.
                                 resize_due = Some(Instant::now() + shortcuts::RESIZE_SETTLE);
@@ -506,15 +460,11 @@ async fn main() -> Result<()> {
                 .any(|b| is_mouse_button_down(b) || is_mouse_button_released(b));
         if mouse_active || content_changed {
             selection_badge = selection::text(&terminal)?.map(|text| selection::summary(&text));
-            if let Some(badge) = &selection_badge {
-                // Before the frame's first glyph is queued (cache_glyphs).
-                cache_glyphs(badge, &fonts.primary, dims.font_size);
-            }
         }
         let render_start = Instant::now();
-        renderer.render_terminal(&terminal, dims, &fonts, &coverage, mouse_active)?;
+        renderer.render_terminal(&terminal, dims, &coverage, mouse_active)?;
         if let Some(badge) = &selection_badge {
-            draw_selection_badge(badge, dims, &fonts.primary);
+            renderer.draw_selection_badge(badge, dims, &coverage);
         }
         let render_end = Instant::now();
         next_frame().await;
@@ -601,23 +551,6 @@ fn copy_selection(terminal: &Terminal<'_, '_>) -> Result<()> {
     Ok(())
 }
 
-/// Draw the selection badge in the bottom-right corner of the window, over
-/// the terminal.
-fn draw_selection_badge(text: &str, dims: Dimensions, font: &Font) {
-    let size = measure_text(text, Some(font), dims.font_size, 1.0);
-    let pad = dims.cell_width;
-    let (w, h) = (size.width + 2.0 * pad, dims.cell_height * 1.2);
-    let (x, y) = (
-        dims.window_width - w - PADDING,
-        dims.window_height - h - PADDING,
-    );
-    draw_rectangle(x, y, w, h, color_u8!(40, 40, 40, 230));
-    draw_rectangle_lines(x, y, w, h, 1.0, color_u8!(120, 120, 120, 255));
-    // Centre the text: offset_y is the distance from its top to its baseline.
-    let baseline = y + (h - size.height) / 2.0 + size.offset_y;
-    draw_glyph(text, x + pad, baseline, font, dims.font_size, WHITE, false);
-}
-
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -633,10 +566,9 @@ struct Renderer<'alloc> {
     /// Copies the frame to the screen with blending off. See
     /// [`present_material`].
     present_material: Material,
-    /// The cell-buffer renderer of ADR 0008, or `None` for the
-    /// immediate-mode one: under Metal, without instancing, or with
-    /// `TAI_RENDERER=immediate`.
-    cells: Option<CellGrid>,
+    /// The cell-buffer renderer of ADR 0008, tai's only renderer since
+    /// ADR 0012.
+    cells: CellGrid,
 }
 
 /// The state of the cell-buffer renderer (ADR 0008). Each viewport row's
@@ -665,27 +597,18 @@ struct RowCells {
 }
 
 impl CellGrid {
-    /// `None` for the immediate renderer. Logs which renderer draws and,
-    /// when it's the immediate one, why.
-    fn new() -> Option<Self> {
-        if use_metal() {
-            tracing::info!("renderer: immediate (Metal; the cell renderer needs OpenGL)");
-            return None;
-        }
-        if std::env::var("TAI_RENDERER").as_deref() == Ok("immediate") {
-            tracing::info!("renderer: immediate (TAI_RENDERER=immediate)");
-            return None;
-        }
+    /// Fails when the OpenGL context can't run it. tai has no other
+    /// renderer since ADR 0012 retired the immediate-mode one.
+    fn new() -> Result<Self> {
         let text = cells::TextPass::new()
-            .map_err(|why| tracing::warn!("renderer: immediate ({why})"))
-            .ok()?;
+            .map_err(|why| format!("tai needs OpenGL 3.2 with instancing to draw: {why}"))?;
         let atlas_height = cells::ATLAS_MAX_HEIGHT.min(text.max_texture_size);
         tracing::info!(
             "renderer: cells (OpenGL {}, GLSL {}, glyph atlas up to {atlas_height} px)",
             text.gl_version,
             text.glsl
         );
-        Some(Self {
+        Ok(Self {
             atlas: cells::GlyphAtlas::new(atlas_height),
             text,
             rows: Vec::new(),
@@ -715,315 +638,28 @@ impl<'alloc> Renderer<'alloc> {
             placement_it: PlacementIterator::new()?,
             frame: None,
             present_material: present_material()?,
-            cells: CellGrid::new(),
+            cells: CellGrid::new()?,
         })
     }
 
-    /// Render the current terminal screen using the RenderState API.
+    /// Render the current terminal screen with the cell-buffer renderer
+    /// (ADR 0008). Each row's cells are read into per-row buffers, only
+    /// when the row is dirty.
     ///
-    /// For each row/cell we read the grapheme codepoints and the cell's style,
-    /// resolve foreground/background colors via the palette, and draw each
-    /// character individually with `draw_text_ex`.  This supports per-cell colors
-    /// from SGR sequences (bold, 256-color, 24-bit RGB, etc.).
-    ///
-    /// cell_width and cell_height are the measured dimensions of a single
-    /// monospace glyph at the current font size, in screen (logical) pixels.
-    /// font_size is the logical font size (before DPI scaling).
+    /// Redraw only when something changed, as Ghostty does: its renderer
+    /// draws on a wakeup from the IO thread and skips clean frames
+    /// (src/renderer/Thread.zig at a887df42). The render state reports
+    /// changed cells; the cursor, the window and font size, and input
+    /// (a selection being dragged) are checked here too. Otherwise the
+    /// last frame is copied to the screen.
     fn render_terminal(
         &mut self,
         terminal: &Terminal<'alloc, '_>,
         dims: Dimensions,
-        fonts: &Fonts,
         coverage: &Coverage,
         force: bool,
     ) -> Result<()> {
-        if let Some(mut grid) = self.cells.take() {
-            let result = self.render_cells(&mut grid, terminal, dims, coverage, force);
-            self.cells = Some(grid);
-            return result;
-        }
-        // Snapshot the terminal state into our render state. This is the
-        // only point where we need access to the terminal; after this the
-        // snapshot owns everything we need to draw the frame.
-        //
-        // When a snapshot is active, the render state cannot be updated —
-        // this is upheld in the Rust API by making the snapshot take an
-        // exclusive (mutable) reference to the render state.
-        let snapshot = self.render_state.update(terminal)?;
-
-        // Redraw only when something changed, as Ghostty does: its renderer
-        // draws on a wakeup from the IO thread and skips clean frames
-        // (src/renderer/Thread.zig at a887df42). The render state reports
-        // changed cells; the cursor, the window and font size, and input
-        // (a selection being dragged) are checked here too. Otherwise the
-        // last frame is copied to the screen.
-        let cursor = if snapshot.cursor_visible()? {
-            snapshot.cursor_viewport()?.map(|vp| (vp.x, vp.y))
-        } else {
-            None
-        };
-        let unchanged = !force
-            && snapshot.dirty()? == Dirty::Clean
-            && self
-                .frame
-                .as_ref()
-                .is_some_and(|f| f.dims == dims && f.cursor == cursor);
-        if unchanged {
-            if let Some(frame) = &self.frame {
-                Self::present(frame, &self.present_material);
-            }
-            return Ok(());
-        }
-        // Obtain the Kitty graphics storage from the terminal. This is a
-        // reference valid until the next mutating terminal call.
-        let graphics = terminal.kitty_graphics();
-
-        // Redraw only the rows that changed when that's safe, as Ghostty's
-        // renderer rebuilds only dirty rows (src/renderer/generic.zig,
-        // rebuildCells, at a887df42). Other rows keep what the frame texture
-        // already holds. A full-screen TUI that updates one line, such as a
-        // spinner, then costs one row instead of the whole screen. Images
-        // can span rows, and mouse input can change the selection or the
-        // viewport without marking rows, so both redraw everything.
-        let mut full = force
-            || snapshot.dirty()? == Dirty::Full
-            || self.frame.as_ref().is_none_or(|f| f.dims != dims);
-        if !full && let Ok(graphics) = graphics.as_ref() {
-            let mut placements = self.placement_it.update(graphics)?;
-            placements.set_layer(Layer::All)?;
-            full = placements.next().is_some();
-        }
-
-        if self.frame.as_ref().is_none_or(|f| f.dims != dims) {
-            // The texture has the window's size in physical pixels, so text
-            // stays as sharp as when it's drawn to the screen directly.
-            let target = render_target(
-                (dims.window_width * dims.dpi_scale).round() as u32,
-                (dims.window_height * dims.dpi_scale).round() as u32,
-            );
-            target.texture.set_filter(FilterMode::Nearest);
-            self.frame = Some(Frame {
-                target,
-                dims,
-                cursor,
-            });
-        }
-        let frame = self.frame.as_mut().expect("frame was just created");
-        // The cursor is drawn over its row, so the rows it leaves and enters
-        // are redrawn too.
-        let cursor_rows = [frame.cursor, cursor].map(|c| c.map(|(_, y)| y));
-        frame.cursor = cursor;
-        let mut camera =
-            Camera2D::from_display_rect(Rect::new(0.0, 0.0, dims.window_width, dims.window_height));
-        // A render target is drawn upside down compared with the screen.
-        camera.zoom.y = -camera.zoom.y;
-        camera.render_target = Some(frame.target.clone());
-        set_camera(&camera);
-
-        // Get the terminal's background color from the render state snapshot.
-        let colors = snapshot.colors()?;
-        if full {
-            clear_background(color(colors.background));
-        }
-
-        // Populate the row iterator from the current render state snapshot,
-        // resulting in a row *iteration* object, which can be thought of as
-        // a cursor into a row of the snapshot. Attributes of the current row
-        // can be read from it via a shared reference, or it can be moved
-        // to point at the next row via a mutable reference.
-        let mut row_it = self.row_it.update(&snapshot)?;
-
-        // --- Layer 1: images below cell backgrounds (z < INT32_MIN/2) ---
-        if let Ok(graphics) = graphics.as_ref() {
-            Self::render_kitty_images(
-                terminal,
-                &mut self.placement_it,
-                graphics,
-                Layer::BelowBg,
-                dims,
-            )?
-        }
-
-        // Small padding from the window edges.
-        let mut y = PADDING;
-
-        // Reusable text buffer for reading cell graphemes as UTF-8 text.
-        let mut text = String::with_capacity(16);
-
-        // Fallback-font icons of the current row. They're drawn after the
-        // row's cells: an icon may spread into the next cell when that one is
-        // blank, which is only known once the next cell is read, and the next
-        // cell's background must not paint over it.
-        let mut icons: Vec<Icon> = Vec::new();
-
-        // Backgrounds and text are queued and drawn in two passes once all
-        // rows are read, as Ghostty's renderer keeps separate background
-        // and text cell buffers (src/renderer/generic.zig at a887df42).
-        // Drawing each cell's background and then its glyph switched
-        // textures on every cell, and every switch is a separate draw call:
-        // a TUI that colours every cell's background took about a second
-        // per frame on the macOS dev host's Intel GPU.
-        let mut backgrounds = Backgrounds::default();
-        let mut glyphs = Glyphs::default();
-        let mut row_icons: Vec<Icon> = Vec::new();
-
-        // Kitty Unicode placeholder runs, by viewport row, drawn once all
-        // text is down (ADR 0005), and the current row's placeholder cells.
-        let mut virtual_runs: Vec<(u16, placeholders::Placement)> = Vec::new();
-        let mut placeholder_cells: Vec<Option<placeholders::PlaceholderCell>> = Vec::new();
-        let mut row_index: u16 = 0;
-
-        // For convenience, `next` gives you the same iteration back only
-        // as a shared pointer, so you can simultaneously iterate through
-        // all rows while having a handle to query data for each row.
-        while let Some(row) = row_it.next() {
-            if !full {
-                if !row.dirty()? && !cursor_rows.contains(&Some(row_index)) {
-                    y += dims.cell_height;
-                    row_index += 1;
-                    continue;
-                }
-                // Clear the row, padding included, before drawing it again.
-                backgrounds.push(
-                    0.0,
-                    y,
-                    dims.window_width,
-                    dims.cell_height,
-                    color(colors.background),
-                );
-            }
-            // libghostty-vt flags rows holding a U+10EEEE placeholder.
-            let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
-
-            // Cell iterators work similarly as they create a cell *iteration*
-            // from a row iteration, which can then be used in a similar pattern.
-            let mut cell_it = self.cell_it.update(row)?;
-            walk_row(
-                &mut cell_it,
-                placeholder_row,
-                y,
-                dims,
-                &colors,
-                coverage,
-                &mut text,
-                &mut icons,
-                &mut placeholder_cells,
-                &mut ImmediateRow {
-                    backgrounds: &mut backgrounds,
-                    glyphs: &mut glyphs,
-                    y,
-                    dims,
-                },
-            )?;
-
-            row_icons.append(&mut icons);
-
-            if placeholder_row {
-                let runs = placeholders::row_placements(placeholder_cells.drain(..));
-                virtual_runs.extend(runs.into_iter().map(|run| (row_index, run)));
-            }
-
-            // Clear per-row dirty flag after rendering it.
-            row.set_dirty(false)?;
-            y += dims.cell_height;
-            row_index += 1;
-        }
-
-        // The two passes, then the icons, which overhang their cell.
-        backgrounds.draw();
-        glyphs.draw(&fonts.primary, dims.font_size);
-        // Cache every icon glyph before drawing any: see cache_glyphs.
-        for icon in &row_icons {
-            let place = coverage.place(icon.face, dims.font_size, icon.cells);
-            cache_glyphs(&icon.text, fonts.get(icon.face, coverage), place.font_size);
-        }
-        for icon in row_icons {
-            let place = coverage.place(icon.face, dims.font_size, icon.cells);
-            let baseline = icon.y + dims.baseline - place.rise;
-            draw_glyph(
-                &icon.text,
-                icon.x,
-                baseline,
-                fonts.get(icon.face, coverage),
-                place.font_size,
-                icon.fg,
-                icon.bold,
-            );
-        }
-
-        // --- Layer 2: images below text (i32::MIN / 2 <= z < 0) ---
-        // Drawn after cell backgrounds but before the cursor and any
-        // above-text images.  In our single-pass renderer the cell text
-        // has already been drawn, but this still achieves the correct
-        // visual for the common case where images sit behind text.
-        if let Ok(graphics) = graphics.as_ref() {
-            Self::render_kitty_images(
-                terminal,
-                &mut self.placement_it,
-                graphics,
-                Layer::BelowText,
-                dims,
-            )?;
-            // Images shown through Unicode placeholders (ADR 0005).
-            if !virtual_runs.is_empty() {
-                Self::render_virtual_placements(
-                    &mut self.placement_it,
-                    graphics,
-                    &virtual_runs,
-                    dims,
-                )?;
-            }
-        }
-
-        // Draw the cursor if visible.
-        if snapshot.cursor_visible()?
-            && let Some(vp) = snapshot.cursor_viewport()?
-        {
-            // Draw the cursor using the foreground color (or explicit cursor
-            // color if the terminal set one).
-            let cursor_color = colors.cursor.unwrap_or(colors.foreground);
-
-            draw_rectangle(
-                PADDING + vp.x as f32 * dims.cell_width,
-                PADDING + vp.y as f32 * dims.cell_height,
-                dims.cell_width,
-                dims.cell_height,
-                color(cursor_color),
-            );
-        }
-
-        // --- Layer 3: images above text (z >= 0) ---
-        if let Ok(graphics) = graphics.as_ref() {
-            Self::render_kitty_images(
-                terminal,
-                &mut self.placement_it,
-                graphics,
-                Layer::AboveText,
-                dims,
-            )?
-        }
-
-        // Reset global dirty state so the next update reports changes accurately.
-        snapshot.set_dirty(Dirty::Clean)?;
-
-        set_default_camera();
-        if let Some(frame) = &self.frame {
-            Self::present(frame, &self.present_material);
-        }
-        Ok(())
-    }
-
-    /// Render the terminal with the cell-buffer renderer (ADR 0008). Cells
-    /// are read as in the immediate-mode path above, but into per-row
-    /// buffers, and only for dirty rows.
-    fn render_cells(
-        &mut self,
-        grid: &mut CellGrid,
-        terminal: &Terminal<'alloc, '_>,
-        dims: Dimensions,
-        coverage: &Coverage,
-        force: bool,
-    ) -> Result<()> {
+        let grid = &mut self.cells;
         let snapshot = self.render_state.update(terminal)?;
         let cursor = if snapshot.cursor_visible()? {
             snapshot.cursor_viewport()?.map(|vp| (vp.x, vp.y))
@@ -1052,7 +688,8 @@ impl<'alloc> Renderer<'alloc> {
             .is_none_or(|d| d.font_size != dims.font_size || d.dpi_scale != dims.dpi_scale)
         {
             // A new glyph size: start an empty atlas, as Ghostty builds a
-            // new one per font size (see `Fonts::fresh_caches`).
+            // new one per font size and frees the old ones
+            // (`src/font/SharedGridSet.zig`, `ref`/`deref`, at a887df42).
             grid.atlas.clear();
         }
         grid.dims = Some(dims);
@@ -1213,7 +850,7 @@ impl<'alloc> Renderer<'alloc> {
             instances,
             atlas,
             camera.matrix(),
-            frame.target.render_pass.raw_miniquad_id(),
+            Some(frame.target.render_pass.raw_miniquad_id()),
         );
 
         if let Ok(graphics) = graphics.as_ref() {
@@ -1266,6 +903,45 @@ impl<'alloc> Renderer<'alloc> {
             Self::present(frame, &self.present_material);
         }
         Ok(())
+    }
+
+    /// Draw the selection badge in the bottom-right corner of the window,
+    /// over the terminal, straight to the screen.
+    fn draw_selection_badge(&mut self, text: &str, dims: Dimensions, coverage: &Coverage) {
+        let font = coverage.font(Face::Primary);
+        let size = measure_text(font, text, dims.font_size, dims.dpi_scale);
+        let pad = dims.cell_width;
+        let (w, h) = (size.width + 2.0 * pad, dims.cell_height * 1.2);
+        let (x, y) = (
+            dims.window_width - w - PADDING,
+            dims.window_height - h - PADDING,
+        );
+        draw_rectangle(x, y, w, h, color_u8!(40, 40, 40, 230));
+        draw_rectangle_lines(x, y, w, h, 1.0, color_u8!(120, 120, 120, 255));
+        // Centre the text: offset_y is the distance from its top to its baseline.
+        let baseline = y + (h - size.height) / 2.0 + size.offset_y;
+        let grid = &mut self.cells;
+        grid.instances.clear();
+        grid.atlas.push_text(
+            &mut grid.instances,
+            font,
+            Face::Primary,
+            text,
+            x + pad,
+            baseline,
+            dims.font_size,
+            dims.dpi_scale,
+            WHITE,
+            false,
+        );
+        // Camera2D::matrix flips y when there's no render target, because
+        // macroquad's own screen drawing goes through its own projection;
+        // the text pass uses this matrix directly, so flip it back.
+        let mut screen =
+            Camera2D::from_display_rect(Rect::new(0.0, 0.0, dims.window_width, dims.window_height));
+        screen.zoom.y = -screen.zoom.y;
+        grid.text
+            .draw(&grid.instances, &mut grid.atlas, screen.matrix(), None);
     }
 
     /// Copy a drawn frame to the screen.
@@ -1473,22 +1149,11 @@ impl<'alloc> Renderer<'alloc> {
     }
 }
 
-/// Where `walk_row` sends what a row's cells show. The two renderers
-/// differ only in how they queue it.
-trait CellSink {
-    /// The next cell's background, at `x`; `None` where the terminal's
-    /// own background shows.
-    fn background(&mut self, x: f32, bg: Option<RgbColor>);
-    /// A cell's text in the primary font, at `x`.
-    fn text(&mut self, text: &str, x: f32, fg: RgbColor, bold: bool);
-}
-
-/// Read one row's cells and work out what each shows, for both renderers:
-/// colours (inverse and selection swap them), Kitty placeholder cells, and
-/// which font draws each grapheme. Backgrounds and primary-font text go to
-/// `sink` as they're read. Fallback-font icons go to `icons`, complete once
-/// the row is read, because an icon spreads into the next cell when that
-/// one is blank. On a placeholder row, every cell's placeholder or `None`
+/// Read one row's cells and work out what each shows: colours (inverse and
+/// selection swap them), Kitty placeholder cells, and which font draws each
+/// grapheme. Backgrounds and primary-font text go to `sink` as they're
+/// read. Fallback-font icons go to `icons`, complete once the row is read,
+/// because an icon spreads into the next cell when that one is blank. On a placeholder row, every cell's placeholder or `None`
 /// goes to `placeholder_cells`.
 #[allow(clippy::too_many_arguments)]
 fn walk_row(
@@ -1501,7 +1166,7 @@ fn walk_row(
     text: &mut String,
     icons: &mut Vec<Icon>,
     placeholder_cells: &mut Vec<Option<placeholders::PlaceholderCell>>,
-    sink: &mut impl CellSink,
+    sink: &mut GridRow<'_>,
 ) -> Result<()> {
     placeholder_cells.clear();
     let mut x = PADDING;
@@ -1589,7 +1254,10 @@ fn walk_row(
                 .chars()
                 .next()
                 .map_or(Face::Primary, |ch| coverage.face_for(ch));
-            if matches!(face, Face::Symbols | Face::Iosevka | Face::Emoji) {
+            if matches!(
+                face,
+                Face::Symbols | Face::Iosevka | Face::Emoji | Face::Discovered(_)
+            ) {
                 icons.push(Icon {
                     text: text.clone(),
                     face,
@@ -1609,43 +1277,18 @@ fn walk_row(
     Ok(())
 }
 
-/// The immediate renderer's row: rectangles and glyph runs for this frame.
-struct ImmediateRow<'a> {
-    backgrounds: &'a mut Backgrounds,
-    glyphs: &'a mut Glyphs,
-    y: f32,
-    dims: Dimensions,
-}
-
-impl CellSink for ImmediateRow<'_> {
-    fn background(&mut self, x: f32, bg: Option<RgbColor>) {
-        if let Some(bg) = bg {
-            let Dimensions {
-                cell_width,
-                cell_height,
-                ..
-            } = self.dims;
-            self.backgrounds
-                .push(x, self.y, cell_width, cell_height, color(bg));
-        }
-    }
-
-    fn text(&mut self, text: &str, x: f32, fg: RgbColor, bold: bool) {
-        self.glyphs
-            .push(text, x, self.y + self.dims.baseline, color(fg), bold);
-    }
-}
-
 /// The cell renderer's row buffers (ADR 0008).
 struct GridRow<'a> {
     atlas: &'a mut cells::GlyphAtlas,
     row: &'a mut RowCells,
-    font: &'a fontdue::Font,
+    font: &'a Typeface,
     y: f32,
     dims: Dimensions,
 }
 
-impl CellSink for GridRow<'_> {
+impl GridRow<'_> {
+    /// The next cell's background; `None` where the terminal's own
+    /// background shows.
     fn background(&mut self, _x: f32, bg: Option<RgbColor>) {
         // One texel per cell; transparent shows the terminal's background.
         self.row
@@ -1653,6 +1296,7 @@ impl CellSink for GridRow<'_> {
             .push(bg.map_or([0; 4], |c| [c.r, c.g, c.b, 255]));
     }
 
+    /// A cell's text in the primary font, at `x`.
     fn text(&mut self, text: &str, x: f32, fg: RgbColor, bold: bool) {
         self.atlas.push_text(
             &mut self.row.text,
@@ -1681,104 +1325,22 @@ struct Icon {
     cells: u8,
 }
 
-/// Cell backgrounds queued for one frame. Neighbouring cells of the same
-/// colour on a row merge into one rectangle.
-#[derive(Default)]
-struct Backgrounds(Vec<(Rect, Color)>);
-
-impl Backgrounds {
-    fn push(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
-        if let Some((last, c)) = self.0.last_mut()
-            && *c == color
-            && last.y == y
-            && last.h == h
-            && (last.x + last.w - x).abs() < 0.01
-        {
-            last.w += w;
-            return;
-        }
-        self.0.push((Rect::new(x, y, w, h), color));
+/// The size of `text` in `font`, as macroquad's `measure_text` measured it
+/// (vendor/macroquad/src/text.rs): the advances' sum, the inked height,
+/// and how far the ink's top is above the baseline, in logical pixels.
+fn measure_text(font: &Typeface, text: &str, font_size: u16, dpi_scale: f32) -> TextDimensions {
+    let px = (f32::from(font_size) * dpi_scale).ceil();
+    let (mut width, mut min_y, mut max_y) = (0.0, f32::MAX, f32::MIN);
+    for ch in text.chars() {
+        let m = font.metrics(ch, px);
+        width += m.advance_width;
+        min_y = min_y.min(m.ymin as f32);
+        max_y = max_y.max(m.height as f32 + m.ymin as f32);
     }
-
-    fn draw(&self) {
-        for (r, c) in &self.0 {
-            draw_rectangle(r.x, r.y, r.w, r.h, *c);
-        }
-    }
-}
-
-/// Primary-font text queued for one frame: each cell's text is a range of
-/// one buffer, so queuing doesn't allocate per cell.
-#[derive(Default)]
-struct Glyphs {
-    text: String,
-    cells: Vec<(std::ops::Range<usize>, f32, f32, Color, bool)>,
-}
-
-impl Glyphs {
-    fn push(&mut self, text: &str, x: f32, baseline: f32, fg: Color, bold: bool) {
-        let start = self.text.len();
-        self.text.push_str(text);
-        self.cells
-            .push((start..self.text.len(), x, baseline, fg, bold));
-    }
-
-    fn draw(&self, font: &Font, font_size: u16) {
-        // Cache every glyph first: see cache_glyphs.
-        cache_glyphs(&self.text, font, font_size);
-        for (range, x, baseline, fg, bold) in &self.cells {
-            draw_glyph(
-                &self.text[range.clone()],
-                *x,
-                *baseline,
-                font,
-                font_size,
-                *fg,
-                *bold,
-            );
-        }
-    }
-}
-
-/// Put the glyphs of `text` into the font's atlas without drawing them.
-///
-/// macroquad caches a glyph the first time it's drawn. When a new glyph
-/// doesn't fit, the atlas doubles, every glyph moves, and the atlas texture
-/// is replaced. Glyphs of that font already queued in the frame still point
-/// at the old texture and positions, so they draw as nothing or garbage,
-/// and tai's kept frame keeps them that way. Measuring the text caches the
-/// glyphs at the same pixel size `draw_text_ex` uses, so any growth happens
-/// before the first glyph of the frame is queued.
-fn cache_glyphs(text: &str, font: &Font, font_size: u16) {
-    measure_text(text, Some(font), font_size, 1.0);
-}
-
-/// Draw one cell's text with its baseline at `baseline`.
-fn draw_glyph(
-    text: &str,
-    x: f32,
-    baseline: f32,
-    font: &Font,
-    font_size: u16,
-    fg: Color,
-    bold: bool,
-) {
-    let params = TextParams {
-        font: Some(font),
-        font_size,
-        color: fg,
-        ..Default::default()
-    };
-    draw_text_ex(text, x, baseline, params.clone());
-
-    // Bold: draw the text a second time shifted 1 pixel to the right to
-    // thicken the strokes ("fake bold").
-    //
-    // In a more sophisticated terminal one would obviously use the correct
-    // bold version of the font using font discovery, but let's do it the
-    // hackier way here.
-    if bold {
-        draw_text_ex(text, x + 1.0, baseline, params);
+    TextDimensions {
+        width: width / dpi_scale,
+        height: (max_y - min_y) / dpi_scale,
+        offset_y: max_y / dpi_scale,
     }
 }
 
@@ -1823,11 +1385,15 @@ struct Dimensions {
 }
 
 impl Dimensions {
-    fn new(font: Option<&Font>, font_size: u16) -> Self {
-        // Measure a representative glyph to derive the monospace cell size.
-        // measure_text applies the DPI scale itself and returns logical
-        // units, the same units we draw in.
-        let glyph_size = measure_text("M", font, font_size, 1.0);
+    fn new(coverage: &Coverage, font_size: u16) -> Self {
+        // Measure a representative glyph to derive the monospace cell size,
+        // in logical units, the same units we draw in.
+        let glyph_size = measure_text(
+            coverage.font(Face::Primary),
+            "M",
+            font_size,
+            screen_dpi_scale(),
+        );
 
         // Guard against zero cell dimensions — these would cause division
         // by zero when computing the terminal grid.
@@ -1872,11 +1438,11 @@ impl Dimensions {
         (px(cols, cell_w), px(rows, cell_h))
     }
 
-    fn update(&mut self, font: Option<&Font>) -> bool {
+    fn update(&mut self, coverage: &Coverage) -> bool {
         // The DPI scale may not be final on the first frame, or may change
         // when the window moves between displays; re-measure the cells then.
         if screen_dpi_scale() != self.dpi_scale {
-            *self = Self::new(font, self.font_size);
+            *self = Self::new(coverage, self.font_size);
             return true;
         }
         if screen_width() == self.window_width && screen_height() == self.window_height {
@@ -2825,15 +2391,10 @@ impl SelectionState<'_> {
 ///
 /// By default the window is resizable and DPI-aware,
 /// while prioritizing Wayland over X11 on Linux.
-/// On Apple platforms, `TAI_APPLE_GFX=metal` selects Metal instead of OpenGL.
-/// Metal stays opt-in: on the macOS dev host it leaked GPU memory steadily
-/// (about 1.2 MB/s while htop redrew) where OpenGL stayed flat.
+/// OpenGL on every platform: the cell renderer has no Metal shaders, and
+/// macroquad's Metal backend leaked GPU memory on the macOS dev host (about
+/// 1.2 MB/s while htop redrew) where OpenGL stayed flat (ADR 0012).
 fn macroquad_conf() -> Conf {
-    let apple_gfx_api = if use_metal() {
-        conf::AppleGfxApi::Metal
-    } else {
-        conf::AppleGfxApi::OpenGl
-    };
     Conf {
         window_title: "tai".to_owned(),
         window_resizable: true,
@@ -2841,7 +2402,7 @@ fn macroquad_conf() -> Conf {
         platform: conf::Platform {
             // Default to Wayland and fallback to X11 on Linux.
             linux_backend: conf::LinuxBackend::WaylandWithX11Fallback,
-            apple_gfx_api,
+            apple_gfx_api: conf::AppleGfxApi::OpenGl,
             ..Default::default()
         },
         ..Default::default()

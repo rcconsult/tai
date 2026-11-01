@@ -5,27 +5,46 @@
 //! Iosevka Fixed (general symbols such as ⎈ and ⏵, and braille) and Noto
 //! Emoji (monochrome emoji). All four fonts are bundled (`fonts/README.md`
 //! records where they come from). Unicode spaces draw blank without a font.
-//! Noto Emoji is parsed only when a codepoint none of the others has first
-//! shows up. Colour emoji and system-font discovery for CJK are left for
-//! later.
+//! A codepoint none of them has goes to the font the OS's own fallback
+//! picks for the user's locale (`discovery.rs`), as Ghostty does, which is
+//! how CJK is drawn. Colour emoji are left for later.
+//!
+//! Fonts are read in place with skrifa and each glyph's outline is filled
+//! with zeno when the glyph is first drawn (ADR 0012). Nothing is parsed up
+//! front: fontdue, which tai used before, built every glyph's outline when
+//! it loaded a font, about 100 MB of heap for these four.
 
-use std::cell::OnceCell;
-use std::sync::Arc;
+use std::{
+    cell::{OnceCell, RefCell},
+    collections::HashMap,
+    path::Path,
+};
 
-use macroquad::text::{Font, load_ttf_font_from_fontdue};
+use skrifa::{
+    FontRef, GlyphId, MetadataProvider,
+    instance::{LocationRef, Size},
+    outline::{DrawSettings, OutlinePen},
+};
+use zeno::{Command, Mask, Point};
+
+use crate::discovery::{self, FontFile};
 
 pub const PRIMARY_BYTES: &[u8] = include_bytes!("../fonts/JetBrainsMono-Medium.ttf");
 pub const SYMBOLS_BYTES: &[u8] = include_bytes!("../fonts/SymbolsNerdFontMono-Regular.ttf");
 pub const IOSEVKA_BYTES: &[u8] = include_bytes!("../fonts/IosevkaFixedSS01-Medium.ttf");
 pub const EMOJI_BYTES: &[u8] = include_bytes!("../fonts/NotoEmoji-Regular.ttf");
 
-/// How a codepoint is drawn: with one of the bundled fonts, or not at all.
+/// How a codepoint is drawn: with one of the bundled fonts, a font the OS
+/// found, or not at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Face {
     Primary,
     Symbols,
     Iosevka,
     Emoji,
+    /// A system font found for a codepoint the bundled fonts lack, by its
+    /// slot in `Coverage`.
+    Discovered(u8),
     /// A Unicode space: the cell keeps its background and draws no glyph.
     Blank,
 }
@@ -41,11 +60,276 @@ pub fn is_space(ch: char) -> bool {
     )
 }
 
+/// A glyph's bitmap box and advance at one size, in pixels. `xmin` and
+/// `ymin` are the box's left and bottom edges from the pen position on the
+/// baseline, with y up, as fontdue reported them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Metrics {
+    pub xmin: i32,
+    pub ymin: i32,
+    pub width: usize,
+    pub height: usize,
+    pub advance_width: f32,
+}
+
+/// One face of a font file, read in place.
+///
+/// Sizes are applied here, as `units × px / units_per_em` in f32, as fontdue
+/// did, not through skrifa's fixed-point scaling: that gives JetBrains
+/// Mono's 600-unit advance as 59.99994 px at 100 px, and the cell size in
+/// pixels, which is truncated, would lose a pixel.
+#[derive(Clone)]
+pub struct Typeface {
+    font: FontRef<'static>,
+    units_per_em: f32,
+}
+
+/// Collects a glyph's outline as zeno path commands, from font units to
+/// pixels. Font outlines have y up and zeno's masks y down, so y is flipped.
+struct Pen {
+    scale: f32,
+    path: Vec<Command>,
+}
+
+impl Pen {
+    fn point(&self, x: f32, y: f32) -> Point {
+        Point::new(x * self.scale, -y * self.scale)
+    }
+}
+
+impl OutlinePen for Pen {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.path.push(Command::MoveTo(self.point(x, y)));
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.path.push(Command::LineTo(self.point(x, y)));
+    }
+
+    fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
+        let command = Command::QuadTo(self.point(cx0, cy0), self.point(x, y));
+        self.path.push(command);
+    }
+
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        let command =
+            Command::CurveTo(self.point(cx0, cy0), self.point(cx1, cy1), self.point(x, y));
+        self.path.push(command);
+    }
+
+    fn close(&mut self) {
+        self.path.push(Command::Close);
+    }
+}
+
+impl Typeface {
+    /// Face `index` of the font file in `bytes` (0 unless it's a collection).
+    pub fn new(bytes: &'static [u8], index: u32) -> Result<Self, &'static str> {
+        let font = FontRef::from_index(bytes, index).map_err(|_| "not a font file")?;
+        let units_per_em = f32::from(
+            font.metrics(Size::unscaled(), LocationRef::default())
+                .units_per_em,
+        );
+        if units_per_em <= 0.0 {
+            return Err("font has no units per em");
+        }
+        Ok(Self { font, units_per_em })
+    }
+
+    /// The glyph for `ch`, or the missing-glyph box when the font has none.
+    fn glyph_id(&self, ch: char) -> GlyphId {
+        self.font.charmap().map(ch).unwrap_or(GlyphId::NOTDEF)
+    }
+
+    /// Whether the font has a glyph for `ch`.
+    pub fn has(&self, ch: char) -> bool {
+        self.font.charmap().map(ch).is_some()
+    }
+
+    /// Whether the font has an outline for `ch`, which tai can draw. A
+    /// bitmap-only font, such as Apple Color Emoji (sbix), has glyphs but
+    /// no outlines.
+    pub fn has_outline(&self, ch: char) -> bool {
+        self.font
+            .charmap()
+            .map(ch)
+            .is_some_and(|glyph| self.font.outline_glyphs().get(glyph).is_some())
+    }
+
+    /// The metrics Ghostty sizes fallback fonts by, in em.
+    fn size_metrics(&self) -> SizeMetrics {
+        let em = |units: f32| units / self.units_per_em;
+        let m = self.font.metrics(Size::unscaled(), LocationRef::default());
+        let glyphs = self
+            .font
+            .glyph_metrics(Size::unscaled(), LocationRef::default());
+        let charmap = self.font.charmap();
+        // As Ghostty's FreeType face measures them (src/font/face/freetype.zig,
+        // `getMetrics`): the widest advance and the inked height over the
+        // printable ASCII range.
+        let (mut cell_width, mut top, mut bottom) = (0.0f32, 0.0f32, 0.0f32);
+        for glyph in (' '..='~').filter_map(|ch| charmap.map(ch)) {
+            cell_width = cell_width.max(glyphs.advance_width(glyph).unwrap_or(0.0));
+            if let Some(b) = glyphs.bounds(glyph) {
+                top = top.max(b.y_max);
+                bottom = bottom.min(b.y_min);
+            }
+        }
+        // 水's advance, unless its ink is wider than that, which Ghostty
+        // takes as a broken advance (a CJK font run through a patcher).
+        let ic_width = charmap.map('水').and_then(|glyph| {
+            let advance = glyphs.advance_width(glyph)?;
+            let ink = glyphs.bounds(glyph).map_or(0.0, |b| b.x_max - b.x_min);
+            (ink <= advance).then_some(em(advance))
+        });
+        SizeMetrics {
+            ascent: em(m.ascent),
+            descent: em(m.descent),
+            line_gap: em(m.leading),
+            cap_height: m.cap_height.map(em),
+            ex_height: m.x_height.map(em),
+            ascii_height: (top - bottom > 0.0).then_some(em(top - bottom)),
+            cell_width: em(cell_width),
+            ic_width,
+        }
+    }
+
+    /// Pixels per font unit at `px` pixels per em.
+    fn scale(&self, px: f32) -> f32 {
+        px / self.units_per_em
+    }
+
+    /// How far glyph `glyph` moves the pen at `px` pixels per em.
+    fn glyph_advance(&self, glyph: GlyphId, px: f32) -> f32 {
+        let units = self
+            .font
+            .glyph_metrics(Size::unscaled(), LocationRef::default())
+            .advance_width(glyph)
+            .unwrap_or(0.0);
+        units * self.scale(px)
+    }
+
+    /// How far `ch` moves the pen at `px` pixels per em.
+    pub fn advance(&self, ch: char, px: f32) -> f32 {
+        self.glyph_advance(self.glyph_id(ch), px)
+    }
+
+    /// The line's ascent and descent (negative below the baseline) at `px`.
+    fn line_metrics(&self, px: f32) -> (f32, f32) {
+        let m = self.font.metrics(Size::unscaled(), LocationRef::default());
+        (m.ascent * self.scale(px), m.descent * self.scale(px))
+    }
+
+    /// `ch`'s box and advance at `px`, as `rasterize` would draw it.
+    pub fn metrics(&self, ch: char, px: f32) -> Metrics {
+        self.rasterize(ch, px).0
+    }
+
+    /// `ch` at `px` pixels per em: its box and advance, and one coverage
+    /// byte per pixel, row by row from the top. Unhinted, as fontdue drew
+    /// it, so text keeps its weight.
+    pub fn rasterize(&self, ch: char, px: f32) -> (Metrics, Vec<u8>) {
+        let glyph = self.glyph_id(ch);
+        let advance_width = self.glyph_advance(glyph, px);
+        let mut pen = Pen {
+            scale: self.scale(px),
+            path: Vec::new(),
+        };
+        if let Some(outline) = self.font.outline_glyphs().get(glyph) {
+            let settings = DrawSettings::unhinted(Size::unscaled(), LocationRef::default());
+            if outline.draw(settings, &mut pen).is_err() {
+                pen.path.clear();
+            }
+        }
+        let empty = Metrics {
+            advance_width,
+            ..Metrics::default()
+        };
+        if pen.path.is_empty() {
+            return (empty, Vec::new());
+        }
+        let (bitmap, place) = Mask::new(&pen.path).render();
+        if place.width == 0 || place.height == 0 {
+            return (empty, Vec::new());
+        }
+        let metrics = Metrics {
+            xmin: place.left,
+            ymin: -(place.top + place.height as i32),
+            width: place.width as usize,
+            height: place.height as usize,
+            advance_width,
+        };
+        (metrics, bitmap)
+    }
+}
+
+/// The face metrics Ghostty compares to size a fallback font, in em
+/// (`src/font/Metrics.zig`, `FaceMetrics`, at a887df42). The optional ones
+/// are what the font says; the methods fall back to Ghostty's estimates.
+#[derive(Clone, Copy, Debug)]
+struct SizeMetrics {
+    ascent: f32,
+    descent: f32,
+    line_gap: f32,
+    cap_height: Option<f32>,
+    ex_height: Option<f32>,
+    ascii_height: Option<f32>,
+    cell_width: f32,
+    ic_width: Option<f32>,
+}
+
+fn positive(value: Option<f32>) -> Option<f32> {
+    value.filter(|v| *v > 0.0)
+}
+
+impl SizeMetrics {
+    fn cap_height(&self) -> f32 {
+        positive(self.cap_height).unwrap_or(0.75 * self.ascent)
+    }
+
+    fn ex_height(&self) -> f32 {
+        positive(self.ex_height).unwrap_or(0.75 * self.cap_height())
+    }
+
+    fn ascii_height(&self) -> f32 {
+        positive(self.ascii_height).unwrap_or(1.5 * self.cap_height())
+    }
+
+    fn ic_width(&self) -> f32 {
+        positive(self.ic_width).unwrap_or(self.ascii_height().min(2.0 * self.cell_width))
+    }
+
+    fn line_height(&self) -> f32 {
+        self.ascent - self.descent + self.line_gap
+    }
+
+    /// How much bigger than the primary to draw a fallback face, as
+    /// Ghostty's `scaleFactor` with its default `.ic_width` adjustment
+    /// (`src/font/Collection.zig`): match the ideograph width when the
+    /// face has one, else the ex height, the cap height, then the line
+    /// height, each only when the face states it.
+    fn scale_from(primary: &Self, face: &Self) -> f32 {
+        let (p, f) = if positive(face.ic_width).is_some() {
+            (primary.ic_width(), face.ic_width())
+        } else if positive(face.ex_height).is_some() {
+            (primary.ex_height(), face.ex_height())
+        } else if positive(face.cap_height).is_some() {
+            (primary.cap_height(), face.cap_height())
+        } else {
+            (primary.line_height(), face.line_height())
+        };
+        if f > 0.0 { p / f } else { 1.0 }
+    }
+}
+
 /// How a fallback font's glyphs are fitted to the primary font's cells.
 struct Fit {
-    /// Font size as a fraction of the primary size, so one glyph is one
-    /// cell wide.
+    /// Font size as a fraction of the primary size: per cell spanned for
+    /// the bundled fonts, so one glyph is one cell wide; for the whole
+    /// glyph for a discovered font.
     scale: f32,
+    /// Whether `scale` is per cell.
+    per_cell: bool,
     /// The largest scale whose line still fits the primary's line.
     max_scale: f32,
     /// Vertical middle of the font's line, (ascent + descent) / 2, in em
@@ -53,27 +337,93 @@ struct Fit {
     mid: f32,
 }
 
-/// A parsed fallback font and how it fits the primary's cells.
-struct Fallback {
-    font: Arc<fontdue::Font>,
+/// Glyphs used to measure each font's advance. All fonts are monospaced.
+const PRIMARY_PROBE: char = 'M';
+const SYMBOLS_PROBE: char = '\u{f113}';
+const IOSEVKA_PROBE: char = 'M';
+const EMOJI_PROBE: char = '\u{1f600}';
+const PROBE_PX: f32 = 100.0;
+
+fn mid(font: &Typeface) -> f32 {
+    let (ascent, descent) = font.line_metrics(PROBE_PX);
+    (ascent + descent) / 2.0 / PROBE_PX
+}
+
+impl Fit {
+    fn new(primary: &Typeface, font: &Typeface, probe: char) -> Self {
+        Self {
+            scale: primary.advance(PRIMARY_PROBE, PROBE_PX) / font.advance(probe, PROBE_PX),
+            per_cell: true,
+            max_scale: line_height(primary) / line_height(font),
+            mid: mid(font),
+        }
+    }
+
+    /// A discovered font's fit: Ghostty's size normalization, then capped
+    /// at the primary's line and centred on it like the bundled fonts.
+    fn normalized(primary: &Typeface, primary_size: &SizeMetrics, font: &Typeface) -> Self {
+        Self {
+            scale: SizeMetrics::scale_from(primary_size, &font.size_metrics()),
+            per_cell: false,
+            max_scale: line_height(primary) / line_height(font),
+            mid: mid(font),
+        }
+    }
+}
+
+/// A font's ascent minus descent at `PROBE_PX`.
+fn line_height(font: &Typeface) -> f32 {
+    let (ascent, descent) = font.line_metrics(PROBE_PX);
+    ascent - descent
+}
+
+/// A system font found for fallback.
+struct Discovered {
+    font: Typeface,
     fit: Fit,
 }
 
-/// Which codepoints each bundled font covers. This doesn't depend on the
-/// font size, so it's built once. fontdue keeps a codepoint → glyph map, so
-/// a lookup is a hash lookup with no rasterizing.
+/// How many system fonts fallback keeps. Each covers a script or more, so
+/// a session rarely needs more than a few.
+const MAX_DISCOVERED: usize = 16;
+
+/// `path`'s bytes for the rest of the process. Mapped, not read: a CJK
+/// collection is 13–80 MB and only the pages of glyphs drawn are touched.
+/// Leaked, because a discovered face is kept until tai exits and there are
+/// at most `MAX_DISCOVERED` of them.
+#[allow(unsafe_code)]
+pub fn map(path: &Path) -> std::io::Result<&'static [u8]> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: a mapped file that another process truncates can fault on
+    // read. System font files don't change while they're installed, and
+    // DirectWrite, CoreText and FreeType map them the same way.
+    let mapped: &'static memmap2::Mmap = Box::leak(Box::new(unsafe { memmap2::Mmap::map(&file)? }));
+    Ok(&mapped[..])
+}
+
+/// The bundled fonts and the system fonts found so far, which codepoints
+/// each covers, and how each fits the primary's cells. Covering a
+/// codepoint is a lookup in the font's own character map.
 pub struct Coverage {
-    primary: Arc<fontdue::Font>,
-    symbols: Arc<fontdue::Font>,
-    iosevka: Arc<fontdue::Font>,
+    primary: Typeface,
+    symbols: Typeface,
+    iosevka: Typeface,
+    emoji: Typeface,
     primary_mid: f32,
+    primary_size: SizeMetrics,
     symbols_fit: Fit,
     iosevka_fit: Fit,
-    /// Noto Emoji, parsed on first use. fontdue prepares every glyph's
-    /// outline when it parses a font, which costs about 30–40 MB for
-    /// Noto Emoji, so sessions that never show a codepoint the other fonts
-    /// lack don't pay for it. `None` inside means it failed to parse.
-    emoji: OnceCell<Option<Fallback>>,
+    emoji_fit: Fit,
+    /// System fonts found for fallback, filled in order. A face never
+    /// moves once found, so `font` can hand out references to it.
+    discovered: [OnceCell<Discovered>; MAX_DISCOVERED],
+    /// Each codepoint asked about past the bundled fonts, and the slot that
+    /// draws it, `None` included, so the OS is asked once per codepoint.
+    found: RefCell<HashMap<char, Option<u8>>>,
+    /// Font files the OS has named, and their slot (`None` when unusable).
+    files: RefCell<HashMap<FontFile, Option<u8>>>,
+    /// Asks the OS; `discovery::find` outside tests.
+    find: fn(char) -> Option<FontFile>,
 }
 
 /// How to draw a glyph in a cell: the font size to draw at and how far to
@@ -84,117 +434,137 @@ pub struct Placement {
     pub rise: f32,
 }
 
-/// Glyphs used to measure each font's advance. All fonts are monospaced.
-const PRIMARY_PROBE: char = 'M';
-const SYMBOLS_PROBE: char = '\u{f113}';
-const IOSEVKA_PROBE: char = 'M';
-const EMOJI_PROBE: char = '\u{1f600}';
-const PROBE_PX: f32 = 100.0;
-
-fn line_metrics(font: &fontdue::Font) -> Result<fontdue::LineMetrics, &'static str> {
-    font.horizontal_line_metrics(PROBE_PX)
-        .ok_or("font has no horizontal line metrics")
-}
-
-fn mid(m: fontdue::LineMetrics) -> f32 {
-    (m.ascent + m.descent) / 2.0 / PROBE_PX
-}
-
-impl Fit {
-    fn new(
-        primary: &fontdue::Font,
-        font: &fontdue::Font,
-        probe: char,
-    ) -> Result<Self, &'static str> {
-        let advance = |font: &fontdue::Font, ch| font.metrics(ch, PROBE_PX).advance_width;
-        let height = |m: fontdue::LineMetrics| m.ascent - m.descent;
-        let (p_lines, f_lines) = (line_metrics(primary)?, line_metrics(font)?);
-        Ok(Self {
-            scale: advance(primary, PRIMARY_PROBE) / advance(font, probe),
-            max_scale: height(p_lines) / height(f_lines),
-            mid: mid(f_lines),
-        })
-    }
-}
-
 impl Coverage {
     pub fn new() -> Result<Self, &'static str> {
-        let settings = fontdue::FontSettings::default();
-        let primary = fontdue::Font::from_bytes(PRIMARY_BYTES, settings)?;
-        let symbols = fontdue::Font::from_bytes(SYMBOLS_BYTES, settings)?;
-        let iosevka = fontdue::Font::from_bytes(IOSEVKA_BYTES, settings)?;
+        Self::with_discovery(discovery::find)
+    }
+
+    fn with_discovery(find: fn(char) -> Option<FontFile>) -> Result<Self, &'static str> {
+        let primary = Typeface::new(PRIMARY_BYTES, 0)?;
+        let symbols = Typeface::new(SYMBOLS_BYTES, 0)?;
+        let iosevka = Typeface::new(IOSEVKA_BYTES, 0)?;
+        let emoji = Typeface::new(EMOJI_BYTES, 0)?;
         Ok(Self {
-            primary_mid: mid(line_metrics(&primary)?),
-            symbols_fit: Fit::new(&primary, &symbols, SYMBOLS_PROBE)?,
-            iosevka_fit: Fit::new(&primary, &iosevka, IOSEVKA_PROBE)?,
-            primary: Arc::new(primary),
-            symbols: Arc::new(symbols),
-            iosevka: Arc::new(iosevka),
-            emoji: OnceCell::new(),
+            primary_mid: mid(&primary),
+            primary_size: primary.size_metrics(),
+            symbols_fit: Fit::new(&primary, &symbols, SYMBOLS_PROBE),
+            iosevka_fit: Fit::new(&primary, &iosevka, IOSEVKA_PROBE),
+            emoji_fit: Fit::new(&primary, &emoji, EMOJI_PROBE),
+            primary,
+            symbols,
+            iosevka,
+            emoji,
+            discovered: Default::default(),
+            found: RefCell::default(),
+            files: RefCell::default(),
+            find,
         })
     }
 
-    /// Noto Emoji, parsed on the first call.
-    fn emoji(&self) -> Option<&Fallback> {
-        self.emoji
-            .get_or_init(|| {
-                let parsed =
-                    fontdue::Font::from_bytes(EMOJI_BYTES, fontdue::FontSettings::default())
-                        .and_then(|font| {
-                            let fit = Fit::new(&self.primary, &font, EMOJI_PROBE)?;
-                            Ok(Fallback {
-                                font: Arc::new(font),
-                                fit,
-                            })
-                        });
-                parsed
-                    .inspect_err(|e| tracing::warn!("emoji font: {e}"))
-                    .ok()
-            })
-            .as_ref()
+    /// The discovered face for `ch`, asking the OS the first time.
+    fn discovered(&self, ch: char) -> Option<u8> {
+        if let Some(slot) = self.found.borrow().get(&ch) {
+            return *slot;
+        }
+        let slot = self.discover(ch);
+        self.found.borrow_mut().insert(ch, slot);
+        slot
     }
 
-    /// The parsed emoji font, if it has been loaded and parsed, for the
-    /// drawing fonts to share.
-    fn loaded_emoji(&self) -> Option<Arc<fontdue::Font>> {
-        self.emoji.get()?.as_ref().map(|e| e.font.clone())
+    fn discover(&self, ch: char) -> Option<u8> {
+        // A face found for another codepoint may draw this one too; Ghostty
+        // also checks its loaded faces before discovery
+        // (`CodepointResolver.getIndex`).
+        let loaded = self.discovered.iter().map_while(OnceCell::get);
+        if let Some(slot) = loaded.clone().position(|d| d.font.has_outline(ch)) {
+            return Some(slot as u8);
+        }
+        let file = (self.find)(ch)?;
+        if self.files.borrow().contains_key(&file) {
+            // Loaded already, and it lacks `ch` after all, or unusable.
+            return None;
+        }
+        let slot = self.load(&file, ch, loaded.count());
+        self.files.borrow_mut().insert(file, slot);
+        slot
+    }
+
+    /// Load `file` into slot `next` if it can draw `ch`.
+    fn load(&self, file: &FontFile, ch: char, next: usize) -> Option<u8> {
+        let path = file.path.display();
+        let Some(cell) = self.discovered.get(next) else {
+            tracing::warn!("font fallback: {MAX_DISCOVERED} fonts in use; {path} not loaded");
+            return None;
+        };
+        let bytes = map(&file.path)
+            .inspect_err(|e| tracing::warn!("font fallback: {path}: {e}"))
+            .ok()?;
+        let font = Typeface::new(bytes, file.index)
+            .inspect_err(|e| tracing::warn!("font fallback: {path} #{}: {e}", file.index))
+            .ok()?;
+        if !font.has_outline(ch) {
+            tracing::info!(
+                "font fallback: {path} #{} has no outline for U+{:04X}",
+                file.index,
+                ch as u32
+            );
+            return None;
+        }
+        let fit = Fit::normalized(&self.primary, &self.primary_size, &font);
+        tracing::info!(
+            "font fallback: U+{:04X} from {path} #{}, at {:.2}x (line cap {:.2}x)",
+            ch as u32,
+            file.index,
+            fit.scale,
+            fit.max_scale
+        );
+        let _ = cell.set(Discovered { font, fit });
+        Some(next as u8)
     }
 
     /// How to draw `ch`. Unicode spaces are blank. Otherwise the first font
-    /// in the chain that has a glyph for it (glyph index ≠ 0): primary,
-    /// then Symbols, then Iosevka, then Noto Emoji. When none has it, the
-    /// primary draws its missing-glyph box.
+    /// in the chain that has a glyph for it: primary, then Symbols, then
+    /// Iosevka, then Noto Emoji, then a system font the OS picks. When none
+    /// has it, the primary draws its missing-glyph box.
     pub fn face_for(&self, ch: char) -> Face {
-        let has = |font: &fontdue::Font| font.lookup_glyph_index(ch) != 0;
         if is_space(ch) {
             Face::Blank
-        } else if has(&self.primary) {
+        } else if self.primary.has(ch) {
             Face::Primary
-        } else if has(&self.symbols) {
+        } else if self.symbols.has(ch) {
             Face::Symbols
-        } else if has(&self.iosevka) {
+        } else if self.iosevka.has(ch) {
             Face::Iosevka
-        } else if self.emoji().is_some_and(|e| has(&e.font)) {
+        } else if self.emoji.has(ch) {
             Face::Emoji
+        } else if let Some(slot) = self.discovered(ch) {
+            Face::Discovered(slot)
         } else {
             Face::Primary
         }
     }
 
-    /// The parsed font that draws `face`, for rasterizing its glyphs.
-    /// `Blank` draws nothing, so any font will do.
-    pub fn font(&self, face: Face) -> &fontdue::Font {
+    /// The font that draws `face`. `Blank` draws nothing, so any font will
+    /// do.
+    pub fn font(&self, face: Face) -> &Typeface {
         match face {
             Face::Primary | Face::Blank => &self.primary,
             Face::Symbols => &self.symbols,
             Face::Iosevka => &self.iosevka,
-            // face_for only returns Emoji once the font has parsed.
-            Face::Emoji => self.emoji().map_or(&self.primary, |e| &e.font),
+            Face::Emoji => &self.emoji,
+            Face::Discovered(slot) => self
+                .discovered_face(slot)
+                .map_or(&self.primary, |d| &d.font),
         }
     }
 
+    fn discovered_face(&self, slot: u8) -> Option<&Discovered> {
+        self.discovered.get(usize::from(slot))?.get()
+    }
+
     /// Where to draw a glyph of `face` when the primary font is at
-    /// `font_size`. Fallback glyphs are sized to span `cells` cells, but no
+    /// `font_size`. Bundled fallback glyphs are sized to span `cells` cells,
+    /// discovered ones by Ghostty's size normalization; either way no
     /// taller than the primary's line, and centred on that line.
     pub fn place(&self, face: Face, font_size: u16, cells: u8) -> Placement {
         let fit = match face {
@@ -206,76 +576,18 @@ impl Coverage {
             }
             Face::Symbols => &self.symbols_fit,
             Face::Iosevka => &self.iosevka_fit,
-            Face::Emoji => match self.emoji() {
-                Some(e) => &e.fit,
+            Face::Emoji => &self.emoji_fit,
+            Face::Discovered(slot) => match self.discovered_face(slot) {
+                Some(d) => &d.fit,
                 None => return self.place(Face::Primary, font_size, cells),
             },
         };
-        let scale = (fit.scale * f32::from(cells)).min(fit.max_scale);
+        let per_cell = if fit.per_cell { f32::from(cells) } else { 1.0 };
+        let scale = (fit.scale * per_cell).min(fit.max_scale);
         let size = (f32::from(font_size) * scale).round().max(1.0);
         Placement {
             font_size: size as u16,
             rise: self.primary_mid * f32::from(font_size) - fit.mid * size,
-        }
-    }
-}
-
-/// The macroquad fonts used for drawing. Each one keeps a glyph atlas per
-/// size it has drawn, so a font-size change replaces the atlases (see
-/// `fresh_caches`).
-pub struct Fonts {
-    pub primary: Font,
-    pub symbols: Font,
-    pub iosevka: Font,
-    /// Built from `Coverage`'s emoji font on first use.
-    emoji: OnceCell<Font>,
-}
-
-impl Fonts {
-    /// The drawing fonts, sharing the parsed font data with `coverage`.
-    /// fontdue keeps every glyph's outline, so a second parse would cost
-    /// about 100 MB more for the bundled fonts.
-    pub fn load(coverage: &Coverage) -> Self {
-        Self {
-            primary: load_ttf_font_from_fontdue(coverage.primary.clone()),
-            symbols: load_ttf_font_from_fontdue(coverage.symbols.clone()),
-            iosevka: load_ttf_font_from_fontdue(coverage.iosevka.clone()),
-            emoji: OnceCell::new(),
-        }
-    }
-
-    /// The same fonts with empty glyph caches, for a font-size change. Like
-    /// Ghostty, which builds a new glyph atlas and cache for each font size
-    /// and frees the old ones (`src/font/SharedGridSet.zig`, `ref`/`deref`,
-    /// at a887df4 "terminal: bound page map probe lengths without tombstones
-    /// (#13294)"), this drops the old size's glyphs. Unlike reloading, it
-    /// keeps the parsed font data, which took about 0.1 s per step in
-    /// release builds and 0.8 s in debug ones.
-    pub fn fresh_caches(&self) -> Self {
-        Self {
-            primary: self.primary.with_fresh_cache(),
-            symbols: self.symbols.with_fresh_cache(),
-            iosevka: self.iosevka.with_fresh_cache(),
-            emoji: self
-                .emoji
-                .get()
-                .map(Font::with_fresh_cache)
-                .map(OnceCell::from)
-                .unwrap_or_default(),
-        }
-    }
-
-    /// The font that draws `face`. `Blank` draws nothing, so any font will do.
-    pub fn get(&self, face: Face, coverage: &Coverage) -> &Font {
-        match face {
-            Face::Primary | Face::Blank => &self.primary,
-            Face::Symbols => &self.symbols,
-            Face::Iosevka => &self.iosevka,
-            // face_for only returns Emoji once the font has parsed.
-            Face::Emoji => match coverage.loaded_emoji() {
-                Some(font) => self.emoji.get_or_init(|| load_ttf_font_from_fontdue(font)),
-                None => &self.primary,
-            },
         }
     }
 }
@@ -356,19 +668,6 @@ mod tests {
     }
 
     #[test]
-    fn emoji_font_loads_on_first_use() {
-        let c = Coverage::new().unwrap();
-        assert!(c.emoji.get().is_none());
-        // Codepoints the other fonts have don't load it.
-        for ch in ['A', '\u{f113}', '\u{2388}', ' '] {
-            c.face_for(ch);
-        }
-        assert!(c.emoji.get().is_none());
-        assert_eq!(c.face_for('\u{1f4c1}'), Face::Emoji);
-        assert!(c.loaded_emoji().is_some());
-    }
-
-    #[test]
     fn emoji_use_noto_emoji() {
         let c = Coverage::new().unwrap();
         // Textual's file-tree icons 📁 📄, ppxai's 💭 📊, and U+2638 ☸
@@ -393,5 +692,75 @@ mod tests {
     fn missing_everywhere_stays_primary() {
         let c = Coverage::new().unwrap();
         assert_eq!(c.face_for('\u{10fffd}'), Face::Primary);
+    }
+
+    #[test]
+    fn glyph_boxes_sit_on_the_baseline() {
+        let c = Coverage::new().unwrap();
+        let primary = c.font(Face::Primary);
+        // JetBrains Mono's M: 0.6 em advance, flat on the baseline, about
+        // 0.73 em tall (its cap height).
+        let (m, bitmap) = primary.rasterize('M', 100.0);
+        assert_eq!(m.advance_width, 60.0);
+        assert_eq!(m.ymin, 0);
+        assert!((70..=75).contains(&m.height), "{m:?}");
+        assert_eq!(bitmap.len(), m.width * m.height);
+        assert!(bitmap.contains(&255));
+        // A descender reaches below the baseline.
+        assert!(primary.metrics('g', 100.0).ymin < 0);
+        // A space has an advance and no pixels.
+        let (space, bitmap) = primary.rasterize(' ', 100.0);
+        assert_eq!((space.width, space.height), (0, 0));
+        assert!(space.advance_width > 0.0 && bitmap.is_empty());
+    }
+
+    static ASKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Names Iosevka's file for every codepoint, and counts the calls.
+    fn iosevka_file(_ch: char) -> Option<FontFile> {
+        ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(FontFile {
+            path: concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/fonts/IosevkaFixedSS01-Medium.ttf"
+            )
+            .into(),
+            index: 0,
+        })
+    }
+
+    #[test]
+    fn discovery_is_asked_once_per_codepoint() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = Coverage::with_discovery(iosevka_file).unwrap();
+        let before = ASKED.load(Relaxed);
+        // The file named lacks U+10FFFD: no face, and remembered as such.
+        assert_eq!(c.face_for('\u{10fffd}'), Face::Primary);
+        assert_eq!(c.face_for('\u{10fffd}'), Face::Primary);
+        assert_eq!(ASKED.load(Relaxed) - before, 1);
+        // The bundled fonts come first: ⎈ never reaches discovery.
+        assert_eq!(c.face_for('\u{2388}'), Face::Iosevka);
+        assert_eq!(ASKED.load(Relaxed) - before, 1);
+    }
+
+    /// The OS's fallback draws CJK, two cells wide by Ghostty's ideograph
+    /// width, centred on the primary's line. Needs the OS's CJK fonts.
+    #[cfg(windows)]
+    #[test]
+    fn cjk_comes_from_the_system() {
+        let c = Coverage::new().unwrap();
+        let face = c.face_for('水');
+        assert_eq!(face, Face::Discovered(0));
+        // A second Han character comes from the face already found.
+        assert_eq!(c.face_for('木'), face);
+        let font = c.font(face);
+        let place = c.place(face, 20, 2);
+        let px = f32::from(place.font_size);
+        // JetBrains Mono's estimated ideograph width is two 0.6 em cells.
+        let width = font.advance('水', px);
+        eprintln!("水 at {place:?}: advance {width} px against 24 px for two cells");
+        assert!((20.0..=24.5).contains(&width), "{width}");
+        // The cell count doesn't change a discovered face's size.
+        assert_eq!(c.place(face, 20, 1), place);
     }
 }

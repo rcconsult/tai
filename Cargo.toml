@@ -11,8 +11,13 @@ publish = false
 libghostty-vt = { version = "=0.2.2", features = ["tracing"] }
 # Keep the `audio` feature off: it needs libasound2-dev on Linux and tai has no sound.
 macroquad = { version = "0.4.14", default-features = false }
-# Glyph coverage checks for font fallback. Same version macroquad uses.
-fontdue = "0.9.5"
+# Fonts read in place and glyph outlines filled on first use (ADR 0012).
+# skrifa 0.44.0 is the version epaint 0.36 uses, so tai-gui builds it once.
+skrifa = "0.44.0"
+zeno = "0.3.3"
+# System fonts found for fallback are mapped, not read (ADR 0012). The
+# version eframe already brings in for tai-gui.
+memmap2 = "0.9.12"
 # Sixel decoding, for translating Sixel into Kitty images (ADR 0006).
 icy_sixel = "0.7.0"
 tracing = "0.1.44"
@@ -63,20 +68,33 @@ nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user
 [target.'cfg(windows)'.dependencies]
 portable-pty = "0.9.0"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_System_LibraryLoader"] }
+# DirectWrite font fallback (ADR 0012); windows-sys has no COM interfaces.
+# 0.62.2 is the version wgpu already brings in for tai-gui.
+windows = { version = "0.62.2", features = ["Win32_Graphics_DirectWrite", "Win32_Globalization"] }
+# For #[implement]: the text source DirectWrite reads (src/discovery.rs).
+windows-core = "0.62.2"
 
 # miniquad's macOS clipboard is a stub (get returns None, set does nothing),
 # so macOS uses arboard. Text only: no image support.
 [target.'cfg(target_os = "macos")'.dependencies]
 arboard = { version = "3.7.0", default-features = false }
+# Font discovery through CoreText (ADR 0012). 0.3.2 is the objc2 family
+# winit and wgpu already pull in.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFString", "CFURL"] }
+objc2-core-text = { version = "0.3.2", default-features = false, features = ["std", "CTFont", "CTFontDescriptor", "CTFontManager"] }
+
+# fontconfig for finding system fonts on Linux (ADR 0012); links
+# libfontconfig, so the build needs libfontconfig-dev.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+yeslogic-fontconfig-sys = "6.0.1"
 
 # Vendored macroquad with a clipboard fix; see vendor/macroquad/TAI-PATCHES.md.
 [patch.crates-io]
 macroquad = { path = "vendor/macroquad" }
 
-# Optimize dependencies in dev builds. fontdue parses every glyph of a
-# font eagerly (much of it in ttf-parser), and each font-size step reloads
-# all fonts: unoptimized, the three bundled fonts took ~1.1 s per step on
-# Windows, ~0.3 s with this, ~0.15 s in release (issue #2). tai's own code
-# stays unoptimized, so its rebuilds stay quick.
+# Optimize dependencies in dev builds. Font parsing and glyph rasterizing
+# live in dependencies: when tai used fontdue, a font-size step took ~1.1 s
+# on Windows unoptimized, ~0.3 s with this, ~0.15 s in release (issue #2).
+# tai's own code stays unoptimized, so its rebuilds stay quick.
 [profile.dev.package."*"]
 opt-level = 3
