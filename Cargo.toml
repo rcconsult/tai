@@ -79,6 +79,11 @@ windows-core = "0.62.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 arboard = { version = "3.7.0", default-features = false }
 
+# fontconfig for finding system fonts on Linux (ADR 0012); links
+# libfontconfig, so the build needs libfontconfig-dev.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+yeslogic-fontconfig-sys = "6.0.1"
+
 # Vendored macroquad with a clipboard fix; see vendor/macroquad/TAI-PATCHES.md.
 [patch.crates-io]
 macroquad = { path = "vendor/macroquad" }
