@@ -2967,6 +2967,7 @@ dependencies = [
  "icy_sixel",
  "libghostty-vt",
  "macroquad",
+ "memmap2",
  "nix 0.31.3",
  "portable-pty",
  "serde_json",
@@ -2975,6 +2976,8 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "ureq",
+ "windows",
+ "windows-core",
  "windows-sys 0.61.2",
  "zeno",
 ]

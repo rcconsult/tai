@@ -1254,7 +1254,10 @@ fn walk_row(
                 .chars()
                 .next()
                 .map_or(Face::Primary, |ch| coverage.face_for(ch));
-            if matches!(face, Face::Symbols | Face::Iosevka | Face::Emoji) {
+            if matches!(
+                face,
+                Face::Symbols | Face::Iosevka | Face::Emoji | Face::Discovered(_)
+            ) {
                 icons.push(Icon {
                     text: text.clone(),
                     face,
