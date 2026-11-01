@@ -7,7 +7,7 @@ can use, with where they come from and what state tai is in. Surveyed
 2026-11-01. Each source was read at the commit given; the postmortems are
 the projects' own write-ups, so check their code before porting.
 
-Licences: con-terminal and godotty are MIT, so code may be ported with
+Licences: con-terminal, wispterm and godotty are MIT, so code may be ported with
 attribution, recorded as for Ghostty ports (repo, path, commit). mightty
 has no licence: ideas only.
 
@@ -36,8 +36,8 @@ reflow separately.
 ## 2. IME: composed text and raw keys take separate paths
 
 **Source:** con-terminal `postmortem/2026-05-01-windows-linux-cjk-ime.md`
-and `postmortem/2026-05-13-ime-commit-no-repaint.md`; wispterm (MIT, at
-`196ac8e574`) `src/ime_caret.zig`.
+and `postmortem/2026-05-13-ime-commit-no-repaint.md`; wispterm
+(`xuzhougeng/wispterm`, MIT, at `196ac8e574`) `src/ime_caret.zig`.
 
 Rules for when tai-gui wires winit's IME events (ADR 0012, decision 7, and
 its trigger):
@@ -123,3 +123,30 @@ Each capture writes the rows' text, cells and colours as JSON next to the
 PNG, so a wrong screenshot can be split into a VT bug (the cells are
 wrong) or a rendering bug (the cells are right). tai's pixel comparisons
 (ADR 0008's checks, ADR 0012's step 1) compare PNGs only.
+
+## References
+
+Thanks to the authors of these projects for writing up what they found.
+Links are pinned to the commits the lessons were read at.
+
+- awesome-libghostty, the list surveyed:
+  https://github.com/Uzaaft/awesome-libghostty/tree/b09654cfc5435f554e1f4213767b67801bf397ce
+- Ghostty PR #14296, "terminal: add option to disable scrollback pull on
+  resize": https://github.com/ghostty-org/ghostty/pull/14296
+- libghostty-rs, `Terminal::set_resize_pull_scrollback`:
+  https://github.com/Uzaaft/libghostty-rs/blob/575ed6b8ceb79ffaf247ecf7e34333876b0d5be4/crates/libghostty-vt/src/terminal.rs
+- con-terminal (MIT), https://github.com/nowledge-co/con-terminal, postmortems at
+  `ce47be206176332ab28b726b48a94bfc376f2caf`:
+  - https://github.com/nowledge-co/con-terminal/blob/ce47be206176332ab28b726b48a94bfc376f2caf/postmortem/2026-09-20-conpty-resize-scrollback.md
+  - https://github.com/nowledge-co/con-terminal/blob/ce47be206176332ab28b726b48a94bfc376f2caf/postmortem/2026-05-01-windows-linux-cjk-ime.md
+  - https://github.com/nowledge-co/con-terminal/blob/ce47be206176332ab28b726b48a94bfc376f2caf/postmortem/2026-05-13-ime-commit-no-repaint.md
+  - https://github.com/nowledge-co/con-terminal/blob/ce47be206176332ab28b726b48a94bfc376f2caf/postmortem/2026-09-22-portable-grapheme-rendering.md
+  - https://github.com/nowledge-co/con-terminal/blob/ce47be206176332ab28b726b48a94bfc376f2caf/postmortem/2026-07-22-windows-cjk-font-fallback.md
+- wispterm (MIT), https://github.com/xuzhougeng/wispterm, at
+  `196ac8e5749e68999bc07b33c57fd1aa2ac7f40b`:
+  - https://github.com/xuzhougeng/wispterm/blob/196ac8e5749e68999bc07b33c57fd1aa2ac7f40b/src/ime_caret.zig
+  - https://github.com/xuzhougeng/wispterm/blob/196ac8e5749e68999bc07b33c57fd1aa2ac7f40b/src/font/fallback_cache.zig
+- godotty (MIT), https://github.com/ingur/godotty:
+  https://github.com/ingur/godotty/blob/bad2d0a9712ba12eb13f6f4b34a64497fdd1498f/src/font.rs
+- mightty (no licence; ideas only), https://github.com/frixaco/mightty:
+  https://github.com/frixaco/mightty/blob/bcfccfac708c0ca83092a85d8d9599d9e47a89bf/docs/windows-text-rendering-notes.md
