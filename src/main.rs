@@ -66,6 +66,7 @@ mod placeholders;
 #[cfg(windows)]
 #[path = "pty_windows.rs"]
 mod pty;
+mod pty_input;
 mod shortcuts;
 mod sixel;
 
@@ -2878,7 +2879,7 @@ mod pty {
         unistd::{self, Pid},
     };
 
-    use crate::Dimensions;
+    use crate::{Dimensions, pty_input::Input};
 
     type Chunk = Result<Vec<u8>, PtyError>;
 
@@ -2895,14 +2896,11 @@ mod pty {
     /// full-screen TUI at tai's frame rate. The terminal stays on the main
     /// thread: libghostty-vt's types are `!Send`.
     ///
-    /// Input goes through a writer thread too, as Ghostty's I/O thread
-    /// writes from a queue (`src/termio/Exec.zig`, `queueWrite`). Writing
-    /// from the frame loop dropped whatever didn't fit in the pty buffer,
-    /// so a big paste into a busy program arrived truncated.
+    /// Input goes through a writer thread too (`src/pty_input.rs`).
     pub struct Pty {
         fd: OwnedFd,
-        /// Input for the writer thread.
-        input: mpsc::Sender<Vec<u8>>,
+        /// The writer thread's queue.
+        input: Input,
         output: Receiver<Chunk>,
         /// A chunk wait_readable took from `output`, for the next read.
         waited: Mutex<Option<Chunk>>,
@@ -3007,11 +3005,7 @@ mod pty {
                         .name("pty-reader".into())
                         .spawn(move || read_loop(&reader, &tx))?;
 
-                    let writer = fd.try_clone()?;
-                    let (input, queued) = mpsc::channel::<Vec<u8>>();
-                    std::thread::Builder::new()
-                        .name("pty-writer".into())
-                        .spawn(move || write_loop(&writer, &queued))?;
+                    let input = Input::spawn(MasterWriter(fd.try_clone()?))?;
 
                     let pty = Self {
                         fd,
@@ -3057,14 +3051,9 @@ mod pty {
             Ok(())
         }
 
-        /// Queue input for the pty. The writer thread writes it in order at
-        /// the pace the child reads; nothing here waits on the pty.
+        /// Queue input for the pty (`src/pty_input.rs`).
         pub fn write(&self, data: &[u8]) {
-            if !data.is_empty() {
-                // A closed channel means the writer hit an error; the input
-                // is dropped.
-                _ = self.input.send(data.to_vec());
-            }
+            self.input.send(data);
         }
 
         /// Send a resize event to the pty via the TIOCSWINSZ ioctl.
@@ -3110,28 +3099,33 @@ mod pty {
         }
     }
 
-    /// The writer thread: write queued input to the (non-blocking) master in
-    /// order, waiting for room while the child isn't reading. It ends when
-    /// the Pty is dropped or a write fails (the child has gone).
-    fn write_loop(fd: &OwnedFd, queued: &Receiver<Vec<u8>>) {
-        for data in queued {
-            let mut remaining = &data[..];
-            while !remaining.is_empty() {
-                match unistd::write(fd, remaining) {
-                    Ok(len) => remaining = &remaining[len..],
+    /// The master fd for the writer thread. It's non-blocking (the reader
+    /// shares it), so a write that finds the pty buffer full waits for room
+    /// instead of failing.
+    struct MasterWriter(OwnedFd);
+
+    impl std::io::Write for MasterWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            loop {
+                match unistd::write(&self.0, buf) {
+                    Ok(len) => return Ok(len),
                     Err(Errno::EINTR) => {}
                     Err(Errno::EAGAIN) => {
                         let mut fds = [nix::libc::pollfd {
-                            fd: fd.as_raw_fd(),
+                            fd: self.0.as_raw_fd(),
                             events: nix::libc::POLLOUT,
                             revents: 0,
                         }];
                         // Errors other than EINTR show up on the next write.
                         _ = unsafe { nix::libc::poll(fds.as_mut_ptr(), 1, -1) };
                     }
-                    Err(_) => return,
+                    Err(err) => return Err(err.into()),
                 }
             }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
@@ -3139,40 +3133,37 @@ mod pty {
     mod tests {
         use std::{
             io::Read,
-            sync::mpsc,
             time::{Duration, Instant},
         };
 
         use nix::fcntl::{self, OFlag};
 
-        use super::write_loop;
+        use super::MasterWriter;
+        use crate::pty_input::Input;
 
         #[test]
-        fn queued_input_waits_for_a_slow_reader_and_arrives_whole() {
+        fn a_non_blocking_master_waits_for_room_instead_of_dropping() {
             // A non-blocking write end, like the pty master.
             let (reader, writer) = nix::unistd::pipe().unwrap();
             let flags = fcntl::fcntl(&writer, fcntl::F_GETFL).unwrap();
             let flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
             fcntl::fcntl(&writer, fcntl::F_SETFL(flags)).unwrap();
-            let (input, queued) = mpsc::channel::<Vec<u8>>();
-            let thread = std::thread::spawn(move || write_loop(&writer, &queued));
+            let input = Input::spawn(MasterWriter(writer)).unwrap();
 
-            // A big paste, far more than a pipe holds, to a child that isn't
-            // reading yet: queueing it must not wait on the pipe.
+            // Far more than the pipe holds, to a reader that starts late.
             let sent: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
             let start = Instant::now();
             for chunk in sent.chunks(4096) {
-                input.send(chunk.to_vec()).unwrap();
+                input.send(chunk);
             }
             assert!(start.elapsed() < Duration::from_millis(500));
-            drop(input);
 
-            // The child reads it later: all of it arrives, in order, where
-            // writing from the frame loop dropped what didn't fit.
+            // All of it arrives, in order, where writing from the frame loop
+            // dropped what didn't fit.
             std::thread::sleep(Duration::from_millis(200));
+            drop(input);
             let mut got = Vec::new();
             std::fs::File::from(reader).read_to_end(&mut got).unwrap();
-            thread.join().unwrap();
             assert_eq!(got.len(), sent.len());
             assert!(got == sent);
         }
