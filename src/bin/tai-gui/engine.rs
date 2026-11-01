@@ -406,7 +406,8 @@ fn exit_reason(status: std::process::ExitStatus, tail: &Mutex<VecDeque<String>>)
         .unwrap_or_default();
     let text = tail.join("\n");
     if text.contains("unrecognized arguments") && text.contains("--owned") {
-        return "this ppxai-server has no --owned flag (it comes with ppxai 1.19.5). \
+        return "this ppxai-server has no --owned flag: it needs a ppxai build from \
+                feature/v1.19.5 at 0ca511a7 or later (early 1.19.5 builds lack it). \
                 ADR 0010's plain-mode fallback isn't in the prototype"
             .into();
     }
