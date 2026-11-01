@@ -149,7 +149,7 @@ impl Typeface {
     /// Whether the font has an outline for `ch`, which tai can draw. A
     /// bitmap-only font, such as Apple Color Emoji (sbix), has glyphs but
     /// no outlines.
-    fn has_outline(&self, ch: char) -> bool {
+    pub fn has_outline(&self, ch: char) -> bool {
         self.font
             .charmap()
             .map(ch)

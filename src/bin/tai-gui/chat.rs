@@ -82,6 +82,24 @@ impl ChatFonts {
                     continue;
                 }
             };
+            // epaint panics on a font it can't parse (epaint 0.36
+            // `src/text/fonts.rs`, "Error parsing … TTF/OTF font file"), so
+            // read it with skrifa first, as epaint will, and skip a file that
+            // fails or has no outline for `ch`, as the terminal does.
+            match fonts::Typeface::new(bytes, file.index) {
+                Ok(face) if face.has_outline(ch) => {}
+                Ok(_) => {
+                    tracing::info!(
+                        "chat font fallback: {path} has no outline for U+{:04X}",
+                        ch as u32
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("chat font fallback: {path} #{}: {e}", file.index);
+                    continue;
+                }
+            }
             let mut data = egui::FontData::from_static(bytes);
             data.index = file.index;
             let fallback = |family| InsertFontFamily {
