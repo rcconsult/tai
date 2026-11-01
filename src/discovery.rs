@@ -517,7 +517,7 @@ mod tests {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+mod coretext_tests {
     use super::find;
     use skrifa::{FontRef, MetadataProvider};
 
