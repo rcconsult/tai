@@ -131,6 +131,11 @@ pub struct TerminalPane {
     /// The last frame's instances, reused while nothing changed.
     instances: Arc<Vec<Instance>>,
     built_for: Option<(Dimensions, Option<(u16, u16)>)>,
+    /// Each viewport row's instances as last built, so a frame rebuilds
+    /// only the rows that changed, as Ghostty's `rebuildRow` does
+    /// (src/renderer/generic.zig at a887df42) and the macroquad build's
+    /// cell renderer does (ADR 0008).
+    rows: Vec<RowInstances>,
     /// Typed and pasted bytes waiting to be written.
     response: Vec<u8>,
     /// Set by the pty's reader when it has woken egui, cleared by pump.
@@ -218,6 +223,7 @@ impl TerminalPane {
             atlas: GlyphAtlas::new(crate::cells::ATLAS_MAX_HEIGHT),
             instances: Arc::new(Vec::new()),
             built_for: None,
+            rows: Vec::new(),
             response: Vec::new(),
             wake_pending,
             gesture: Gesture::new()?,
@@ -481,7 +487,10 @@ impl TerminalPane {
     }
 
     /// Rebuild the instances when the screen, the pane, the cursor or the
-    /// selection changed. Returns whether it rebuilt.
+    /// selection changed. Returns whether it rebuilt. Only dirty rows and
+    /// the rows the cursor left and entered are rebuilt, unless everything
+    /// must be: a new size, a full redraw from the terminal, or a changed
+    /// selection (the dirty flags track contents, not the selection).
     fn build(&mut self, force: bool) -> Result<bool> {
         let snapshot = self.render_state.update(&self.terminal)?;
         let cursor = if snapshot.cursor_visible()? {
@@ -489,104 +498,125 @@ impl TerminalPane {
         } else {
             None
         };
+        let dirty = snapshot.dirty()?;
         let key = Some((self.dims, cursor));
-        if !force && snapshot.dirty()? == Dirty::Clean && self.built_for == key {
+        if !force && dirty == Dirty::Clean && self.built_for == key {
             return Ok(false);
         }
+        let old_cursor_row = self.built_for.and_then(|(_, c)| c).map(|(_, y)| y);
+        let full = force
+            || dirty == Dirty::Full
+            || self.built_for.is_none_or(|(dims, _)| dims != self.dims);
         self.built_for = key;
         let dims = self.dims;
         let colors = snapshot.colors()?;
-        let mut out = Vec::with_capacity(self.instances.len());
-        out.push(Instance::solid(
-            [0.0, 0.0, dims.width, dims.height],
-            rgba(colors.background),
-        ));
-
         let cursor_color = colors.cursor.unwrap_or(colors.foreground);
         let mut text = String::with_capacity(16);
-        let mut glyphs: Vec<(String, f32, f32, RgbColor, bool)> = Vec::new();
+
         let mut row_it = self.row_it.update(&snapshot)?;
         let mut y = PADDING;
         let mut row_index: u16 = 0;
         while let Some(row) = row_it.next() {
-            let mut cell_it = self.cell_it.update(row)?;
-            let mut x = PADDING;
-            let mut col: u16 = 0;
-            while let Some(cell) = cell_it.next() {
-                let graphemes = cell.graphemes_len()?;
-                let selected = cell.is_selected()?;
-                let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-                let bg = cell.bg_color()?;
-                let mut has_bg = bg.is_some();
-                let mut bg = bg.unwrap_or(colors.background);
-                let mut bold = false;
-                if graphemes > 0 && cell.has_styling()? {
-                    let style = cell.style()?;
-                    if style.inverse {
+            let index = usize::from(row_index);
+            if self.rows.len() <= index {
+                self.rows.resize_with(index + 1, RowInstances::default);
+            }
+            let cursor_row = cursor.map(|(_, cy)| cy);
+            let rebuild = full
+                || row.dirty()?
+                || old_cursor_row == Some(row_index)
+                || cursor_row == Some(row_index);
+            if rebuild {
+                let cached = &mut self.rows[index];
+                cached.bg.clear();
+                cached.text.clear();
+                let mut cell_it = self.cell_it.update(row)?;
+                let mut x = PADDING;
+                let mut col: u16 = 0;
+                while let Some(cell) = cell_it.next() {
+                    let graphemes = cell.graphemes_len()?;
+                    let selected = cell.is_selected()?;
+                    let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
+                    let bg = cell.bg_color()?;
+                    let mut has_bg = bg.is_some();
+                    let mut bg = bg.unwrap_or(colors.background);
+                    let mut bold = false;
+                    if graphemes > 0 && cell.has_styling()? {
+                        let style = cell.style()?;
+                        if style.inverse {
+                            std::mem::swap(&mut fg, &mut bg);
+                            has_bg = true;
+                        }
+                        bold = style.bold;
+                    }
+                    // Selected cells are drawn in reverse video, as in the
+                    // macroquad build (walk_row in src/main.rs).
+                    if selected {
                         std::mem::swap(&mut fg, &mut bg);
                         has_bg = true;
                     }
-                    bold = style.bold;
-                }
-                // Selected cells are drawn in reverse video, as in the
-                // macroquad build (walk_row in src/main.rs).
-                if selected {
-                    std::mem::swap(&mut fg, &mut bg);
-                    has_bg = true;
-                }
-                if cursor == Some((col, row_index)) {
-                    out.push(Instance::solid(
-                        [x, y, dims.cell_width, dims.cell_height],
-                        rgba(cursor_color),
-                    ));
-                    fg = colors.background;
-                } else if has_bg {
-                    out.push(Instance::solid(
-                        [x, y, dims.cell_width, dims.cell_height],
-                        rgba(bg),
-                    ));
-                }
-                if graphemes > 0 {
-                    cell.graphemes_utf8(&mut text)?;
-                    // VS15/VS16 have no glyph (see walk_row in src/main.rs).
-                    text.retain(|ch| !matches!(ch, '\u{fe0e}' | '\u{fe0f}'));
-                    if !text.is_empty() {
-                        glyphs.push((text.clone(), x, y, fg, bold));
+                    let cell_rect = [x, y, dims.cell_width, dims.cell_height];
+                    if cursor == Some((col, row_index)) {
+                        cached
+                            .bg
+                            .push(Instance::solid(cell_rect, rgba(cursor_color)));
+                        fg = colors.background;
+                    } else if has_bg {
+                        cached.bg.push(Instance::solid(cell_rect, rgba(bg)));
                     }
+                    if graphemes > 0 {
+                        cell.graphemes_utf8(&mut text)?;
+                        // VS15/VS16 have no glyph (see walk_row in src/main.rs).
+                        text.retain(|ch| !matches!(ch, '\u{fe0e}' | '\u{fe0f}'));
+                        let face = text
+                            .chars()
+                            .next()
+                            .map_or(Face::Primary, |ch| self.coverage.face_for(ch));
+                        if face != Face::Blank && !text.is_empty() {
+                            let place = self.coverage.place(face, dims.font_size, 1);
+                            let fg = rgba(fg);
+                            self.atlas.push_text(
+                                &mut cached.text,
+                                self.coverage.font(face),
+                                face,
+                                &text,
+                                x,
+                                y + dims.baseline - place.rise,
+                                place.font_size,
+                                dims.dpi_scale,
+                                Color::from_rgba(fg[0], fg[1], fg[2], fg[3]),
+                                bold,
+                            );
+                        }
+                    }
+                    x += dims.cell_width;
+                    col += 1;
                 }
-                x += dims.cell_width;
-                col += 1;
+                row.set_dirty(false)?;
             }
-            row.set_dirty(false)?;
             y += dims.cell_height;
             row_index += 1;
         }
+        self.rows.truncate(usize::from(row_index));
         snapshot.set_dirty(Dirty::Clean)?;
 
-        // Text after every background, so a wide glyph isn't covered by the
-        // next cell's background.
-        for (text, x, y, fg, bold) in glyphs {
-            let face = text
-                .chars()
-                .next()
-                .map_or(Face::Primary, |ch| self.coverage.face_for(ch));
-            if face == Face::Blank {
-                continue;
-            }
-            let place = self.coverage.place(face, dims.font_size, 1);
-            let fg = rgba(fg);
-            self.atlas.push_text(
-                &mut out,
-                self.coverage.font(face),
-                face,
-                &text,
-                x,
-                y + dims.baseline - place.rise,
-                place.font_size,
-                dims.dpi_scale,
-                Color::from_rgba(fg[0], fg[1], fg[2], fg[3]),
-                bold,
-            );
+        // The background, every row's cell backgrounds, then every row's
+        // text, so no background covers a glyph that overhangs its cell.
+        let total = 1 + self
+            .rows
+            .iter()
+            .map(|r| r.bg.len() + r.text.len())
+            .sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        out.push(Instance::solid(
+            [0.0, 0.0, dims.width, dims.height],
+            rgba(colors.background),
+        ));
+        for row in &self.rows {
+            out.extend_from_slice(&row.bg);
+        }
+        for row in &self.rows {
+            out.extend_from_slice(&row.text);
         }
         self.instances = Arc::new(out);
         Ok(true)
@@ -708,6 +738,14 @@ fn draw_badge(ui: &egui::Ui, rect: egui::Rect, text: &str) {
         egui::StrokeKind::Inside,
     );
     painter.galley(badge.min + pad, galley, egui::Color32::WHITE);
+}
+
+/// One viewport row's instances: cell backgrounds (and the cursor) and
+/// glyphs, kept apart so all backgrounds draw before any text.
+#[derive(Default)]
+struct RowInstances {
+    bg: Vec<Instance>,
+    text: Vec<Instance>,
 }
 
 fn rgba(c: RgbColor) -> [u8; 4] {
