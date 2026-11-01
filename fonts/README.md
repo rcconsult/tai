@@ -31,7 +31,7 @@ Iosevka is there for symbols only, so the build doesn't matter for
 letters. SS01 (a stylistic set) is used because its files are about a
 sixth the size of plain Iosevka Fixed's: 1.1 MB against 6.7 MB for
 Medium. Its character map differs from plain Iosevka Fixed in 3
-codepoints. Unhinted, because fontdue ignores hinting. Medium, to match
+codepoints. Unhinted, because tai draws outlines unhinted (ADR 0012). Medium, to match
 JetBrains Mono's weight.
 
 ## How fallback works
@@ -53,7 +53,7 @@ Noto Emoji draws emoji, such as Textual's file-tree icons 📁 📄 and
 ☸ U+2638, in one colour (the text's). It is the monochrome font Ghostty
 bundles as its last emoji fallback, after a colour emoji font. Ghostty's
 colour fallback is Apple Color Emoji on macOS and the bundled Noto Color
-Emoji elsewhere; tai has no colour glyphs yet, because fontdue only
-rasterizes outlines. VS15 and VS16 (U+FE0E, U+FE0F), which pick text or
+Emoji elsewhere; tai has no colour glyphs yet, because it only fills
+outlines. VS15 and VS16 (U+FE0E, U+FE0F), which pick text or
 emoji presentation, aren't drawn, as in Ghostty. Still missing: colour
 emoji and CJK.

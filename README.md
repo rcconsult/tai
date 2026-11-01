@@ -18,8 +18,8 @@ Always go through `scripts/cargo.sh`. On first use it fetches the Zig
 version that the pinned Ghostty needs, plus the Ghostty source, into
 `.local/`. The first build takes a few minutes.
 
-On macOS, `TAI_APPLE_GFX=metal` switches from OpenGL to Metal. It's
-experimental: it leaked GPU memory in testing.
+tai draws with OpenGL 3.2 or newer on every platform. On an older
+OpenGL it stops with an error that says what's missing.
 
 ## Shortcuts
 

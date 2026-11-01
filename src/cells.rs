@@ -24,7 +24,7 @@ use macroquad::{
     window::get_internal_gl,
 };
 
-use crate::fonts::Face;
+use crate::fonts::{Face, Typeface};
 
 /// One glyph quad: where it's drawn, in logical pixels (x, y, w, h), where
 /// it is in the atlas, in atlas pixels, and its colour.
@@ -82,8 +82,8 @@ impl GlyphAtlas {
     }
 }
 
-/// A rasterized glyph: its place in the atlas and fontdue's metrics, in
-/// physical pixels.
+/// A rasterized glyph: its place in the atlas and its metrics, in physical
+/// pixels.
 #[derive(Clone, Copy, Debug)]
 struct Glyph {
     x: u32,
@@ -152,7 +152,7 @@ impl GlyphAtlas {
     /// The glyph for `ch` at `px` physical pixels, rasterized and placed on
     /// first use. `None` for a glyph with no pixels (a space) or when the
     /// atlas is full.
-    fn glyph(&mut self, face: Face, ch: char, px: u16, font: &fontdue::Font) -> Option<Glyph> {
+    fn glyph(&mut self, face: Face, ch: char, px: u16, font: &Typeface) -> Option<Glyph> {
         if let Some(glyph) = self.glyphs.get(&(face, ch, px)) {
             return *glyph;
         }
@@ -161,7 +161,7 @@ impl GlyphAtlas {
         glyph
     }
 
-    fn place(&mut self, ch: char, px: u16, font: &fontdue::Font) -> Option<Glyph> {
+    fn place(&mut self, ch: char, px: u16, font: &Typeface) -> Option<Glyph> {
         let (metrics, bitmap) = font.rasterize(ch, f32::from(px));
         let (w, h) = (metrics.width as u32, metrics.height as u32);
         if w == 0 || h == 0 || w + 2 * GAP > ATLAS_WIDTH {
@@ -208,14 +208,15 @@ impl GlyphAtlas {
     }
 
     /// Queue `text` in `face` with its baseline at (`x`, `baseline`), laid
-    /// out as macroquad's `draw_text_ex` lays it out (no rotation, scale 1),
-    /// so both renderers put glyphs on the same pixels. `bold` draws it a
-    /// second time 1 logical pixel to the right, as tai's fake bold does.
+    /// out as macroquad's `draw_text_ex` laid it out (no rotation, scale 1),
+    /// so glyphs stay on the pixels they had before tai drew its own text.
+    /// `bold` draws it a second time 1 logical pixel to the right, as tai's
+    /// fake bold does.
     #[allow(clippy::too_many_arguments)]
     pub fn push_text(
         &mut self,
         out: &mut Vec<Instance>,
-        font: &fontdue::Font,
+        font: &Typeface,
         face: Face,
         text: &str,
         x: f32,
@@ -230,7 +231,7 @@ impl GlyphAtlas {
         let mut advance = 0.0;
         for ch in text.chars() {
             let Some(glyph) = self.glyph(face, ch, px, font) else {
-                advance += font.metrics(ch, f32::from(px)).advance_width;
+                advance += font.advance(ch, f32::from(px));
                 continue;
             };
             let (w, h) = (glyph.w as f32, glyph.h as f32);
@@ -342,8 +343,7 @@ pub struct TextPass {
 
 impl TextPass {
     /// Why not, when the context can't run it: an OpenGL without
-    /// instancing or GLSL 1.50, or a shader that didn't compile. (Metal
-    /// never gets here; there's no MSL port yet.)
+    /// instancing or GLSL 1.50, or a shader that didn't compile.
     pub fn new() -> Result<Self, String> {
         // SAFETY: macroquad's context exists for the program's lifetime once
         // macroquad::main runs, and tai uses it from the main thread only.
@@ -449,14 +449,14 @@ impl TextPass {
         })
     }
 
-    /// Draw `instances` into `pass` with `projection`, after everything
-    /// macroquad has queued so far.
+    /// Draw `instances` into `pass` (the screen when `None`) with
+    /// `projection`, after everything macroquad has queued so far.
     pub fn draw(
         &mut self,
         instances: &[Instance],
         atlas: &mut GlyphAtlas,
         projection: Mat4,
-        pass: RenderPass,
+        pass: Option<RenderPass>,
     ) {
         if instances.is_empty() {
             return;
@@ -480,7 +480,7 @@ impl TextPass {
             );
         }
         ctx.buffer_update(self.instances, BufferSource::slice(instances));
-        ctx.begin_pass(Some(pass), PassAction::Nothing);
+        ctx.begin_pass(pass, PassAction::Nothing);
         ctx.apply_pipeline(&self.pipeline);
         ctx.apply_bindings(&macroquad::miniquad::Bindings {
             vertex_buffers: vec![self.corners, self.instances],
