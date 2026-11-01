@@ -67,7 +67,7 @@ impl Input {
         if self.queued.load(Ordering::Relaxed) + data.len() > MAX_QUEUED_FOR_REPLIES {
             if !self.dropping.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
-                    "dropping replies to the child: it isn't reading its input                      ({} bytes unwritten)",
+                    "dropping replies to the child: it isn't reading its input ({} bytes unwritten)",
                     self.queued.load(Ordering::Relaxed)
                 );
             }
