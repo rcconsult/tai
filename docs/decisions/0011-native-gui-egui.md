@@ -1,7 +1,8 @@
 # ADR 0011: A Rust-native GUI on egui, with terminals as panes
 
 - **Status:** Proposed 2026-11-01. The owner agreed to try the direction;
-  a prototype decides.
+  a prototype decides. The prototype is built (branch `gui-proto`) and
+  measured; see "Prototype results". Awaiting the owner's decision.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host.
 - **Amends:** decision 3 of [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
@@ -202,6 +203,62 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
   wgpu's GL backend has to keep working as a fallback. Headless runs
   under Xvfb get only CPU Vulkan (lavapipe) or llvmpipe GL, enough for
   pixel-diff tests at CPU speed.
+
+## Prototype results (2026-11-01)
+
+`tai-gui` on branch `gui-proto` (behind the `gui` feature, so the
+macroquad build is untouched): eframe 0.36 on wgpu 30, egui_dock 0.21,
+egui_commonmark 0.25 with syntect.
+
+**What it does.** Two tab stacks, chat beside a terminal and preview
+stack. The terminal pane runs the shell on tai's own pty modules and
+draws it with `cells.rs`'s glyph atlas through a WGSL port of the text
+pass in an egui paint callback. The chat pane starts `ppxai-server
+--owned` per ADR 0010, sends a prompt to `/v1/oneshot` and renders the
+answer as Markdown; the owner got an answer from Gemini through it on
+Windows. Not in it: images, selection, mouse reporting, streaming chat,
+the preview, and ADR 0010's plain-mode fallback.
+
+**Measured** against today's macroquad `tai`, release builds. Windows:
+AMD integrated GPU, Vulkan. Linux: GTX 980 under Xvfb (no vsync), with
+`tai` on llvmpipe GL since Xvfb has no hardware GL. macOS: Intel Iris
+Pro, Metal, `WGPU_VALIDATION_INDIRECT_CALL=0`.
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Idle CPU, shell idle, `tai` → `tai-gui` | 4.4-5.3% → 0% | 479% → 0% | 4.7-4.9% → 0% |
+| Memory, `tai` → `tai-gui` | 227 → 531 MB (224 MB with `WGPU_BACKEND=gl`) | 207 → 291 MB | 160 → 162 MB |
+| Keypress to pixels, median | felt the same (owner) | 3.5 → 4.4 ms | not measured |
+| Output flood, `tai` → `tai-gui` | 7.42 → 7.50 s (100,000 lines, shell-bound) | 2.46 → 3.0 s (`seq 1 3000000`) | 12.6 → 11.4 s (`seq 1 200000`) |
+
+The engine is a separate process: about 90-100 MB.
+
+**Findings.**
+- egui's reactive repaint gives an idle `tai-gui` no frames at all,
+  once the pty's reader wakes egui only when output arrives, at most
+  once per frame. A blinking text cursor alone kept egui at about 30
+  frames a second, so text cursors don't blink.
+- Typing took two frames until the pane waited up to 4 ms for the echo
+  after writing input, as `tai`'s `ECHO_WAIT` does; that brought the
+  Linux median from 7.5 to 4.4 ms.
+- The flood gap on Linux (+22%) is per-frame work: the pane rebuilds
+  and uploads every visible row on any change, where `tai` rebuilds
+  only dirty rows (ADR 0008). That's the first thing to tune. On macOS
+  `tai-gui` was faster but used about twice the CPU (20-26% against
+  9-10%), and its ui time grew from about 0.7 to 1.1 ms over a flood.
+- Windows memory: wgpu's Vulkan backend on the AMD driver costs about
+  300 MB; the GL backend matches `tai`. DX12 isn't available on that
+  host (`DxcCreateInstance` fails), so the backend choice there needs a
+  decision.
+- The process tree ends with tai on all three: a kill-on-close job
+  object on Windows (the server starts suspended and is resumed inside
+  the job), the process group and stdin EOF on Unix, checked with
+  `kill -9` of `tai-gui` and with a one-file `--owned` build on macOS.
+- Hazards found: egui-winit turns Ctrl+C/X/V into Copy/Cut/Paste events
+  with no key event, so the terminal pane sends Ctrl+C and Ctrl+X on
+  itself; libghostty-vt 0.2.2's `encode_to_vec` can drop a key when its
+  retry reserves too little (worked around in `tai-gui`, latent in
+  `tai`); clicked links in model output open only for http and https.
 
 ## Triggers to revisit
 
