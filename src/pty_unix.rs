@@ -244,8 +244,22 @@ impl Pty {
 /// The reader thread: wait for output on the (non-blocking) master, read
 /// all of it, and queue it for the frame loop. It ends at end of stream,
 /// on an error, or when the Pty is dropped.
+///
+/// Reads are gathered into one chunk until the master has nothing more
+/// (EAGAIN) or the buffer is full. A program writing to a tty often
+/// writes a line at a time (seq does), so sending each read() on its own
+/// filled the QUEUED_CHUNKS slots with ~170-byte chunks, the reader then
+/// waited for the next frame to drain them, and flood throughput tracked
+/// the frame rate: coalescing made `seq 1 3000000` about 2x faster in tai
+/// and 3x in tai-gui on Linux (popos-tai). The bound stays QUEUED_CHUNKS
+/// full buffers, 4 MB.
 fn read_loop(fd: &OwnedFd, tx: &mpsc::SyncSender<Chunk>, wake_up: &Wake) {
     let mut buf = vec![0u8; 64 * 1024];
+    let send = |chunk: Chunk| {
+        let sent = tx.send(chunk).is_ok();
+        wake(wake_up);
+        sent
+    };
     loop {
         let mut fds = [nix::libc::pollfd {
             fd: fd.as_raw_fd(),
@@ -254,22 +268,39 @@ fn read_loop(fd: &OwnedFd, tx: &mpsc::SyncSender<Chunk>, wake_up: &Wake) {
         }];
         // Errors other than EINTR show up on the read below.
         _ = unsafe { nix::libc::poll(fds.as_mut_ptr(), 1, -1) };
+        let mut filled = 0;
         loop {
-            let chunk = match unistd::read(fd, &mut buf) {
-                Ok(len) if len > 0 => Ok(buf[..len].to_vec()),
-                Err(Errno::EAGAIN) => break,
-                Err(Errno::EINTR) => continue,
+            match unistd::read(fd, &mut buf[filled..]) {
+                Ok(len) if len > 0 => {
+                    filled += len;
+                    if filled == buf.len() {
+                        if !send(Ok(buf.clone())) {
+                            return;
+                        }
+                        filled = 0;
+                    }
+                }
+                Err(Errno::EAGAIN) => {
+                    if filled > 0 && !send(Ok(buf[..filled].to_vec())) {
+                        return;
+                    }
+                    break;
+                }
+                Err(Errno::EINTR) => {}
                 // EOF -- the child closed its side of the pty. On Linux,
                 // the slave closing often produces EIO rather than a
-                // clean EOF (read returning 0). Treat it the same.
-                Ok(_) | Err(Errno::EIO) => Err(PtyError::EndOfStream),
-                Err(err) => Err(PtyError::OtherError(err)),
-            };
-            let last = chunk.is_err();
-            let sent = tx.send(chunk).is_ok();
-            wake(wake_up);
-            if !sent || last {
-                return;
+                // clean EOF (read returning 0). Treat it the same. Output
+                // gathered before it is sent first.
+                end => {
+                    if filled > 0 && !send(Ok(buf[..filled].to_vec())) {
+                        return;
+                    }
+                    _ = send(Err(match end {
+                        Ok(_) | Err(Errno::EIO) => PtyError::EndOfStream,
+                        Err(err) => PtyError::OtherError(err),
+                    }));
+                    return;
+                }
             }
         }
     }
