@@ -368,6 +368,8 @@ async fn main() -> Result<()> {
     tracing::info!("Initialized terminal with size {cols}x{rows}");
 
     let mut stats = FrameStats::new();
+    // The selection badge's text, while there is a selection.
+    let mut selection_badge: Option<String> = None;
 
     // Each frame: handle resize → read pty → process input → render.
     loop {
@@ -395,6 +397,8 @@ async fn main() -> Result<()> {
             .selection
             .update_mouse_cursor(&terminal, dims, matches!(child, Child::Active(_)))?;
 
+        // Typing or output can move or clear the selection.
+        let mut content_changed = false;
         match child {
             Child::Active(_) => {
                 // Forward keyboard/mouse input only while the child is alive.
@@ -431,6 +435,7 @@ async fn main() -> Result<()> {
                 // Write the composed response back to the PTY,
                 // and clear it in preparation of the next frame.
                 let typed = !input.response.is_empty();
+                content_changed |= typed;
                 pty.write(&input.response);
                 input.response.clear();
                 // Give the shell a moment to echo what was just typed, so the
@@ -442,6 +447,7 @@ async fn main() -> Result<()> {
                 // Sixel images become Kitty images on the way in (ADR 0006).
                 let cell_height = cell_pixels.get().1;
                 let mut write = |bytes: &[u8]| {
+                    content_changed = true;
                     sixel.feed(bytes, cell_height, &mut |out| terminal.vt_write(out));
                 };
                 match pty.read(&mut write, frame_start + PARSE_DEADLINE) {
@@ -492,8 +498,18 @@ async fn main() -> Result<()> {
             || [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
                 .into_iter()
                 .any(|b| is_mouse_button_down(b) || is_mouse_button_released(b));
+        if mouse_active || content_changed {
+            selection_badge = selection_text(&terminal)?.map(|text| selection_summary(&text));
+            if let Some(badge) = &selection_badge {
+                // Before the frame's first glyph is queued (cache_glyphs).
+                cache_glyphs(badge, &fonts.primary, dims.font_size);
+            }
+        }
         let render_start = Instant::now();
         renderer.render_terminal(&terminal, dims, &fonts, &coverage, mouse_active)?;
+        if let Some(badge) = &selection_badge {
+            draw_selection_badge(badge, dims, &fonts.primary);
+        }
         let render_end = Instant::now();
         next_frame().await;
         if let Some(stats) = stats.as_mut() {
@@ -571,20 +587,55 @@ fn apply_dims(
     Ok(())
 }
 
-/// Copy the selection to the clipboard as plain text, the way Ghostty does:
-/// soft-wrapped lines joined and trailing blanks trimmed. Does nothing
+/// The selection as Copy puts it on the clipboard, the way Ghostty does:
+/// plain text, soft-wrapped lines joined, trailing blanks trimmed. `None`
 /// without a selection.
-fn copy_selection(terminal: &Terminal<'_, '_>) -> Result<()> {
+fn selection_text(terminal: &Terminal<'_, '_>) -> Result<Option<String>> {
     let options = FormatOptions::new()
         .with_emit_format(Format::Plain)
         .with_unwrap(true)
         .with_trim(true);
-    if let Some(text) = terminal.format_selection_alloc(None, options)?
-        && !text.is_empty()
-    {
-        clipboard::set(&String::from_utf8_lossy(&text));
+    Ok(terminal
+        .format_selection_alloc(None, options)?
+        .filter(|text| !text.is_empty())
+        .map(|text| String::from_utf8_lossy(&text).into_owned()))
+}
+
+/// Copy the selection to the clipboard. Does nothing without a selection.
+fn copy_selection(terminal: &Terminal<'_, '_>) -> Result<()> {
+    if let Some(text) = selection_text(terminal)? {
+        clipboard::set(&text);
     }
     Ok(())
+}
+
+/// The selection badge's text: lines and characters of what Copy would put
+/// on the clipboard. Lines are logical (a soft-wrapped line counts once) and
+/// characters are grapheme clusters (👨‍👩‍👧 is one), line breaks included. ASCII
+/// only, so drawing it never adds a glyph to the font atlas mid-frame.
+fn selection_summary(text: &str) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let lines = text.lines().count().max(1);
+    let chars = text.graphemes(true).count();
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    format!("{}, {}", plural(lines, "line"), plural(chars, "char"))
+}
+
+/// Draw the selection badge in the bottom-right corner of the window, over
+/// the terminal.
+fn draw_selection_badge(text: &str, dims: Dimensions, font: &Font) {
+    let size = measure_text(text, Some(font), dims.font_size, 1.0);
+    let pad = dims.cell_width;
+    let (w, h) = (size.width + 2.0 * pad, dims.cell_height * 1.2);
+    let (x, y) = (
+        dims.window_width - w - PADDING,
+        dims.window_height - h - PADDING,
+    );
+    draw_rectangle(x, y, w, h, color_u8!(40, 40, 40, 230));
+    draw_rectangle_lines(x, y, w, h, 1.0, color_u8!(120, 120, 120, 255));
+    // Centre the text: offset_y is the distance from its top to its baseline.
+    let baseline = y + (h - size.height) / 2.0 + size.offset_y;
+    draw_glyph(text, x + pad, baseline, font, dims.font_size, WHITE, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -3244,6 +3295,21 @@ mod tests {
             baseline: 0.0,
             dpi_scale,
         }
+    }
+
+    #[test]
+    fn selection_summary_counts_lines_and_graphemes() {
+        use super::selection_summary;
+        assert_eq!(selection_summary("ls"), "1 line, 2 chars");
+        // Lines are what Copy gives: three lines, line breaks counted.
+        assert_eq!(selection_summary("a\nbc\nd"), "3 lines, 6 chars");
+        // A family emoji is one character, not five code points.
+        assert_eq!(
+            selection_summary("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"),
+            "1 line, 1 char"
+        );
+        // Text from a Windows program may end lines with CR LF: one break.
+        assert_eq!(selection_summary("a\r\nb"), "2 lines, 3 chars");
     }
 
     #[test]
