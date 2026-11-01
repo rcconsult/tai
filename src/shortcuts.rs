@@ -114,8 +114,13 @@ impl Held {
 /// among them, which defuses an embedded `ESC[201~`) with spaces, and
 /// either wraps the text in bracketed-paste markers or turns newlines
 /// into carriage returns.
+///
+/// Windows' clipboard ends lines with CR LF, and the encoder turns each LF
+/// into CR, so CR LF became two Enters. Windows Terminal sends one CR for a
+/// CR LF (`src/types/utils.cpp`, `FilterStringForPaste`, at
+/// microsoft/terminal 703ef7f969), so CR LF becomes LF first.
 pub fn encode_paste(text: &str, bracketed: bool) -> libghostty_vt::error::Result<Vec<u8>> {
-    let mut data = text.as_bytes().to_vec();
+    let mut data = text.replace("\r\n", "\n").into_bytes();
     // Room for the input plus the two 6-byte bracketed-paste markers.
     let mut buf = vec![0u8; data.len() + 12];
     let len = paste::encode(&mut data, bracketed, &mut buf)?;
@@ -260,6 +265,15 @@ mod tests {
     #[test]
     fn paste_unbracketed_turns_newlines_into_returns() {
         assert_eq!(encode_paste("ls\npwd\n", false).unwrap(), b"ls\rpwd\r");
+    }
+
+    #[test]
+    fn paste_from_a_windows_clipboard_sends_one_return_per_line() {
+        assert_eq!(encode_paste("ls\r\npwd\r\n", false).unwrap(), b"ls\rpwd\r");
+        assert_eq!(
+            encode_paste("a\r\nb", true).unwrap(),
+            b"\x1b[200~a\nb\x1b[201~"
+        );
     }
 
     #[test]
