@@ -214,3 +214,57 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
   needed on the macOS host.
 - A Rust code-editor widget matures enough to make an in-window editor
   worthwhile.
+
+## Reference: runs spawned from a chat session
+
+Not a decision yet. It records how ppxai's web app handles oneshot and
+task runs started from a chat session, as tai's starting point. The
+details are to be settled with the ppxai session in an RFC, because the
+routes involved are ppxai's unsealed `/v1/agent/*` and
+`/sessions/merge-run-result`.
+
+Read in ppxai `feature/v1.19.5` at `b3433545`
+(`ppxai/web/shared/agent-run-controller.js`,
+`components/views/agent-run-view.js`, `task-run-view.js`,
+`ppxai/server/routes/sessions.py`):
+
+- **Where progress shows:** a run started from chat (`/agentrun` for
+  the tool-free `POST /v1/agent/run`, `/task` for `POST /v1/agent/task`)
+  renders in its own right-panel view, one per run id, so the chat prompt
+  stays usable while it runs.
+- **What the views show:**
+  - **Oneshot run:** a status chip and the result.
+  - **Task run:** a meta bar (provider and model, tool and egress
+    grants, budget), a live event log (`tool_call`, `tool_denied`,
+    `network_*`, `spawn_*`), Cancel while it runs, and a consent card
+    while it's parked in `waiting`, answered through
+    `POST .../respond`.
+- **How a result reaches the session:** it follows the server's
+  `execution.collect` setting.
+  - **`yes` (the default):** a Collect button.
+  - **`auto`:** it merges on completion.
+  - **`no`:** collecting is disabled.
+
+  Merging posts `POST /sessions/merge-run-result`, and the result text
+  enters the conversation as-is, for the model's next turn, at most
+  once per run.
+- **Sub-agents:** a task can start child runs (`spawn_subagent`,
+  `ppxai/engine/tools/agent_spawn.py`).
+- **Records:** run data stays in `~/.ppxai/runs/<id>/`, and a resume
+  route exists.
+
+tai's intended shape, the same flow natively:
+- **In the chat:** a compact card per run, with status, consent buttons
+  and "Open".
+- **In the session's tab stack (decision 6):** a tab per run, with
+  child runs nested under their parent.
+- **Collect:** follows `execution.collect`.
+- **Attention:** a run waiting for consent marks its card, its tab and
+  the workspace tab.
+
+Questions for the RFC:
+- whether tai may rely on these routes before `/v1/agent/*` is sealed;
+- how a session lists the runs it started, so cards survive a restart;
+- whether runs started by the model mid-chat are announced on the
+  `/chat` stream;
+- what a run waiting for consent looks like when tai isn't watching it.
