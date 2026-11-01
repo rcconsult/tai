@@ -37,7 +37,7 @@ keyword counts in `app.js`, and mapped to Rust:
 
 | Web app feature (what it uses) | In Rust | Verdict |
 |---|---|---|
-| Chat stream with Markdown and code highlighting (`marked`, `highlight.js`) | `egui_commonmark`, `syntect` | yes |
+| Chat stream with Markdown and code highlighting (`marked`, `highlight.js`, `DOMPurify`) | `egui_commonmark`, `syntect`. Raw HTML in Markdown isn't rendered, which replaces the sanitiser. | yes |
 | Consent dialogs, tooltips | egui windows | yes |
 | Slash-command autocomplete, command roster | text box and popup | yes |
 | Attachments: drag and drop, upload, inline images | dropped files from the windowing layer, the `image` crate | yes |
@@ -46,11 +46,16 @@ keyword counts in `app.js`, and mapped to Rust:
 | Split panes, tabs, the right-hand panel | `egui_dock` or `egui_tiles` | yes |
 | CSV and XLSX tables; JSON, YAML, TOML and HCL trees (SheetJS, js-yaml) | `calamine`, `serde_json`, `serde_yaml`, `toml`, `hcl-rs`, table widgets | yes |
 | Markdown and image file views | as for chat | yes |
-| Agent and task run views (event streams) | lists and logs over SSE | yes |
+| Agent and task run views (event streams; SSE read from `fetch()` bodies of POSTs, not `EventSource`) | lists and logs; the client POSTs and parses SSE itself | yes |
 | Terminal view (xterm.js on a server-side PTY over a WebSocket) | tai's own libghostty-vt panes, local, and SSH in a pane | yes, natively |
-| PowerPoint (the server renders each slide to PNG with LibreOffice) | the PNGs | yes |
+| Remote ppxai servers (`ssh-launcher-view.js`, ppxai ADR 0013's hub: launch and attach to `ppxai-server` on remote hosts over SSH) | an `ssh` child process, and the ADR 0010 client on the forwarded endpoint | yes, a feature of its own |
+| PowerPoint (the server renders each slide to PNG with LibreOffice; without it, per-slide text) | the PNGs, or the text | yes |
 | Code editor (CodeMirror 6, 30 languages, edit and save) | weak in Rust GUI crates beyond viewing and light edits | see decision 3 |
 | PDF (the browser's `<embed>`); Word (the server converts it to PDF) | needs a PDF library: `pdfium-render` bundles Google's C++ library, and MuPDF is AGPL | see decision 4 |
+
+Neither Mermaid nor KaTeX is used, so there's nothing more to port for
+diagrams or maths. The Linux session checked this table against the files
+at `b3433545`.
 
 The server already serves `GET /files/preview?path=…&slide=N` (PNG per
 PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
@@ -109,6 +114,17 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
   scrolling, and rich text styling takes work.
 - Kitty and Sixel images inside terminal panes keep working through the
   cell renderer, but the native UI never uses them.
+- Linux is new ground in two ways: Wayland-native windows (miniquad runs
+  X11 or XWayland only), and IME through winit (XIM on X11, text-input-v3
+  on Wayland), which egui must have wired. The prototype tests dead keys
+  and an IBus CJK engine, and clipboard copy-then-exit, on X11 and
+  Wayland. On Wayland, `arboard` needs the data-control protocol, which
+  GNOME's Mutter lacks, so it falls back through XWayland.
+- wgpu picks Vulkan where it can. Older GPUs may stop getting new
+  drivers (the Linux host's Maxwell card is on NVIDIA's 580 branch), so
+  wgpu's GL backend has to keep working as a fallback. Headless runs
+  under Xvfb get only CPU Vulkan (lavapipe) or llvmpipe GL, enough for
+  pixel-diff tests at CPU speed.
 
 ## Triggers to revisit
 
