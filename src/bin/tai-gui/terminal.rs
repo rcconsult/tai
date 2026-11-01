@@ -128,11 +128,14 @@ pub struct TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(coverage: Coverage, dpi_scale: f32) -> Result<Self> {
+    pub fn new(coverage: Coverage, ctx: egui::Context) -> Result<Self> {
+        let dpi_scale = ctx.pixels_per_point();
         let font_size = shortcuts::DEFAULT_FONT_SIZE;
         let dims = Dimensions::new(&coverage, font_size, dpi_scale, egui::vec2(800.0, 600.0));
         let (cols, rows) = dims.grid_size();
         let (pty, child) = Pty::new(dims)?;
+        // egui sleeps until something happens; output is something.
+        pty.wake_on_output(move || ctx.request_repaint());
         let pty = Rc::new(pty);
         let grid_size = Rc::new(Cell::new((cols, rows)));
         let cell_pixels = Rc::new(Cell::new(dims.cell_pixels()));

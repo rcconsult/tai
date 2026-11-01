@@ -34,6 +34,17 @@ use crate::{Dimensions, pty_input::Input};
 
 type Chunk = std::io::Result<Vec<u8>>;
 
+/// The reader thread's wake-up call, set after the thread starts.
+type Wake = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
+
+fn wake(wake: &Wake) {
+    if let Ok(w) = wake.lock()
+        && let Some(f) = w.as_ref()
+    {
+        f();
+    }
+}
+
 /// Handle to a pseudo console.
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
@@ -43,6 +54,8 @@ pub struct Pty {
     /// A chunk wait_readable took from `output`, for the next read.
     waited: Mutex<Option<Chunk>>,
     exit: Arc<OnceLock<ExitStatus>>,
+    /// Called by the reader thread after it queues output (tai-gui).
+    wake: Wake,
 }
 
 impl Pty {
@@ -94,6 +107,8 @@ impl Pty {
         let input = Input::spawn(writer)?;
 
         let (tx, output) = mpsc::channel::<Chunk>();
+        let wake: Wake = Arc::default();
+        let reader_wake = Arc::clone(&wake);
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
@@ -103,6 +118,7 @@ impl Pty {
                         if tx.send(Ok(buf[..len].to_vec())).is_err() {
                             break;
                         }
+                        self::wake(&reader_wake);
                     }
                     Err(e) => {
                         _ = tx.send(Err(e));
@@ -110,6 +126,8 @@ impl Pty {
                     }
                 }
             }
+            // The end of output is news too: the child has gone.
+            self::wake(&reader_wake);
         });
 
         let exit = Arc::new(OnceLock::new());
@@ -127,6 +145,7 @@ impl Pty {
             output,
             waited: Mutex::new(None),
             exit: Arc::clone(&exit),
+            wake,
         };
         Ok((pty, Child::Active(Handle { killer, exit })))
     }
@@ -170,6 +189,15 @@ impl Pty {
             Ok(chunk) => *waited = Some(chunk),
             // read() reports a closed channel.
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+        }
+    }
+
+    /// Call `wake` from the reader thread whenever output arrives or ends,
+    /// so a UI that sleeps until something happens (tai-gui) wakes for it.
+    #[allow(dead_code)]
+    pub fn wake_on_output(&self, wake: impl Fn() + Send + 'static) {
+        if let Ok(mut w) = self.wake.lock() {
+            *w = Some(Box::new(wake));
         }
     }
 

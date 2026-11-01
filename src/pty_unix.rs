@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        Mutex,
+        Arc, Mutex,
         mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
     },
     time::{Duration, Instant},
@@ -25,6 +25,17 @@ use nix::{
 use crate::{Dimensions, pty_input::Input};
 
 type Chunk = Result<Vec<u8>, PtyError>;
+
+/// The reader thread's wake-up call, set after the thread starts.
+type Wake = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
+
+fn wake(wake: &Wake) {
+    if let Ok(w) = wake.lock()
+        && let Some(f) = w.as_ref()
+    {
+        f();
+    }
+}
 
 /// Chunks the reader thread may queue before it stops reading, which
 /// makes a flooding child wait instead of tai's memory growing.
@@ -47,6 +58,8 @@ pub struct Pty {
     output: Receiver<Chunk>,
     /// A chunk wait_readable took from `output`, for the next read.
     waited: Mutex<Option<Chunk>>,
+    /// Called by the reader thread after it queues output (tai-gui).
+    wake: Wake,
 }
 
 impl Pty {
@@ -144,9 +157,11 @@ impl Pty {
 
                 let reader = fd.try_clone()?;
                 let (tx, output) = mpsc::sync_channel::<Chunk>(QUEUED_CHUNKS);
+                let wake: Wake = Arc::default();
+                let reader_wake = Arc::clone(&wake);
                 std::thread::Builder::new()
                     .name("pty-reader".into())
-                    .spawn(move || read_loop(&reader, &tx))?;
+                    .spawn(move || read_loop(&reader, &tx, &reader_wake))?;
 
                 let input = Input::spawn(MasterWriter(fd.try_clone()?))?;
 
@@ -155,6 +170,7 @@ impl Pty {
                     input,
                     output,
                     waited: Mutex::new(None),
+                    wake,
                 };
                 Ok((pty, Child::Active(child)))
             }
@@ -194,6 +210,15 @@ impl Pty {
         Ok(())
     }
 
+    /// Call `wake` from the reader thread whenever output arrives or ends,
+    /// so a UI that sleeps until something happens (tai-gui) wakes for it.
+    #[allow(dead_code)]
+    pub fn wake_on_output(&self, wake: impl Fn() + Send + 'static) {
+        if let Ok(mut w) = self.wake.lock() {
+            *w = Some(Box::new(wake));
+        }
+    }
+
     /// Queue what the user typed or pasted (`src/pty_input.rs`).
     pub fn write(&self, data: &[u8]) {
         self.input.send(data);
@@ -219,7 +244,7 @@ impl Pty {
 /// The reader thread: wait for output on the (non-blocking) master, read
 /// all of it, and queue it for the frame loop. It ends at end of stream,
 /// on an error, or when the Pty is dropped.
-fn read_loop(fd: &OwnedFd, tx: &mpsc::SyncSender<Chunk>) {
+fn read_loop(fd: &OwnedFd, tx: &mpsc::SyncSender<Chunk>, wake_up: &Wake) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let mut fds = [nix::libc::pollfd {
@@ -241,7 +266,9 @@ fn read_loop(fd: &OwnedFd, tx: &mpsc::SyncSender<Chunk>) {
                 Err(err) => Err(PtyError::OtherError(err)),
             };
             let last = chunk.is_err();
-            if tx.send(chunk).is_err() || last {
+            let sent = tx.send(chunk).is_ok();
+            wake(wake_up);
+            if !sent || last {
                 return;
             }
         }

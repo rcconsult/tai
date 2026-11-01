@@ -126,7 +126,54 @@ impl TabViewer for Panes<'_> {
     }
 }
 
+/// Frames per second and what asked for them, logged when
+/// `TAI_FRAME_STATS=1`, for ADR 0011's measurements.
+struct FrameStats {
+    since: std::time::Instant,
+    frames: u32,
+    busy: std::time::Duration,
+    causes: std::collections::BTreeMap<String, u32>,
+}
+
+impl FrameStats {
+    fn new() -> Option<Self> {
+        (std::env::var("TAI_FRAME_STATS").as_deref() == Ok("1")).then(|| Self {
+            since: std::time::Instant::now(),
+            frames: 0,
+            busy: std::time::Duration::ZERO,
+            causes: Default::default(),
+        })
+    }
+
+    fn record(&mut self, ctx: &egui::Context, busy: std::time::Duration) {
+        self.frames += 1;
+        self.busy += busy;
+        for cause in ctx.repaint_causes() {
+            *self
+                .causes
+                .entry(format!("{}:{}", cause.file, cause.line))
+                .or_default() += 1;
+        }
+        if self.since.elapsed() >= std::time::Duration::from_secs(1) {
+            tracing::info!(
+                "frames: {} in {:.2} s, ui time {:.1} ms/frame; repaint causes: {:?}",
+                self.frames,
+                self.since.elapsed().as_secs_f32(),
+                self.busy.as_secs_f32() * 1000.0 / self.frames as f32,
+                self.causes
+            );
+            *self = Self {
+                since: std::time::Instant::now(),
+                frames: 0,
+                busy: std::time::Duration::ZERO,
+                causes: Default::default(),
+            };
+        }
+    }
+}
+
 struct App {
+    stats: Option<FrameStats>,
     dock: DockState<Tab>,
     terminal: Option<TerminalPane>,
     chat: chat::ChatPane,
@@ -135,14 +182,14 @@ struct App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let started = std::time::Instant::now();
         // Read the shell's output even while its tab is hidden.
         if let Some(terminal) = &mut self.terminal {
-            terminal.pump();
-            // The pty has no waker into egui yet, so poll it; step 5
-            // measures what that costs.
-            if !terminal.exited() {
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(8));
+            // The pty's reader wakes egui when output arrives. A frame
+            // reads only so much of it (terminal.rs, PARSE_BUDGET), so
+            // after a read, come back for the rest.
+            if terminal.pump() {
+                ui.ctx().request_repaint();
             }
         }
         let style = Style::from_egui(ui.style().as_ref());
@@ -157,6 +204,9 @@ impl eframe::App for App {
                     engine: &self.engine,
                 },
             );
+        if let Some(stats) = &mut self.stats {
+            stats.record(ui.ctx(), started.elapsed());
+        }
     }
 
     fn on_exit(&mut self) {
@@ -207,13 +257,14 @@ fn main() -> eframe::Result {
             }
             let terminal = fonts::Coverage::new()
                 .map_err(Into::into)
-                .and_then(|coverage| TerminalPane::new(coverage, cc.egui_ctx.pixels_per_point()))
+                .and_then(|coverage| TerminalPane::new(coverage, cc.egui_ctx.clone()))
                 .map_err(|e| tracing::error!("the terminal didn't start: {e}"))
                 .ok();
             Ok(Box::new(App {
                 dock: initial_layout(),
                 terminal,
                 chat: chat::ChatPane::new(),
+                stats: FrameStats::new(),
                 engine: engine::Engine::start(cc.egui_ctx.clone()),
             }))
         }),
