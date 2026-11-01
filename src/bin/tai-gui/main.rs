@@ -170,7 +170,7 @@ fn main() -> eframe::Result {
         setup.power_preference = eframe::wgpu::PowerPreference::from_env()
             .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
     }
-    eframe::run_native(
+    let result = eframe::run_native(
         "tai",
         options,
         Box::new(|cc| {
@@ -196,7 +196,19 @@ fn main() -> eframe::Result {
                 terminal,
             }))
         }),
-    )
+    );
+    // ADR 0011 decision 3: name the opt-out when the GPU device didn't
+    // start. wgpu's indirect-draw validation crashes the shader compiler
+    // on some Intel Macs (Iris Pro, macOS 12), and the device is lost.
+    if let Err(eframe::Error::Wgpu(e)) = &result
+        && std::env::var("WGPU_VALIDATION_INDIRECT_CALL").as_deref() != Ok("0")
+    {
+        tracing::error!(
+            "the GPU device didn't start ({e}). If the log above shows a shader \
+             compiler error, try again with WGPU_VALIDATION_INDIRECT_CALL=0"
+        );
+    }
+    result
 }
 
 #[cfg(test)]
