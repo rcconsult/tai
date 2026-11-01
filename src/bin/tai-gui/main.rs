@@ -2,7 +2,8 @@
 //!
 //! One eframe window on wgpu with two tab stacks (egui_dock): chat beside a
 //! terminal and preview stack. The terminal is a libghostty-vt pane on
-//! tai's pty (step 2); chat and preview are placeholders for later steps. Build and run with
+//! tai's pty (step 2); chat sends one-shot prompts to the engine (steps 3-4);
+//! preview is a placeholder. Build and run with
 //! `scripts/cargo.sh run --features gui --bin tai-gui`.
 //!
 //! wgpu's validation: egui-wgpu creates the instance with
@@ -41,6 +42,7 @@ mod pty_input;
 #[allow(dead_code)]
 mod shortcuts;
 
+mod chat;
 mod engine;
 mod gpu;
 mod terminal;
@@ -77,6 +79,7 @@ fn initial_layout() -> DockState<Tab> {
 
 struct Panes<'a> {
     terminal: Option<&'a mut TerminalPane>,
+    chat: &'a mut chat::ChatPane,
     engine: &'a engine::Engine,
 }
 
@@ -97,7 +100,7 @@ impl TabViewer for Panes<'_> {
             (Tab::Terminal, None) => {
                 ui.label("The terminal didn't start; see the log.");
             }
-            (Tab::Chat, _) => engine_status(ui, self.engine),
+            (Tab::Chat, _) => self.chat.ui(ui, self.engine),
             (tab, _) => {
                 ui.label(format!("{} pane: not built yet.", tab.title()));
             }
@@ -109,8 +112,9 @@ impl TabViewer for Panes<'_> {
         *tab != Tab::Terminal
     }
 
+    // The terminal and the chat pane scroll themselves.
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
-        if *tab == Tab::Terminal {
+        if matches!(tab, Tab::Terminal | Tab::Chat) {
             [false, false]
         } else {
             [true, true]
@@ -122,33 +126,10 @@ impl TabViewer for Panes<'_> {
     }
 }
 
-/// The engine's state, until the chat pane (step 4) takes over the tab.
-fn engine_status(ui: &mut egui::Ui, engine: &engine::Engine) {
-    let Ok(state) = engine.state.lock() else {
-        return;
-    };
-    match &*state {
-        engine::State::Starting(step) => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("Engine: {step}…"));
-            });
-        }
-        engine::State::Ready(link) => {
-            ui.label(format!(
-                "Engine: ppxai-server {} ready at {} (pid {}).",
-                link.version, link.base, link.pid
-            ));
-        }
-        engine::State::Failed(why) => {
-            ui.colored_label(ui.visuals().error_fg_color, format!("Engine: {why}"));
-        }
-    }
-}
-
 struct App {
     dock: DockState<Tab>,
     terminal: Option<TerminalPane>,
+    chat: chat::ChatPane,
     engine: engine::Engine,
 }
 
@@ -172,6 +153,7 @@ impl eframe::App for App {
                 ui,
                 &mut Panes {
                     terminal: self.terminal.as_mut(),
+                    chat: &mut self.chat,
                     engine: &self.engine,
                 },
             );
@@ -231,6 +213,7 @@ fn main() -> eframe::Result {
             Ok(Box::new(App {
                 dock: initial_layout(),
                 terminal,
+                chat: chat::ChatPane::new(),
                 engine: engine::Engine::start(cc.egui_ctx.clone()),
             }))
         }),

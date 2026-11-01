@@ -44,6 +44,7 @@ pub enum State {
 }
 
 /// A ready server: where it is and how to reach it.
+#[derive(Clone)]
 pub struct Link {
     pub base: String,
     pub version: String,
@@ -61,6 +62,32 @@ impl Link {
             .get(format!("{}{path}", self.base))
             .header("Authorization", format!("Bearer {}", self.token))
             .call()
+            .map_err(|e| e.to_string())?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| e.to_string())?;
+        Ok((status, body))
+    }
+
+    /// POST `body` as JSON to `path` with tai's bearer, waiting up to
+    /// `timeout` for the answer: the status and the body.
+    pub fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        timeout: Duration,
+    ) -> Result<(u16, String), String> {
+        let mut response = self
+            .agent
+            .post(format!("{}{path}", self.base))
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
             .map_err(|e| e.to_string())?;
         let status = response.status().as_u16();
         let body = response
