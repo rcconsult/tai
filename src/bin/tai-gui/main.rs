@@ -72,6 +72,7 @@ impl eframe::App for App {
         let style = Style::from_egui(ui.style().as_ref());
         DockArea::new(&mut self.dock)
             .style(style)
+            .show_leaf_close_all_buttons(false)
             .show_inside(ui, &mut Panes);
     }
 }
