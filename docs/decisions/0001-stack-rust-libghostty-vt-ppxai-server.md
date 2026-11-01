@@ -2,6 +2,7 @@
 
 - **Status:** Accepted 2026-10-24 (owner). Nothing is implemented yet.
 - **Deciders:** owner. Two Claude sessions, one on each dev host (Linux x86_64, macOS 12 Intel), wrote the options and reviewed each other's work.
+- **Superseded in part by:** [ADR 0010](0010-engine-link-loopback-tcp.md) (decision 4: loopback TCP replaces `--uds --announce`).
 - **Related:** ppxai `docs/api-gateway.md` (API stability tiers), ppxai ADR 0003 (agent platform, `/v1/agent/*`), ppxai ADR 0016 (cheap engine import).
 
 ## Context

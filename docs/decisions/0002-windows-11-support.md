@@ -6,6 +6,9 @@
   its open questions below still hold.
 - **Deciders:** owner. Written by the Claude session on the Windows dev host
   (Windows 11 Pro x86_64), with input from the Linux and macOS sessions.
+- **Superseded in part by:** [ADR 0010](0010-engine-link-loopback-tcp.md)
+  (decision 7's condition that its two open gaps close first; they are
+  accepted risks until ppxai's strict mode ships).
 - **Related:** [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md),
   which this amends for Windows (decision 4 and the build), without changing
   it for Linux or macOS.
