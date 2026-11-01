@@ -16,8 +16,9 @@ Status is summarised; the record itself is authoritative.
 | [0008](0008-gpu-cell-renderer.md) | Draw the grid from GPU cell buffers, as Ghostty does, in milestone (a) | ✅ Accepted 2026-10-25; merged 2026-10-25 |
 | [0009](0009-sixel-not-advertised.md) | Translate Sixel as xterm draws it, but don't advertise it unless `TAI_SIXEL=1` | ✅ Accepted 2026-10-26 |
 | [0010](0010-engine-link-loopback-tcp.md) | Reach ppxai-server over loopback TCP on every platform, then ppxai's strict mode | ✅ Accepted 2026-11-01 |
+| [0011](0011-native-gui-egui.md) | A Rust-native GUI on egui, with terminals as panes | 📝 Proposed 2026-11-01; prototype decides |
 
-Numbering is sequential. The next record is `0011`.
+Numbering is sequential. The next record is `0012`.
 
 ## About these records
 
