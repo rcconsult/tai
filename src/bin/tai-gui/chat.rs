@@ -120,6 +120,19 @@ impl ChatPane {
                     }
                 });
         });
+
+        // Answers are model output, and a Markdown link can name any
+        // scheme: file:, or a Windows protocol handler. Open only web links;
+        // the hover still shows the full target.
+        ui.ctx().output_mut(|o| {
+            o.commands.retain(|command| match command {
+                egui::OutputCommand::OpenUrl(open) if !is_web_link(&open.url) => {
+                    tracing::warn!("chat: not opening a non-web link: {}", open.url);
+                    false
+                }
+                _ => true,
+            })
+        });
     }
 
     fn status_line(&self, ui: &mut egui::Ui, engine: &Engine) {
@@ -200,6 +213,12 @@ fn answer(body: &str) -> Entry {
     Entry::Answer { text, meta }
 }
 
+/// Whether a link is http or https, the only schemes the chat opens.
+fn is_web_link(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
 /// FastAPI's `{"detail": ...}`, or the body as it is.
 fn detail(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
@@ -214,7 +233,17 @@ fn detail(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, answer, detail};
+    use super::{Entry, answer, detail, is_web_link};
+
+    #[test]
+    fn only_web_links_open() {
+        assert!(is_web_link("https://example.com/a"));
+        assert!(is_web_link("HTTP://example.com"));
+        assert!(!is_web_link("file:///C:/Windows/System32/calc.exe"));
+        assert!(!is_web_link("ms-msdt:/id PCWDiagnostic"));
+        assert!(!is_web_link("javascript:alert(1)"));
+        assert!(!is_web_link("httpx://example.com"));
+    }
 
     #[test]
     fn an_answer_names_provider_model_and_tokens() {
