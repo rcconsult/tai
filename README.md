@@ -18,6 +18,10 @@ Always go through `scripts/cargo.sh`. On first use it fetches the Zig
 version that the pinned Ghostty needs, plus the Ghostty source, into
 `.local/`. The first build takes a few minutes.
 
+On Linux, the build needs fontconfig's headers (`libfontconfig-dev` on
+Debian and Ubuntu, `fontconfig-devel` on Fedora) and `pkg-config`: tai asks
+fontconfig for fonts it doesn't bundle, such as CJK.
+
 tai draws with OpenGL 3.2 or newer on every platform. On an older
 OpenGL it stops with an error that says what's missing.
 
