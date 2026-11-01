@@ -40,6 +40,48 @@ pub struct Instance {
 // instances at this stride.
 const _: () = assert!(std::mem::size_of::<Instance>() == 36);
 
+// For tai-gui (ADR 0011), whose wgpu text pass also draws solid quads and
+// uploads the atlas itself; the macroquad build doesn't use these.
+#[allow(dead_code)]
+impl Instance {
+    /// A solid quad: an empty atlas source tells tai-gui's shader to fill
+    /// it with `color` instead of sampling the atlas.
+    pub fn solid(dest: [f32; 4], color: [u8; 4]) -> Self {
+        Self {
+            dest,
+            src: [0.0; 4],
+            color,
+        }
+    }
+
+    pub fn as_bytes(instances: &[Self]) -> &[u8] {
+        // SAFETY: Instance is repr(C) plain data with no padding (36 bytes:
+        // eight f32 and four u8), so every byte is initialized.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::slice::from_raw_parts(instances.as_ptr().cast(), std::mem::size_of_val(instances))
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl GlyphAtlas {
+    /// The atlas's size in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        (ATLAS_WIDTH, self.height)
+    }
+
+    /// The RGBA pixels, row by row.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// The rows changed since the last call, for an upload of just those.
+    pub fn take_dirty_rows(&mut self) -> Option<(u32, u32)> {
+        self.dirty_rows.take()
+    }
+}
+
 /// A rasterized glyph: its place in the atlas and fontdue's metrics, in
 /// physical pixels.
 #[derive(Clone, Copy, Debug)]
