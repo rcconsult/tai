@@ -125,3 +125,20 @@ every codepoint in them, so they overlap the next cells. The bundled Noto
 Emoji has GSUB ligatures for these sequences. A full reset (`ESC c`)
 would also turn the mode off, because libghostty-vt's C API has no
 default-modes option.
+
+## encode_to_vec can drop a key or mouse event
+
+libghostty-vt 0.2.2's `Encoder::encode_to_vec`, for keys (`src/key.rs`)
+and for the mouse (`src/mouse.rs`), retries a buffer that's too small
+with `vec.reserve(required - remaining)`. `Vec::reserve` counts from the
+length, so when bytes are already queued in the Vec the retry can be too
+small as well, and the call returns `OutOfSpace`: the event is lost.
+Amortised growth hides it most of the time.
+
+tai-gui hit it on Windows, logged as "input: out of space, 16 bytes
+required", when typed text and a special key landed in the same buffer
+in one frame. Both binaries now reserve `ENCODE_ROOM` (64 bytes) before
+every encode (`src/main.rs`, `src/bin/tai-gui/terminal.rs`). The test
+`a_key_queued_after_other_bytes_isnt_lost` reproduces the drop with seven
+bytes queued in an 8-byte buffer, and fails once the crate is fixed; drop
+the workaround then. Still present upstream (libghostty-rs) at 575ed6b8ce.
