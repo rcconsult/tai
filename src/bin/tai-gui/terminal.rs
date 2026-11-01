@@ -509,6 +509,12 @@ impl TerminalPane {
             .set_unshifted_codepoint(ucp)
             .set_utf8(text);
         let before = self.response.len();
+        // libghostty-vt 0.2.2's encode_to_vec retries a too-small buffer
+        // with reserve(required - remaining), and reserve counts from the
+        // length, so with bytes already queued the retry fails too and the
+        // key is lost ("out of space, 16 bytes required"). Leave room for
+        // any key sequence up front.
+        self.response.reserve(64);
         self.key_encoder
             .set_options_from_terminal(&self.terminal)
             .encode_to_vec(&self.key_event, &mut self.response)?;
