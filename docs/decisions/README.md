@@ -13,12 +13,13 @@ Status is summarised; the record itself is authoritative.
 | [0005](0005-kitty-images.md) | Kitty images: identify tai with `TERM_PROGRAM`, and draw virtual placements | ✅ Accepted 2026-10-25 |
 | [0006](0006-sixel-to-kitty.md) | Accept Sixel by translating it into Kitty images | ✅ Accepted 2026-10-25; decisions 1 and 3 superseded by 0009 |
 | [0007](0007-bundle-conpty.md) | Bundle Microsoft's ConPTY with tai on Windows, so image sequences and DA1 reach tai | ✅ Accepted 2026-10-25 |
-| [0008](0008-gpu-cell-renderer.md) | Draw the grid from GPU cell buffers, as Ghostty does, in milestone (a) | ✅ Accepted 2026-10-25; merged 2026-10-25 |
+| [0008](0008-gpu-cell-renderer.md) | Draw the grid from GPU cell buffers, as Ghostty does, in milestone (a) | ✅ Accepted 2026-10-25; merged 2026-10-25; decision 2's immediate renderer retired by 0012 |
 | [0009](0009-sixel-not-advertised.md) | Translate Sixel as xterm draws it, but don't advertise it unless `TAI_SIXEL=1` | ✅ Accepted 2026-10-26 |
 | [0010](0010-engine-link-loopback-tcp.md) | Reach ppxai-server over loopback TCP on every platform, then ppxai's strict mode | ✅ Accepted 2026-11-01 |
 | [0011](0011-native-gui-egui.md) | A Rust-native GUI on egui, with terminals as panes | ✅ Accepted 2026-11-01, after the prototype |
+| [0012](0012-cjk-font-fallback.md) | Ask the OS for fonts that tai lacks, and draw every glyph with skrifa; retire the immediate renderer | ✅ Accepted 2026-11-01 |
 
-Numbering is sequential. The next record is `0012`.
+Numbering is sequential. The next record is `0013`.
 
 ## About these records
 

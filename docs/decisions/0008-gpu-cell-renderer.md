@@ -4,6 +4,9 @@
   measurements follow on their own branch (decision 3). (2026-10-31: merged
   to main on 2026-10-25 as 36d27d3; see Notes.)
 - **Deciders:** owner. Written by the Claude session on the macOS dev host.
+- **Superseded in part by:** [ADR 0012](0012-cjk-font-fallback.md), which
+  retires the immediate renderer that decision 2 kept for
+  `TAI_APPLE_GFX=metal`, and the Metal opt-in with it.
 - **Related:** [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
   (milestone (a) renders with macroquad; milestone (b) moves to winit +
   wgpu; one trigger is macroquad not holding an interactive frame rate on
