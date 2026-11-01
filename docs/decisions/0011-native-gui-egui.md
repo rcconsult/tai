@@ -80,17 +80,26 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
    - **Unchanged:** the cell walk in `main.rs`.
    - **Removed:** the immediate renderer and macroquad's side of
      `fonts.rs`.
-3. **tai creates its wgpu instance with `VALIDATION_INDIRECT_CALL` off.**
-   On macOS 12.7 with Intel Iris Pro (eframe 0.37, wgpu 30.0.1), wgpu's
-   indirect-call validation builds a compute pipeline at device creation
-   that the Metal driver rejects ("Compiler encountered an internal
-   error"). Device creation then fails, after about 30 s per attempt.
-   `WGPU_VALIDATION_INDIRECT_CALL=0` works only where the instance reads
-   the environment (eframe does; `wgpu::Instance::default()` doesn't), so
-   tai clears the flag in code. wgpu has no GL backend on macOS, so Metal
-   is the only path there. With the flag cleared, a window repainting 40
-   changing text lines every frame ran 105 s at a steady 60 fps, with
-   memory flat at 56–63 MB: none of miniquad's Metal leak.
+3. **wgpu's indirect-call validation stays on by default, and an
+   environment variable turns it off.**
+   - **The problem:** on macOS 12.7 with Intel Iris Pro (eframe 0.37,
+     wgpu 30.0.1), the validation builds a compute pipeline at device
+     creation that the Metal driver rejects ("Compiler encountered an
+     internal error"). Device creation then fails, after about 30 s per
+     attempt. wgpu has no GL backend on macOS, so Metal is the only path
+     there.
+   - **With it off,** a window repainting 40 changing text lines every
+     frame ran 105 s at a steady 60 fps, with memory flat at 56–63 MB:
+     none of miniquad's Metal leak.
+   - **Why not off for everyone (the owner's call):** this is likely one
+     driver's bug, and later macOS versions and other GPUs probably don't
+     have it. So tai builds its instance flags from the environment
+     (`InstanceFlags::with_env`, as eframe does; a bare
+     `wgpu::Instance::default()` ignores it). Then
+     `WGPU_VALIDATION_INDIRECT_CALL=0` turns the validation off where
+     it's needed.
+   - **When device creation fails,** tai's error names that variable,
+     so an affected user isn't left with only the 30 s hang.
 4. **Code editing goes to a real editor in a terminal pane.** The editor
    comes from a config setting or an environment variable (for example
    `$VISUAL`/`$EDITOR`, or Helix or Neovim). tai's own view is read-only
@@ -154,7 +163,7 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
 - The prototype misses macroquad's frame time or input latency, or egui's
   text rendering isn't good enough for long Markdown answers.
 - ppxai can't render PDF pages to PNG.
-- A wgpu upgrade: recheck whether decision 3's workaround is still
+- A wgpu upgrade or a newer macOS: recheck whether decision 3's variable is still
   needed on the macOS host.
 - A Rust code-editor widget matures enough to make an in-window editor
   worthwhile.
