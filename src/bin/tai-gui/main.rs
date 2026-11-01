@@ -205,6 +205,9 @@ struct App {
     dock: DockState<Tab>,
     /// Tabs the user closed, in the order they closed them.
     hidden: Vec<Tab>,
+    /// Where each tab was last seen in the dock, so a hidden tab comes
+    /// back to its own stack.
+    last_place: std::collections::HashMap<Tab, egui_dock::NodePath>,
     /// The pane shown over the whole window, if one is zoomed.
     zoomed: Option<Tab>,
     terminal: Option<TerminalPane>,
@@ -224,6 +227,24 @@ impl App {
                 .map(|(_, tab)| *tab)
                 .or_else(|| self.dock.iter_all_tabs().next().map(|(_, tab)| *tab)),
         };
+    }
+
+    /// Put a hidden tab back in the stack it was closed from, as its
+    /// active tab, or in the first stack if that one has gone (closing a
+    /// stack's last tab removes the stack).
+    fn show(&mut self, tab: Tab) {
+        let place = self.last_place.get(&tab).copied();
+        match place.and_then(|path| self.dock.leaf_mut(path).ok()) {
+            Some(leaf) => leaf.append_tab(tab),
+            None => self.dock.push_to_first_leaf(tab),
+        }
+        if let Some(path) = self.dock.find_tab(&tab) {
+            _ = self.dock.set_active_tab(path);
+            self.dock.set_focused_node_and_surface(egui_dock::NodePath {
+                surface: path.surface,
+                node: path.node,
+            });
+        }
     }
 
     /// The View menu: zoom, and the hidden tabs to show again.
@@ -255,7 +276,7 @@ impl App {
                     if let Some(i) = shown {
                         let tab = self.hidden.remove(i);
                         self.zoomed = None;
-                        self.dock.push_to_first_leaf(tab);
+                        self.show(tab);
                     }
                 });
                 if let Some(tab) = self.zoomed {
@@ -287,6 +308,15 @@ impl eframe::App for App {
         }
         self.menu_bar(ui);
 
+        for (path, tab) in self.dock.iter_all_tabs() {
+            self.last_place.insert(
+                *tab,
+                egui_dock::NodePath {
+                    surface: path.surface,
+                    node: path.node,
+                },
+            );
+        }
         let mut panes = Panes {
             terminal: self.terminal.as_mut(),
             chat: &mut self.chat,
@@ -379,6 +409,7 @@ fn main() -> eframe::Result {
                 terminal,
                 chat: chat::ChatPane::new(),
                 hidden: Vec::new(),
+                last_place: Default::default(),
                 zoomed: None,
                 stats: FrameStats::new(),
                 engine: engine::Engine::start(cc.egui_ctx.clone()),
