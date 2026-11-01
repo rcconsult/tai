@@ -19,6 +19,22 @@ tracing = "0.1.44"
 # Grapheme clusters, for the selection badge's character count.
 unicode-segmentation = "1.12.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# The egui prototype (ADR 0011), behind the `gui` feature so the macroquad
+# build stays as it is. egui_dock 0.21 needs egui 0.36.
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"], optional = true }
+egui_dock = { version = "0.21.1", optional = true }
+
+[features]
+gui = ["dep:eframe", "dep:egui_dock"]
+
+[[bin]]
+name = "tai"
+path = "src/main.rs"
+
+[[bin]]
+name = "tai-gui"
+path = "src/bin/tai-gui/main.rs"
+required-features = ["gui"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user", "ioctl"] }
