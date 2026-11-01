@@ -118,12 +118,57 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
    - PowerPoint works this way today. PDF and Word need the server to
      render pages to PNG as well, a request to ppxai. Until then they
      open in the OS viewer.
-6. **Prototype first.** One window with a chat pane (Markdown, a
-   streamed `/v1/oneshot` answer, through the ADR 0010 client) beside a
-   libghostty-vt terminal pane, on Windows, Linux and macOS. It is
-   measured against today's macroquad build for frame time, input
-   latency, memory, and idle CPU with egui's reactive repaint (tai idles at
-   about 4% CPU today). If it holds up, this record becomes Accepted.
+6. **Layout: panes are tab stacks, and the window has workspace tabs.**
+   - **Pane tabs** (`egui_dock`): every pane holds a stack of views,
+     rotated, dragged between panes, split off or maximised. The views
+     are terminals (shells, SSH), document previews (PNG pages,
+     Markdown, images, tables, trees), editors (decision 4) and
+     sub-agent runs (task and oneshot).
+   - **Following the web app's right panel**
+     (`components/right-panel-frame.js`): one view per file, each view
+     keeps its scroll, page and cursor, back and forward history, and an
+     LRU limit (default 10 per stack). Running views and views with
+     unsaved changes are never dropped. A hidden view isn't drawn, but a
+     hidden terminal keeps reading its output.
+   - **Workspace tabs:** each holds a whole layout with one ppxai
+     session, its working folder and file tree. They show unread output
+     and running tasks. One `ppxai-server` serves all of them.
+7. **Keys follow the mainstream AI harnesses** (Claude Code, Codex CLI,
+   pi agent), not ppxaide.
+   - **In chat:** Enter sends; Shift+Enter or Ctrl+J adds a new line; Esc
+     interrupts; Esc Esc rewinds; Up and Down recall history. `/`
+     commands, `@` files and `!` shell lines; Shift+Tab cycles modes;
+     Ctrl+G edits in `$EDITOR`.
+   - **Window chords** use Cmd on macOS and Ctrl+Shift elsewhere, as
+     `src/shortcuts.rs` does. Ctrl+Tab rotates a stack, and Ctrl+\`
+     moves between chat and the terminal.
+   - **Inside a terminal pane,** every other key goes to the shell.
+   - Each binding is checked against those harnesses' own docs before it
+     ships.
+8. **Lifecycle: everything ends with tai's process, as in the web app.**
+   - **What stops:** the PTYs, `ppxai-server` and its running tasks
+     (ADR 0010, decision 3).
+   - **What survives:** chat sessions, which ppxai keeps on disk
+     (`~/.ppxai`) and restores at the next start.
+   - **The seam:** everything that would outlive the window sits behind
+     one internal interface: the PTYs, the server process and the
+     running tasks. That keeps a detachable mode possible.
+   - **herdr is the reference for that mode, not a dependency.** herdr
+     0.9.5 ("terminal workspace manager for AI coding agents") runs a
+     headless server that keeps named sessions alive for clients that
+     attach and detach, locally or over SSH, and it bundles ConPTY on
+     Windows. Building on it would add a 26 MB third-party daemon with
+     its own UI, keys and update channel. Its licence, and whether its
+     API streams pane output, are unchecked.
+9. **Prototype first.**
+   - **Scope:** one window with two tab stacks, on Windows, Linux and
+     macOS. One holds a chat pane: a `/v1/oneshot` answer through the
+     ADR 0010 client, rendered as Markdown. The other holds a
+     libghostty-vt terminal plus one preview view, to prove rotation.
+   - **Measured against today's macroquad build:** frame time, input
+     latency, memory, and idle CPU with egui's reactive repaint (tai
+     idles at about 4% CPU today).
+   - If it holds up, this record becomes Accepted.
 
 ## Why this and not the alternatives
 
@@ -163,6 +208,8 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
 - The prototype misses macroquad's frame time or input latency, or egui's
   text rendering isn't good enough for long Markdown answers.
 - ppxai can't render PDF pages to PNG.
+- Users need shells or agent work to outlive tai's window: build the
+  detachable `tai --server` behind decision 8's seam, studying herdr.
 - A wgpu upgrade or a newer macOS: recheck whether decision 3's variable is still
   needed on the macOS host.
 - A Rust code-editor widget matures enough to make an in-window editor
