@@ -82,8 +82,6 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
 - tai doesn't shape text, so scripts that need shaping, such as Arabic or
   Devanagari, draw poorly. A grapheme cluster, such as an emoji ZWJ
   sequence, takes the font of its first character.
-- `tai-gui` is a prototype: wide emoji in its terminal panes come out at
-  one cell's size, and its chat pane doesn't show CJK yet.
 - macroquad is vendored with a clipboard fix (`vendor/macroquad/TAI-PATCHES.md`).
 - Windows: tai bundles Microsoft's ConPTY (`conpty.dll` and
   `OpenConsole.exe`, next to `tai.exe`; ADR 0007), because Windows' own

@@ -5,16 +5,27 @@
 //! the server, and nothing streams. `/chat` with SSE, interrupt and consent
 //! comes after the prototype. Keys follow the mainstream harnesses (Claude
 //! Code, Codex, pi): Enter sends, Shift+Enter starts a new line.
+//!
+//! egui's bundled fonts have no CJK. Text they can't draw gets the font the
+//! OS picks for it, added to egui as a fallback (ADR 0012, decision 6).
 
 use std::{
+    collections::HashSet,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use eframe::egui;
+use eframe::egui::{
+    self,
+    epaint::text::{FontInsert, FontPriority, InsertFontFamily},
+};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
-use crate::engine::{Engine, State};
+use crate::{
+    discovery::{self, FontFile},
+    engine::{Engine, State},
+    fonts,
+};
 
 /// How long a one-shot answer may take. Models can be slow; ppxai's own
 /// enrichment path has its own timeout and answers 504 past it.
@@ -32,6 +43,66 @@ pub struct ChatPane {
     /// The answer to the prompt in flight, filled by its thread.
     pending: Option<(Instant, Arc<Mutex<Option<Entry>>>)>,
     markdown: CommonMarkCache,
+    fonts: ChatFonts,
+}
+
+/// System fonts added to egui for codepoints its own fonts lack.
+#[derive(Default)]
+struct ChatFonts {
+    /// Codepoints already looked at, so each is checked once.
+    seen: HashSet<char>,
+    /// Font files already added.
+    added: HashSet<FontFile>,
+}
+
+impl ChatFonts {
+    /// Make sure egui can draw `text`: for each codepoint its fonts lack,
+    /// add the font the OS picks for it, after egui's own fonts, to both
+    /// families. egui lays the text out again on the next frame.
+    fn cover(&mut self, ctx: &egui::Context, text: &str) {
+        for ch in text.chars() {
+            if ch.is_ascii() || !self.seen.insert(ch) {
+                continue;
+            }
+            let font = egui::FontId::proportional(14.0);
+            if ctx.fonts_mut(|f| f.has_glyph(&font, ch)) {
+                continue;
+            }
+            let Some(file) = discovery::find(ch) else {
+                continue;
+            };
+            if !self.added.insert(file.clone()) {
+                continue;
+            }
+            let path = file.path.display();
+            let bytes = match fonts::map(&file.path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!("chat font fallback: {path}: {e}");
+                    continue;
+                }
+            };
+            let mut data = egui::FontData::from_static(bytes);
+            data.index = file.index;
+            let fallback = |family| InsertFontFamily {
+                family,
+                priority: FontPriority::Lowest,
+            };
+            ctx.add_font(FontInsert::new(
+                &format!("{path}#{}", file.index),
+                data,
+                vec![
+                    fallback(egui::FontFamily::Proportional),
+                    fallback(egui::FontFamily::Monospace),
+                ],
+            ));
+            tracing::info!(
+                "chat font fallback: U+{:04X} from {path} #{}",
+                ch as u32,
+                file.index
+            );
+        }
+    }
 }
 
 impl ChatPane {
@@ -41,11 +112,12 @@ impl ChatPane {
             input: String::new(),
             pending: None,
             markdown: CommonMarkCache::default(),
+            fonts: ChatFonts::default(),
         }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, engine: &Engine) {
-        self.collect_answer();
+        self.collect_answer(ui.ctx());
         let link = engine.state.lock().ok().and_then(|state| match &*state {
             State::Ready(link) => Some(link.clone()),
             _ => None,
@@ -62,7 +134,7 @@ impl ChatPane {
                 let send = ui.memory(|m| m.has_focus(input_id))
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
                 let ready = link.is_some() && self.pending.is_none();
-                ui.add(
+                let typed = ui.add(
                     egui::TextEdit::multiline(&mut self.input)
                         .id(input_id)
                         .desired_rows(3)
@@ -73,6 +145,9 @@ impl ChatPane {
                             "Waiting for the engine…"
                         }),
                 );
+                if typed.changed() {
+                    self.fonts.cover(ui.ctx(), &self.input);
+                }
                 if send
                     && ready
                     && !self.input.trim().is_empty()
@@ -180,13 +255,18 @@ impl ChatPane {
         }
     }
 
-    fn collect_answer(&mut self) {
+    fn collect_answer(&mut self, ctx: &egui::Context) {
         let done = self
             .pending
             .as_ref()
             .and_then(|(_, slot)| slot.lock().ok()?.take());
         if let Some(entry) = done {
             self.pending = None;
+            match &entry {
+                Entry::Answer { text, .. } | Entry::Prompt(text) | Entry::Error(text) => {
+                    self.fonts.cover(ctx, text);
+                }
+            }
             self.entries.push(entry);
         }
     }

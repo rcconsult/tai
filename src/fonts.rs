@@ -392,7 +392,7 @@ const MAX_DISCOVERED: usize = 16;
 /// Leaked, because a discovered face is kept until tai exits and there are
 /// at most `MAX_DISCOVERED` of them.
 #[allow(unsafe_code)]
-fn map(path: &Path) -> std::io::Result<&'static [u8]> {
+pub fn map(path: &Path) -> std::io::Result<&'static [u8]> {
     let file = std::fs::File::open(path)?;
     // SAFETY: a mapped file that another process truncates can fault on
     // read. System font files don't change while they're installed, and
