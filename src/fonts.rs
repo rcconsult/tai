@@ -330,7 +330,8 @@ struct Fit {
     scale: f32,
     /// Whether `scale` is per cell.
     per_cell: bool,
-    /// The largest scale whose line still fits the primary's line.
+    /// The largest scale whose line still fits the primary's line;
+    /// unlimited for a discovered font.
     max_scale: f32,
     /// Vertical middle of the font's line, (ascent + descent) / 2, in em
     /// above the baseline. Used to centre glyphs in the row.
@@ -359,13 +360,16 @@ impl Fit {
         }
     }
 
-    /// A discovered font's fit: Ghostty's size normalization, then capped
-    /// at the primary's line and centred on it like the bundled fonts.
-    fn normalized(primary: &Typeface, primary_size: &SizeMetrics, font: &Typeface) -> Self {
+    /// A discovered font's fit: Ghostty's size normalization, centred on
+    /// the primary's line like the bundled fonts. It isn't capped at the
+    /// primary's line, as Ghostty's isn't (`Collection.zig` `scaleFactor`):
+    /// CJK fonts have tall lines, and the cap shrank PingFang's 水 from
+    /// 1.05x to 0.94x though its ink fits (ADR 0012, decision 5).
+    fn normalized(primary_size: &SizeMetrics, font: &Typeface) -> Self {
         Self {
             scale: SizeMetrics::scale_from(primary_size, &font.size_metrics()),
             per_cell: false,
-            max_scale: line_height(primary) / line_height(font),
+            max_scale: f32::INFINITY,
             mid: mid(font),
         }
     }
@@ -510,13 +514,12 @@ impl Coverage {
             );
             return None;
         }
-        let fit = Fit::normalized(&self.primary, &self.primary_size, &font);
+        let fit = Fit::normalized(&self.primary_size, &font);
         tracing::info!(
-            "font fallback: U+{:04X} from {path} #{}, at {:.2}x (line cap {:.2}x)",
+            "font fallback: U+{:04X} from {path} #{}, at {:.2}x",
             ch as u32,
             file.index,
-            fit.scale,
-            fit.max_scale
+            fit.scale
         );
         let _ = cell.set(Discovered { font, fit });
         Some(next as u8)
@@ -564,8 +567,8 @@ impl Coverage {
 
     /// Where to draw a glyph of `face` when the primary font is at
     /// `font_size`. Bundled fallback glyphs are sized to span `cells` cells,
-    /// discovered ones by Ghostty's size normalization; either way no
-    /// taller than the primary's line, and centred on that line.
+    /// no taller than the primary's line; discovered ones by Ghostty's size
+    /// normalization. Either way they're centred on the primary's line.
     pub fn place(&self, face: Face, font_size: u16, cells: u8) -> Placement {
         let fit = match face {
             Face::Primary | Face::Blank => {

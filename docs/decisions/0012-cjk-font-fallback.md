@@ -175,8 +175,12 @@ macroquad's `draw_text_ex`, from fontdue fonts. It runs in three cases
 5. **Size by ideograph width, as Ghostty does.** A discovered face is
    scaled so its `水` is as wide as JetBrains Mono's estimated ideograph
    width, `min(ascii_height, 2 × cell_width)`, with Ghostty's fallbacks
-   for a face without `水`. It's capped at the primary's line height and
-   centred on it, like the other fallbacks (`fonts::Fit`). A wide cell is
+   for a face without `水`. It's centred on the primary's line, like the
+   other fallbacks (`fonts::Fit`), but not capped at its height: Ghostty
+   doesn't cap it, and CJK fonts' tall lines made the cap shrink glyphs
+   whose ink fits (PingFang's `水` went from 1.05x to 0.94x, leaving about
+   0.6 cell empty on macOS). Like Ghostty, tai doesn't centre a CJK glyph
+   in its two cells; it's drawn at its own bearing. A wide cell is
    drawn two cells wide in both binaries. tai-gui passes a cell count of
    1 for every glyph today (`src/bin/tai-gui/terminal.rs`, the
    `coverage.place` call), which also shrinks wide emoji. That gets fixed
