@@ -40,8 +40,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const PADDING: f32 = 6.0;
 /// Space added to the glyph height for each row, as in the macroquad build.
 const ROW_GAP: f32 = 12.0;
-/// How long one frame may spend feeding pty output to the terminal.
-const PARSE_BUDGET: Duration = Duration::from_millis(8);
+/// How long one frame may spend feeding pty output to the terminal; it
+/// stops earlier once the queued output runs out. The macroquad build's
+/// PARSE_DEADLINE: 8 ms halved flood throughput there on Linux, and here
+/// tai-gui's flood throughput tracked its frame rate (popos-tai).
+const PARSE_BUDGET: Duration = Duration::from_millis(14);
 /// How long to wait for the shell's echo after typing, so it's drawn in
 /// the same frame, as the macroquad build's ECHO_WAIT does. Without it a
 /// keystroke took two frames (popos-tai's typing-lag probe).
