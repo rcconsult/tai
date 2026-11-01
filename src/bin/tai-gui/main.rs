@@ -13,7 +13,7 @@
 //! asks. Debug builds also turn on full validation, so measure in release.
 
 use eframe::egui;
-use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
+use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer, tab_viewer::OnCloseResponse};
 
 // Modules shared with the macroquad build. Each is compiled into both
 // binaries; tai-gui uses only part of some.
@@ -52,7 +52,7 @@ mod terminal;
 // The pty modules size the pseudo terminal from `crate::Dimensions`.
 use terminal::{Dimensions, TerminalPane};
 
-/// What a tab shows. Each kind gets its own pane in a later step.
+/// What a tab shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
     Chat,
@@ -83,6 +83,8 @@ struct Panes<'a> {
     terminal: Option<&'a mut TerminalPane>,
     chat: &'a mut chat::ChatPane,
     engine: &'a engine::Engine,
+    /// Tabs closed this frame; the app keeps them to show again.
+    closed: Vec<Tab>,
 }
 
 impl TabViewer for Panes<'_> {
@@ -123,9 +125,28 @@ impl TabViewer for Panes<'_> {
         }
     }
 
+    // Closing a tab hides it: its pane lives on in the app (a terminal's
+    // shell keeps running) and View > Show puts it back.
     fn is_closeable(&self, _tab: &Tab) -> bool {
-        false
+        true
     }
+
+    fn on_close(&mut self, tab: &mut Tab) -> OnCloseResponse {
+        self.closed.push(*tab);
+        OnCloseResponse::Close
+    }
+}
+
+/// The chord that zooms the focused pane to the whole window and back, as
+/// in WezTerm (Ctrl+Shift+Z) and tmux (prefix z). Ctrl on every platform,
+/// as WezTerm does on macOS, since Cmd+Shift+Z is Redo there.
+fn zoom_chord(i: &mut egui::InputState) -> bool {
+    let mods = egui::Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Default::default()
+    };
+    i.consume_key(mods, egui::Key::Z)
 }
 
 /// Frames per second and what asked for them, logged when
@@ -182,9 +203,70 @@ impl FrameStats {
 struct App {
     stats: Option<FrameStats>,
     dock: DockState<Tab>,
+    /// Tabs the user closed, in the order they closed them.
+    hidden: Vec<Tab>,
+    /// The pane shown over the whole window, if one is zoomed.
+    zoomed: Option<Tab>,
     terminal: Option<TerminalPane>,
     chat: chat::ChatPane,
     engine: engine::Engine,
+}
+
+impl App {
+    /// Zoom the focused pane, or the first tab when none has focus yet;
+    /// zoomed already, go back to the layout.
+    fn toggle_zoom(&mut self) {
+        self.zoomed = match self.zoomed {
+            Some(_) => None,
+            None => self
+                .dock
+                .find_active_focused()
+                .map(|(_, tab)| *tab)
+                .or_else(|| self.dock.iter_all_tabs().next().map(|(_, tab)| *tab)),
+        };
+    }
+
+    /// The View menu: zoom, and the hidden tabs to show again.
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("menu-bar").show(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("View", |ui| {
+                    let zoom = if self.zoomed.is_some() {
+                        "Restore layout"
+                    } else {
+                        "Zoom pane"
+                    };
+                    let button = egui::Button::new(zoom).shortcut_text("Ctrl+Shift+Z");
+                    if ui.add(button).clicked() {
+                        self.toggle_zoom();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if self.hidden.is_empty() {
+                        ui.weak("No hidden panes");
+                    }
+                    let mut shown = None;
+                    for (i, tab) in self.hidden.iter().enumerate() {
+                        if ui.button(format!("Show {}", tab.title())).clicked() {
+                            shown = Some(i);
+                            ui.close();
+                        }
+                    }
+                    if let Some(i) = shown {
+                        let tab = self.hidden.remove(i);
+                        self.zoomed = None;
+                        self.dock.push_to_first_leaf(tab);
+                    }
+                });
+                if let Some(tab) = self.zoomed {
+                    ui.weak(format!(
+                        "{} zoomed: Ctrl+Shift+Z restores the layout",
+                        tab.title()
+                    ));
+                }
+            });
+        });
+    }
 }
 
 impl eframe::App for App {
@@ -199,18 +281,32 @@ impl eframe::App for App {
                 ui.ctx().request_repaint();
             }
         }
-        let style = Style::from_egui(ui.style().as_ref());
-        DockArea::new(&mut self.dock)
-            .style(style)
-            .show_leaf_close_all_buttons(false)
-            .show_inside(
-                ui,
-                &mut Panes {
-                    terminal: self.terminal.as_mut(),
-                    chat: &mut self.chat,
-                    engine: &self.engine,
-                },
-            );
+        // Taken before any pane sees the keys, so the shell doesn't get it.
+        if ui.input_mut(zoom_chord) {
+            self.toggle_zoom();
+        }
+        self.menu_bar(ui);
+
+        let mut panes = Panes {
+            terminal: self.terminal.as_mut(),
+            chat: &mut self.chat,
+            engine: &self.engine,
+            closed: Vec::new(),
+        };
+        if let Some(mut tab) = self.zoomed {
+            // The dock keeps its layout; the zoomed pane is drawn alone.
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| panes.ui(ui, &mut tab));
+        } else {
+            let style = Style::from_egui(ui.style().as_ref());
+            DockArea::new(&mut self.dock)
+                .style(style)
+                .show_leaf_close_all_buttons(false)
+                .show_inside(ui, &mut panes);
+        }
+        let closed = std::mem::take(&mut panes.closed);
+        self.hidden.extend(closed);
         if let Some(stats) = &mut self.stats {
             stats.record(ui.ctx(), started.elapsed());
         }
@@ -282,6 +378,8 @@ fn main() -> eframe::Result {
                 dock: initial_layout(),
                 terminal,
                 chat: chat::ChatPane::new(),
+                hidden: Vec::new(),
+                zoomed: None,
                 stats: FrameStats::new(),
                 engine: engine::Engine::start(cc.egui_ctx.clone()),
             }))
