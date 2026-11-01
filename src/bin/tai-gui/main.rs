@@ -41,6 +41,7 @@ mod pty_input;
 #[allow(dead_code)]
 mod shortcuts;
 
+mod engine;
 mod gpu;
 mod terminal;
 
@@ -76,6 +77,7 @@ fn initial_layout() -> DockState<Tab> {
 
 struct Panes<'a> {
     terminal: Option<&'a mut TerminalPane>,
+    engine: &'a engine::Engine,
 }
 
 impl TabViewer for Panes<'_> {
@@ -95,6 +97,7 @@ impl TabViewer for Panes<'_> {
             (Tab::Terminal, None) => {
                 ui.label("The terminal didn't start; see the log.");
             }
+            (Tab::Chat, _) => engine_status(ui, self.engine),
             (tab, _) => {
                 ui.label(format!("{} pane: not built yet.", tab.title()));
             }
@@ -119,9 +122,34 @@ impl TabViewer for Panes<'_> {
     }
 }
 
+/// The engine's state, until the chat pane (step 4) takes over the tab.
+fn engine_status(ui: &mut egui::Ui, engine: &engine::Engine) {
+    let Ok(state) = engine.state.lock() else {
+        return;
+    };
+    match &*state {
+        engine::State::Starting(step) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Engine: {step}…"));
+            });
+        }
+        engine::State::Ready(link) => {
+            ui.label(format!(
+                "Engine: ppxai-server {} ready at {} (pid {}).",
+                link.version, link.base, link.pid
+            ));
+        }
+        engine::State::Failed(why) => {
+            ui.colored_label(ui.visuals().error_fg_color, format!("Engine: {why}"));
+        }
+    }
+}
+
 struct App {
     dock: DockState<Tab>,
     terminal: Option<TerminalPane>,
+    engine: engine::Engine,
 }
 
 impl eframe::App for App {
@@ -144,8 +172,17 @@ impl eframe::App for App {
                 ui,
                 &mut Panes {
                     terminal: self.terminal.as_mut(),
+                    engine: &self.engine,
                 },
             );
+    }
+
+    fn on_exit(&mut self) {
+        tracing::info!("exit: stopping the engine");
+        self.engine.stop();
+        tracing::info!("exit: closing the terminal");
+        drop(self.terminal.take());
+        tracing::info!("exit: done");
     }
 }
 
@@ -194,6 +231,7 @@ fn main() -> eframe::Result {
             Ok(Box::new(App {
                 dock: initial_layout(),
                 terminal,
+                engine: engine::Engine::start(cc.egui_ctx.clone()),
             }))
         }),
     );
