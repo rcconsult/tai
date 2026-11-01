@@ -70,6 +70,10 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_S
 # so macOS uses arboard. Text only: no image support.
 [target.'cfg(target_os = "macos")'.dependencies]
 arboard = { version = "3.7.0", default-features = false }
+# Font discovery through CoreText (ADR 0012). 0.3.2 is the objc2 family
+# winit and wgpu already pull in.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFString", "CFURL"] }
+objc2-core-text = { version = "0.3.2", default-features = false, features = ["std", "CTFont", "CTFontDescriptor", "CTFontManager"] }
 
 # Vendored macroquad with a clipboard fix; see vendor/macroquad/TAI-PATCHES.md.
 [patch.crates-io]
