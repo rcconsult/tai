@@ -173,9 +173,14 @@ impl Pty {
         }
     }
 
-    /// Queue input for the pseudo console (src/pty_input.rs).
+    /// Queue what the user typed or pasted (src/pty_input.rs).
     pub fn write(&self, data: &[u8]) {
         self.input.send(data);
+    }
+
+    /// Queue a reply tai generated for the child; capped (src/pty_input.rs).
+    pub fn reply(&self, data: &[u8]) {
+        self.input.send_reply(data);
     }
 
     /// Resize the pseudo console.

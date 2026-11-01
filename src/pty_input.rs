@@ -11,22 +11,26 @@ use std::{
     io::Write,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
 };
 
-/// Unwritten input bytes before new input is dropped. Pastes fit easily; the
-/// cap is for replies tai generates for the child (cursor reports, for
-/// example), which a child that floods queries and never reads its input
-/// could otherwise pile up without limit.
-const MAX_QUEUED: usize = 8 * 1024 * 1024;
+/// Unwritten bytes past which replies are dropped. Replies are what tai
+/// generates for the child (cursor and size reports, for example), so a
+/// child that floods queries and never reads its input could otherwise pile
+/// them up without limit. What the user types or pastes is never capped: a
+/// paste is bounded by the clipboard, and dropping it would look like paste
+/// not working.
+const MAX_QUEUED_FOR_REPLIES: usize = 8 * 1024 * 1024;
 
 /// The frame loop's end of the writer thread.
 pub struct Input {
     pending: Sender<Vec<u8>>,
     /// Bytes queued and not yet written.
     queued: Arc<AtomicUsize>,
+    /// Whether the last reply was dropped, so a burst of drops logs once.
+    dropping: AtomicBool,
 }
 
 impl Input {
@@ -39,17 +43,38 @@ impl Input {
         std::thread::Builder::new()
             .name("pty-writer".into())
             .spawn(move || write_loop(writer, &receiver, &written))?;
-        Ok(Self { pending, queued })
+        Ok(Self {
+            pending,
+            queued,
+            dropping: AtomicBool::new(false),
+        })
     }
 
-    /// Queue `data` for the child. Nothing here waits on the pty. Past
-    /// `MAX_QUEUED` unwritten bytes, or after a write error, it's dropped.
+    /// Queue what the user typed or pasted. Nothing here waits on the pty;
+    /// only a write error (the child has gone) drops it.
     pub fn send(&self, data: &[u8]) {
-        if data.is_empty() || self.queued.load(Ordering::Relaxed) + data.len() > MAX_QUEUED {
+        if data.is_empty() {
             return;
         }
         self.queued.fetch_add(data.len(), Ordering::Relaxed);
         _ = self.pending.send(data.to_vec());
+    }
+
+    /// Queue a reply tai generated for the child. Past
+    /// `MAX_QUEUED_FOR_REPLIES` unwritten bytes it's dropped, and logged once
+    /// per burst.
+    pub fn send_reply(&self, data: &[u8]) {
+        if self.queued.load(Ordering::Relaxed) + data.len() > MAX_QUEUED_FOR_REPLIES {
+            if !self.dropping.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "dropping replies to the child: it isn't reading its input                      ({} bytes unwritten)",
+                    self.queued.load(Ordering::Relaxed)
+                );
+            }
+            return;
+        }
+        self.dropping.store(false, Ordering::Relaxed);
+        self.send(data);
     }
 }
 
@@ -73,7 +98,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{Input, MAX_QUEUED};
+    use super::{Input, MAX_QUEUED_FOR_REPLIES};
 
     #[test]
     fn queued_input_waits_for_a_slow_reader_and_arrives_whole() {
@@ -99,20 +124,24 @@ mod tests {
     }
 
     #[test]
-    fn input_past_the_cap_is_dropped() {
+    fn replies_past_the_cap_are_dropped_but_pastes_are_not() {
         let (mut reader, writer) = std::io::pipe().unwrap();
         let input = Input::spawn(writer).unwrap();
 
-        // The first chunk blocks the writer on the full pipe, so it stays
-        // counted; the second would pass the cap and is dropped.
-        let first = vec![1u8; MAX_QUEUED / 2 + 1];
-        input.send(&first);
-        input.send(&vec![2u8; MAX_QUEUED / 2 + 1]);
+        // A paste bigger than the cap goes through. It blocks the writer on
+        // the full pipe, so it stays counted, and the reply after it would
+        // pass the cap and is dropped. Typing after that still goes through.
+        let paste = vec![1u8; MAX_QUEUED_FOR_REPLIES + 1];
+        input.send(&paste);
+        input.send_reply(b"[1;1R");
+        input.send(b"a");
 
         std::thread::sleep(Duration::from_millis(100));
         drop(input);
         let mut got = Vec::new();
         reader.read_to_end(&mut got).unwrap();
-        assert!(got == first);
+        assert_eq!(got.len(), paste.len() + 1);
+        assert!(got[..paste.len()] == paste[..]);
+        assert_eq!(got.last(), Some(&b'a'));
     }
 }

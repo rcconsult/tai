@@ -279,7 +279,7 @@ async fn main() -> Result<()> {
         // requires a response back to the application (device status reports,
         // mode queries, device attributes, etc.).  Without this, programs like
         // vim and tmux that probe terminal capabilities would hang.
-        .on_pty_write(|_t, data| pty.write(data))?
+        .on_pty_write(|_t, data| pty.reply(data))?
         // size effect — responds to XTWINOPS size queries (CSI 14/16/18 t)
         // so programs can discover the terminal geometry in cells and pixels.
         .on_size({
@@ -463,7 +463,7 @@ async fn main() -> Result<()> {
                 // it before it reads SGR-Pixels mouse reports as pixels.
                 let reports = terminal.mode(Mode::IN_BAND_RESIZE)?;
                 if reports && !in_band_resize {
-                    pty.write(in_band_size_report(grid_size.get(), cell_pixels.get()).as_bytes());
+                    pty.reply(in_band_size_report(grid_size.get(), cell_pixels.get()).as_bytes());
                 }
                 in_band_resize = reports;
             }
@@ -3051,9 +3051,15 @@ mod pty {
             Ok(())
         }
 
-        /// Queue input for the pty (`src/pty_input.rs`).
+        /// Queue what the user typed or pasted (`src/pty_input.rs`).
         pub fn write(&self, data: &[u8]) {
             self.input.send(data);
+        }
+
+        /// Queue a reply tai generated for the child; capped
+        /// (`src/pty_input.rs`).
+        pub fn reply(&self, data: &[u8]) {
+            self.input.send_reply(data);
         }
 
         /// Send a resize event to the pty via the TIOCSWINSZ ioctl.
