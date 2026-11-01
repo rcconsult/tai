@@ -132,6 +132,7 @@ struct FrameStats {
     since: std::time::Instant,
     frames: u32,
     busy: std::time::Duration,
+    max: std::time::Duration,
     causes: std::collections::BTreeMap<String, u32>,
 }
 
@@ -141,6 +142,7 @@ impl FrameStats {
             since: std::time::Instant::now(),
             frames: 0,
             busy: std::time::Duration::ZERO,
+            max: std::time::Duration::ZERO,
             causes: Default::default(),
         })
     }
@@ -148,6 +150,7 @@ impl FrameStats {
     fn record(&mut self, ctx: &egui::Context, busy: std::time::Duration) {
         self.frames += 1;
         self.busy += busy;
+        self.max = self.max.max(busy);
         for cause in ctx.repaint_causes() {
             *self
                 .causes
@@ -156,16 +159,18 @@ impl FrameStats {
         }
         if self.since.elapsed() >= std::time::Duration::from_secs(1) {
             tracing::info!(
-                "frames: {} in {:.2} s, ui time {:.1} ms/frame; repaint causes: {:?}",
+                "frames: {} in {:.2} s, ui time avg {:.2} max {:.2} ms; repaint causes: {:?}",
                 self.frames,
                 self.since.elapsed().as_secs_f32(),
                 self.busy.as_secs_f32() * 1000.0 / self.frames as f32,
+                self.max.as_secs_f32() * 1000.0,
                 self.causes
             );
             *self = Self {
                 since: std::time::Instant::now(),
                 frames: 0,
                 busy: std::time::Duration::ZERO,
+                max: std::time::Duration::ZERO,
                 causes: Default::default(),
             };
         }
@@ -255,6 +260,11 @@ fn main() -> eframe::Result {
             if let Some(render) = &cc.wgpu_render_state {
                 gpu::CellPass::install(render);
             }
+            // A blinking text cursor in a focused text box kept egui
+            // drawing about 30 frames a second (6-12% of a core on the
+            // Windows host), so the chat input's cursor holds still.
+            cc.egui_ctx
+                .all_styles_mut(|style| style.visuals.text_cursor.blink = false);
             let terminal = fonts::Coverage::new()
                 .map_err(Into::into)
                 .and_then(|coverage| TerminalPane::new(coverage, cc.egui_ctx.clone()))

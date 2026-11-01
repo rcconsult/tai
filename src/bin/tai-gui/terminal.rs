@@ -8,7 +8,10 @@
 use std::{
     cell::Cell,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -38,6 +41,10 @@ const PADDING: f32 = 6.0;
 const ROW_GAP: f32 = 12.0;
 /// How long one frame may spend feeding pty output to the terminal.
 const PARSE_BUDGET: Duration = Duration::from_millis(8);
+/// How long to wait for the shell's echo after typing, so it's drawn in
+/// the same frame, as the macroquad build's ECHO_WAIT does. Without it a
+/// keystroke took two frames (popos-tai's typing-lag probe).
+const ECHO_WAIT: Duration = Duration::from_millis(4);
 
 /// The pane's size and cell metrics. The pty modules size the pseudo
 /// terminal from it (`crate::Dimensions`).
@@ -125,6 +132,8 @@ pub struct TerminalPane {
     built_for: Option<(Dimensions, Option<(u16, u16)>)>,
     /// Typed and pasted bytes waiting to be written.
     response: Vec<u8>,
+    /// Set by the pty's reader when it has woken egui, cleared by pump.
+    wake_pending: Arc<AtomicBool>,
 }
 
 impl TerminalPane {
@@ -135,7 +144,15 @@ impl TerminalPane {
         let (cols, rows) = dims.grid_size();
         let (pty, child) = Pty::new(dims)?;
         // egui sleeps until something happens; output is something.
-        pty.wake_on_output(move || ctx.request_repaint());
+        // One wake per frame at most: the reader calls this for every
+        // chunk, about 40,000 times a second during a flood on Linux.
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let pending = Arc::clone(&wake_pending);
+        pty.wake_on_output(move || {
+            if !pending.swap(true, Ordering::AcqRel) {
+                ctx.request_repaint();
+            }
+        });
         let pty = Rc::new(pty);
         let grid_size = Rc::new(Cell::new((cols, rows)));
         let cell_pixels = Rc::new(Cell::new(dims.cell_pixels()));
@@ -184,6 +201,7 @@ impl TerminalPane {
             instances: Arc::new(Vec::new()),
             built_for: None,
             response: Vec::new(),
+            wake_pending,
         })
     }
 
@@ -195,6 +213,9 @@ impl TerminalPane {
     /// or not the pane is visible, so a hidden shell never blocks on a full
     /// pty. Returns whether anything arrived.
     pub fn pump(&mut self) -> bool {
+        // Clear before reading, so output that arrives after the read
+        // wakes the next frame.
+        self.wake_pending.store(false, Ordering::Release);
         if self.exited() {
             self.child.try_reap();
             return false;
@@ -260,6 +281,8 @@ impl TerminalPane {
                 self.terminal.scroll_viewport(ScrollViewport::Bottom);
                 self.pty.write(&self.response);
                 self.response.clear();
+                self.pty.wait_readable(ECHO_WAIT);
+                self.pump();
             }
         }
         if response.hovered() {
