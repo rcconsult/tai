@@ -17,7 +17,7 @@ use std::{
 
 use eframe::egui;
 use libghostty_vt::{
-    Terminal, TerminalOptions,
+    Terminal,
     key::{self, Key},
     render::{CellIterator, Dirty, RenderState, RowIterator},
     screen::CellWide,
@@ -184,11 +184,13 @@ impl TerminalPane {
         let grid_size = Rc::new(Cell::new((cols, rows)));
         let cell_pixels = Rc::new(Cell::new(dims.cell_pixels()));
 
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols,
-            rows,
-            max_scrollback: 1000,
-        })?;
+        let mut terminal = Terminal::new(cols, rows)?;
+        terminal.set_scrollback_max_lines(Some(1000))?;
+        // ConPTY keeps its own screen and can't take scrollback back, so on
+        // Windows a resize mustn't pull scrollback into the active screen
+        // (docs/lessons/from-libghostty-projects.md, section 1).
+        #[cfg(windows)]
+        terminal.set_resize_pull_scrollback(Some(false))?;
         let (cell_w, cell_h) = dims.cell_pixels();
         terminal.resize(cols, rows, cell_w, cell_h)?;
         terminal
