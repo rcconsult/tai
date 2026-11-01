@@ -80,9 +80,15 @@ What fixed it:
 - Tests: accents, ZWJ sequences, variation selectors, mode 2027 on and
   off, and a tiny atlas filled with many distinct clusters.
 
-**In tai:** `walk_row` reads the whole grapheme (`graphemes_utf8`) but
-picks the font by its first codepoint, and `GlyphAtlas` keys glyphs by
-`(Face, char, px)`. The `grapheme-cluster` branch is parked.
+**In tai:** `Coverage::cluster_face` picks one font for the whole
+cluster, as Ghostty's `RunIterator.indexForCell` does, and both binaries'
+row walks use it. tai doesn't shape, so it draws the first codepoint and
+the zero-advance marks after it, and stops at anything that would
+advance (the rest of a ZWJ sequence, a skin tone, a flag's second
+letter). A cluster can't draw past its cells, so `GlyphAtlas` keeps
+per-glyph keys, `(Face, char, px)`: the cluster's cell width is already
+in `px`, through `Coverage::place`. Mode 2027 stays off by default
+(`libghostty-vt-pitfalls.md`).
 
 ## 4. Font fallback: cache per font, ask loaded fonts first
 

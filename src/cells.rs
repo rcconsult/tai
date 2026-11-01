@@ -495,3 +495,66 @@ impl TextPass {
         ctx.end_render_pass();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fonts::{Coverage, IOSEVKA_BYTES};
+
+    /// Queue one cell's cluster as walk_row does, returning its instances.
+    fn push(atlas: &mut GlyphAtlas, coverage: &Coverage, cluster: &str) -> Vec<Instance> {
+        let mut text = cluster.to_string();
+        let face = coverage.cluster_face(&mut text);
+        let mut out = Vec::new();
+        let white = Color::new(1.0, 1.0, 1.0, 1.0);
+        let font = coverage.font(face);
+        atlas.push_text(
+            &mut out, font, face, &text, 0.0, 40.0, 48, 1.0, white, false,
+        );
+        out
+    }
+
+    /// An atlas that can't grow past its first 256 rows, filled with far
+    /// more distinct clusters than fit: glyphs placed early keep their
+    /// place, every instance points inside the atlas, and the ones that
+    /// don't fit are left out instead of drawing someone else's pixels.
+    #[test]
+    fn a_tiny_atlas_full_of_distinct_clusters() {
+        let coverage = Coverage::without_discovery().unwrap();
+        let iosevka = Typeface::new(IOSEVKA_BYTES, 0).unwrap();
+        let mut atlas = GlyphAtlas::new(256);
+        // Latin, Greek and Cyrillic letters, alone and with marks.
+        let bases = ('A'..='Z')
+            .chain('a'..='z')
+            .chain('\u{391}'..='\u{3a9}')
+            .chain('\u{410}'..='\u{44f}')
+            .filter(|&ch| iosevka.has(ch));
+        let marks = ['\u{301}', '\u{308}', '\u{305}', '\u{331}'];
+        let clusters: Vec<String> = bases
+            .flat_map(|b| {
+                std::iter::once(b.to_string()).chain(marks.iter().map(move |m| format!("{b}{m}")))
+            })
+            .collect();
+        assert!(clusters.len() > 500);
+        let first = push(&mut atlas, &coverage, &clusters[0]);
+        assert_eq!(first.len(), 1);
+        let mut dropped = 0;
+        for cluster in &clusters {
+            let instances = push(&mut atlas, &coverage, cluster);
+            if instances.len() < cluster.chars().count() {
+                dropped += 1;
+            }
+            for i in &instances {
+                let [x, y, w, h] = i.src;
+                assert!(x + w <= ATLAS_WIDTH as f32 && y + h <= atlas.height as f32);
+            }
+        }
+        assert_eq!(atlas.height, 256);
+        assert!(dropped > 0, "the atlas never filled up");
+        // The first glyph is where it was.
+        assert_eq!(
+            push(&mut atlas, &coverage, &clusters[0])[0].src,
+            first[0].src
+        );
+    }
+}

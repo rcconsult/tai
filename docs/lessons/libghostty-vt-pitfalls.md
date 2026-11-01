@@ -118,13 +118,12 @@ because a narrow symbol may grow into a blank next cell, as in Ghostty
 (`src/renderer/cell.zig`, `constraintWidth`). Programs that handle
 grapheme widths can still turn 2027 on themselves; tai honours it.
 
-Branch `grapheme-cluster` turns it on at startup. Before reviving it,
-tai also needs to shape ZWJ sequences, flags and skin tones into one
-glyph: with 2027 on, each such sequence gets two cells, and tai draws
-every codepoint in them, so they overlap the next cells. The bundled Noto
-Emoji has GSUB ligatures for these sequences. A full reset (`ESC c`)
-would also turn the mode off, because libghostty-vt's C API has no
-default-modes option.
+Branch `grapheme-cluster` turns it on at startup. With 2027 on, a ZWJ
+sequence, flag or skin tone gets two cells, and tai draws only its first
+emoji there (`Coverage::cluster_face`): showing the whole sequence needs
+the GSUB ligatures the bundled Noto Emoji has, and tai doesn't shape. A
+full reset (`ESC c`) would also turn the mode off, because libghostty-vt's
+C API has no default-modes option.
 
 ## encode_to_vec can drop a key or mouse event
 

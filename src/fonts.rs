@@ -443,6 +443,13 @@ impl Coverage {
         Self::with_discovery(discovery::find)
     }
 
+    /// The bundled fonts only: the OS is never asked, so tests outside this
+    /// module see the same faces on every platform.
+    #[cfg(test)]
+    pub fn without_discovery() -> Result<Self, &'static str> {
+        Self::with_discovery(|_| None)
+    }
+
     fn with_discovery(find: fn(char) -> Option<FontFile>) -> Result<Self, &'static str> {
         let primary = Typeface::new(PRIMARY_BYTES, 0)?;
         let symbols = Typeface::new(SYMBOLS_BYTES, 0)?;
@@ -532,19 +539,101 @@ impl Coverage {
     pub fn face_for(&self, ch: char) -> Face {
         if is_space(ch) {
             Face::Blank
-        } else if self.primary.has(ch) {
-            Face::Primary
-        } else if self.symbols.has(ch) {
-            Face::Symbols
-        } else if self.iosevka.has(ch) {
-            Face::Iosevka
-        } else if self.emoji.has(ch) {
-            Face::Emoji
-        } else if let Some(slot) = self.discovered(ch) {
-            Face::Discovered(slot)
         } else {
-            Face::Primary
+            self.find_face(ch).unwrap_or(Face::Primary)
         }
+    }
+
+    /// The first font in the chain with a glyph for `ch`, `None` when no
+    /// font has one.
+    fn find_face(&self, ch: char) -> Option<Face> {
+        if self.primary.has(ch) {
+            Some(Face::Primary)
+        } else if self.symbols.has(ch) {
+            Some(Face::Symbols)
+        } else if self.iosevka.has(ch) {
+            Some(Face::Iosevka)
+        } else if self.emoji.has(ch) {
+            Some(Face::Emoji)
+        } else {
+            self.discovered(ch).map(Face::Discovered)
+        }
+    }
+
+    /// Whether `face` has a glyph for `ch` that tai can draw.
+    fn covers(&self, face: Face, ch: char) -> bool {
+        match face {
+            Face::Blank => false,
+            Face::Discovered(_) => self.font(face).has_outline(ch),
+            _ => self.font(face).has(ch),
+        }
+    }
+
+    /// The face for a cell's grapheme cluster, `text`, which is trimmed in
+    /// place to the codepoints tai draws.
+    ///
+    /// One face draws the whole cluster: the first of the faces for its
+    /// codepoints that has all of them, ignoring VS15, VS16 and ZWJ, as
+    /// Ghostty's `RunIterator.indexForCell` (`src/font/shaper/run.zig` at
+    /// a887df42 "terminal: bound page map probe lengths without tombstones
+    /// (#13294)") chooses. When none has them all, the cell draws U+FFFD,
+    /// as Ghostty's does.
+    ///
+    /// tai has no shaper, so of the cluster it draws the first codepoint
+    /// and the zero-advance marks right after it, such as U+0301 on e,
+    /// laid out one after another as fonts design marks to be when nothing
+    /// positions them (a mark's ink lies left of its origin). It stops at
+    /// the first codepoint that would advance or joins: the rest of an
+    /// emoji ZWJ sequence, a skin tone, a flag's second letter, a keycap's
+    /// frame, a spacing mark. Only a ligature draws those within the
+    /// cluster's cells, so the cluster never draws past the columns the
+    /// terminal gave it. When that leaves the base alone, it's drawn in its
+    /// own face. VS15 and VS16 are dropped: no font draws them (Ghostty's
+    /// `run.zig` doesn't send them to the shaper either).
+    ///
+    /// A single codepoint, the common case, is just `face_for`.
+    pub fn cluster_face(&self, text: &mut String) -> Face {
+        let mut chars = text.chars();
+        let Some(base) = chars.next() else {
+            return Face::Blank;
+        };
+        if chars.next().is_none() {
+            return self.face_for(base);
+        }
+        text.retain(|ch| !matches!(ch, '\u{fe0e}' | '\u{fe0f}'));
+        if text.chars().nth(1).is_none() || is_space(base) {
+            return self.face_for(base);
+        }
+        let rest = || text.chars().skip(1).filter(|&ch| ch != '\u{200d}');
+        let candidates: Option<Vec<Face>> = std::iter::once(base)
+            .chain(rest())
+            .map(|ch| self.find_face(ch))
+            .collect();
+        let face = candidates.and_then(|faces| {
+            faces
+                .into_iter()
+                .find(|&face| self.covers(face, base) && rest().all(|ch| self.covers(face, ch)))
+        });
+        let Some(face) = face else {
+            text.clear();
+            text.push('\u{fffd}');
+            return self.face_for('\u{fffd}');
+        };
+        let font = self.font(face);
+        let end = text
+            .char_indices()
+            .skip(1)
+            .find(|&(_, ch)| ch == '\u{200d}' || font.advance(ch, PROBE_PX) != 0.0)
+            .map(|(at, _)| at);
+        if let Some(end) = end {
+            text.truncate(end);
+        }
+        if text.len() == base.len_utf8() {
+            // Only the base is left, so it's drawn in its own face: Noto
+            // Emoji has the 1 of 1️⃣ only as a small keycap digit.
+            return self.face_for(base);
+        }
+        face
     }
 
     /// The font that draws `face`. `Blank` draws nothing, so any font will
@@ -765,5 +854,105 @@ mod tests {
         assert!((20.0..=24.5).contains(&width), "{width}");
         // The cell count doesn't change a discovered face's size.
         assert_eq!(c.place(face, 20, 1), place);
+    }
+
+    /// `text`'s face as a cell's cluster, and what's left of it to draw.
+    /// The OS isn't asked, so the answer doesn't depend on the host.
+    fn cluster(text: &str) -> (Face, String) {
+        let c = Coverage::with_discovery(|_| None).unwrap();
+        let mut text = text.to_string();
+        (c.cluster_face(&mut text), text)
+    }
+
+    #[test]
+    fn a_single_codepoint_is_its_own_face() {
+        assert_eq!(cluster("A"), (Face::Primary, "A".into()));
+        assert_eq!(cluster("\u{e9}"), (Face::Primary, "\u{e9}".into()));
+        assert_eq!(cluster(" "), (Face::Blank, " ".into()));
+    }
+
+    #[test]
+    fn a_decomposed_accent_keeps_its_mark() {
+        // é as e + U+0301: JetBrains Mono has both.
+        assert_eq!(cluster("e\u{301}"), (Face::Primary, "e\u{301}".into()));
+        // U+0305 COMBINING OVERLINE is only in Iosevka, which has e too, so
+        // Iosevka draws the whole cluster (Ghostty's indexForCell).
+        assert_eq!(cluster("e\u{305}"), (Face::Iosevka, "e\u{305}".into()));
+    }
+
+    #[test]
+    fn a_cluster_no_font_can_draw_shows_the_replacement_character() {
+        // U+1AF1 is in none of the bundled fonts.
+        assert_eq!(cluster("e\u{1af1}"), (Face::Primary, "\u{fffd}".into()));
+    }
+
+    #[test]
+    fn a_mark_is_laid_out_over_its_base() {
+        let c = Coverage::with_discovery(|_| None).unwrap();
+        let font = c.font(Face::Primary);
+        let e = font.metrics('e', PROBE_PX);
+        let acute = font.metrics('\u{301}', PROBE_PX);
+        assert_eq!(font.advance('\u{301}', PROBE_PX), 0.0);
+        // Drawn at the pen after e, the accent's ink lands over e's.
+        let ink = e.advance_width + acute.xmin as f32;
+        assert!(ink >= e.xmin as f32 && ink + acute.width as f32 <= e.advance_width);
+    }
+
+    #[test]
+    fn emoji_sequences_draw_their_first_emoji() {
+        // Only a ligature fits these in their cells, and tai doesn't shape.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(cluster(family), (Face::Emoji, "\u{1f468}".into()));
+        let thumbs_medium = "\u{1f44d}\u{1f3fd}";
+        assert_eq!(cluster(thumbs_medium), (Face::Emoji, "\u{1f44d}".into()));
+        let flag_us = "\u{1f1fa}\u{1f1f8}";
+        assert_eq!(cluster(flag_us), (Face::Emoji, "\u{1f1fa}".into()));
+        // Noto Emoji has 1 and the keycap frame, but the frame advances,
+        // so only the 1 is drawn, in the primary rather than as Noto
+        // Emoji's small keycap digit.
+        assert_eq!(cluster("1\u{fe0f}\u{20e3}"), (Face::Primary, "1".into()));
+    }
+
+    #[test]
+    fn variation_selectors_are_dropped() {
+        // ☸ with VS16 (emoji) and VS15 (text); Noto Emoji is the only
+        // bundled font with it. ❤ is in Iosevka, which comes first.
+        assert_eq!(
+            cluster("\u{2638}\u{fe0f}"),
+            (Face::Emoji, "\u{2638}".into())
+        );
+        assert_eq!(
+            cluster("\u{2638}\u{fe0e}"),
+            (Face::Emoji, "\u{2638}".into())
+        );
+        assert_eq!(
+            cluster("\u{2764}\u{fe0f}"),
+            (Face::Iosevka, "\u{2764}".into())
+        );
+    }
+
+    #[test]
+    fn what_a_cluster_draws_after_its_base_never_advances() {
+        let c = Coverage::with_discovery(|_| None).unwrap();
+        let clusters = [
+            "e\u{301}\u{323}",
+            "a\u{305}\u{331}",
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+            "\u{1f44d}\u{1f3fb}",
+            "\u{1f1ef}\u{1f1f5}",
+            "1\u{fe0f}\u{20e3}",
+            "\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}",
+        ];
+        for text in clusters {
+            let mut drawn = text.to_string();
+            let face = c.cluster_face(&mut drawn);
+            let font = c.font(face);
+            let rest: f32 = drawn
+                .chars()
+                .skip(1)
+                .map(|ch| font.advance(ch, PROBE_PX))
+                .sum();
+            assert_eq!(rest, 0.0, "{text:?} drew {drawn:?} in {face:?}");
+        }
     }
 }

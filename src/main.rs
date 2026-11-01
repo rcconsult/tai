@@ -40,6 +40,7 @@ use libghostty_vt::{
     kitty::graphics::{self, DecodePng, DecodedImage, Graphics, Layer, PlacementIterator},
     mouse,
     render::{CellIteration, CellIterator, Colors, Dirty, RenderState, RowIterator},
+    screen::CellWide,
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     style::{RgbColor, StyleColor},
     terminal::{
@@ -1180,14 +1181,8 @@ fn walk_row(
         let graphemes = cell.graphemes_len()?;
         let bg = cell.bg_color()?;
         if graphemes > 0 {
-            // Convert read grapheme codepoints into UTF-8 text.
+            // The whole grapheme cluster as UTF-8 text.
             cell.graphemes_utf8(text)?;
-            // VS15/VS16 only choose text or emoji presentation; no font
-            // draws them, so they'd show as missing-glyph boxes. Ghostty
-            // drops them before shaping too (`src/font/shaper/run.zig`, "Do
-            // not send presentation modifiers", at a887df4 "terminal: bound
-            // page map probe lengths without tombstones (#13294)").
-            text.retain(|ch| !matches!(ch, '\u{fe0e}' | '\u{fe0f}'));
         }
         if std::mem::take(&mut icon_open)
             && (graphemes == 0 || text.chars().next().is_some_and(is_space))
@@ -1249,15 +1244,16 @@ fn walk_row(
             sink.background(x, has_bg.then_some(bg));
 
             // A fallback font draws what the primary lacks (e.g. Nerd Font
-            // icons). The first codepoint decides for the whole grapheme.
-            let face = text
-                .chars()
-                .next()
-                .map_or(Face::Primary, |ch| coverage.face_for(ch));
+            // icons). One face draws the whole cluster, trimmed to what tai
+            // can draw without a shaper (`Coverage::cluster_face`).
+            let face = coverage.cluster_face(text);
             if matches!(
                 face,
                 Face::Symbols | Face::Iosevka | Face::Emoji | Face::Discovered(_)
             ) {
+                // A wide cell spans two cells; a narrow one may take the
+                // next cell too if that turns out blank.
+                let wide = cell.raw_cell()?.wide()? == CellWide::Wide;
                 icons.push(Icon {
                     text: text.clone(),
                     face,
@@ -1265,9 +1261,9 @@ fn walk_row(
                     y,
                     fg: color(fg),
                     bold,
-                    cells: 1,
+                    cells: if wide { 2 } else { 1 },
                 });
-                icon_open = true;
+                icon_open = !wide;
             } else if face == Face::Primary {
                 sink.text(text, x, fg, bold);
             }
@@ -1321,7 +1317,8 @@ struct Icon {
     y: f32,
     fg: Color,
     bold: bool,
-    /// How many cells it spans: 2 when the next cell is blank.
+    /// How many cells it spans: 2 for a wide cell, or a narrow one whose
+    /// next cell is blank.
     cells: u8,
 }
 
@@ -2540,6 +2537,106 @@ mod tests {
         let expected = super::in_band_size_report((100, 30), (9, 18));
         assert_eq!(expected, "\x1b[48;30;100;540;900t");
         assert_eq!(*sent.borrow(), expected.as_bytes());
+    }
+
+    /// The first row's cells after `line` is written, with grapheme
+    /// clustering (mode 2027) on or off: each cell's text and width, as
+    /// walk_row reads them. Spacer cells are left out.
+    fn first_row_cells(
+        line: &str,
+        clustering: bool,
+    ) -> Vec<(String, libghostty_vt::screen::CellWide)> {
+        use libghostty_vt::{
+            Terminal, TerminalOptions,
+            render::{CellIterator, RenderState, RowIterator},
+            terminal::Mode,
+        };
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 40,
+            rows: 2,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        terminal
+            .set_mode(Mode::GRAPHEME_CLUSTER, clustering)
+            .unwrap();
+        terminal.vt_write(line.as_bytes());
+        let mut state = RenderState::new().unwrap();
+        let mut rows = RowIterator::new().unwrap();
+        let mut cells = CellIterator::new().unwrap();
+        let snapshot = state.update(&terminal).unwrap();
+        let mut row_it = rows.update(&snapshot).unwrap();
+        let row = row_it.next().unwrap();
+        let mut cell_it = cells.update(row).unwrap();
+        let mut out = Vec::new();
+        while let Some(cell) = cell_it.next() {
+            if cell.graphemes_len().unwrap() == 0 {
+                continue;
+            }
+            let mut text = String::new();
+            cell.graphemes_utf8(&mut text).unwrap();
+            out.push((text, cell.raw_cell().unwrap().wide().unwrap()));
+        }
+        out
+    }
+
+    /// What tai draws in each cell of `line`: the cell's text trimmed by
+    /// `Coverage::cluster_face`, and whether the cell is wide.
+    fn drawn(
+        coverage: &crate::fonts::Coverage,
+        line: &str,
+        clustering: bool,
+    ) -> Vec<(String, bool)> {
+        first_row_cells(line, clustering)
+            .into_iter()
+            .map(|(mut text, wide)| {
+                coverage.cluster_face(&mut text);
+                (text, wide == libghostty_vt::screen::CellWide::Wide)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clusters_draw_within_their_cells_with_mode_2027_off_and_on() {
+        let coverage = crate::fonts::Coverage::without_discovery().unwrap();
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let cells = |items: &[(&str, bool)]| {
+            items
+                .iter()
+                .map(|&(t, w)| (t.to_string(), w))
+                .chain([("x".to_string(), false)])
+                .collect::<Vec<_>>()
+        };
+        // Off (tai's default): libghostty-vt gives each emoji, skin tone
+        // and flag letter its own cells, and tai draws each one there.
+        let off = |line: &str| drawn(&coverage, &format!("{line}x"), false);
+        assert_eq!(off("e\u{301}"), cells(&[("e\u{301}", false)]));
+        assert_eq!(
+            off(family),
+            cells(&[
+                ("\u{1f468}", true),
+                ("\u{1f469}", true),
+                ("\u{1f467}", true)
+            ])
+        );
+        assert_eq!(
+            off("\u{1f44d}\u{1f3fd}"),
+            cells(&[("\u{1f44d}", true), ("\u{1f3fd}", true)])
+        );
+        assert_eq!(
+            off("\u{1f1fa}\u{1f1f8}"),
+            cells(&[("\u{1f1fa}", true), ("\u{1f1f8}", true)])
+        );
+        assert_eq!(off("\u{2638}\u{fe0f}"), cells(&[("\u{2638}", false)]));
+        // On: each sequence is one wide cell, and tai draws its first emoji
+        // there; the rest needs a ligature.
+        let on = |line: &str| drawn(&coverage, &format!("{line}x"), true);
+        assert_eq!(on("e\u{301}"), cells(&[("e\u{301}", false)]));
+        assert_eq!(on(family), cells(&[("\u{1f468}", true)]));
+        assert_eq!(on("\u{1f44d}\u{1f3fd}"), cells(&[("\u{1f44d}", true)]));
+        assert_eq!(on("\u{1f1fa}\u{1f1f8}"), cells(&[("\u{1f1fa}", true)]));
+        assert_eq!(on("\u{2638}\u{fe0f}"), cells(&[("\u{2638}", true)]));
+        assert_eq!(on("\u{2638}\u{fe0e}"), cells(&[("\u{2638}", false)]));
     }
 
     #[test]

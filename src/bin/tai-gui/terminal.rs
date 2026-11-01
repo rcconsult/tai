@@ -570,12 +570,9 @@ impl TerminalPane {
                     }
                     if graphemes > 0 {
                         cell.graphemes_utf8(&mut text)?;
-                        // VS15/VS16 have no glyph (see walk_row in src/main.rs).
-                        text.retain(|ch| !matches!(ch, '\u{fe0e}' | '\u{fe0f}'));
-                        let face = text
-                            .chars()
-                            .next()
-                            .map_or(Face::Primary, |ch| self.coverage.face_for(ch));
+                        // One face for the whole cluster, trimmed to what
+                        // tai draws (see walk_row in src/main.rs).
+                        let face = self.coverage.cluster_face(&mut text);
                         if face != Face::Blank && !text.is_empty() {
                             // A wide character is drawn two cells wide, as
                             // Ghostty's constraintWidth does for grid width 2
