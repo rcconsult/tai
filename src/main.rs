@@ -72,6 +72,15 @@ mod sixel;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Room to leave in an output buffer before libghostty-vt encodes a key or
+/// mouse event into it. Its `encode_to_vec` (0.2.2, `src/key.rs` and
+/// `src/mouse.rs`) retries a too-small buffer with
+/// `reserve(required - remaining)`, and `reserve` counts from the length,
+/// so with bytes already queued the retry can fail too and the event is
+/// lost ("out of space, 16 bytes required", seen in tai-gui). Every key and
+/// mouse sequence fits in this.
+const ENCODE_ROOM: usize = 64;
+
 /// Whether `TAI_APPLE_GFX=metal` asks for Metal. Other platforms ignore it.
 fn use_metal() -> bool {
     cfg!(target_vendor = "apple") && std::env::var("TAI_APPLE_GFX").as_deref() == Ok("metal")
@@ -2367,6 +2376,7 @@ impl<'alloc> Input<'alloc> {
             .set_unshifted_codepoint(ucp)
             .set_utf8(text);
 
+        self.response.reserve(ENCODE_ROOM);
         self.key_encoder
             // Sync encoder options from the terminal so mode changes (e.g.
             // application cursor keys, Kitty keyboard protocol) are honoured.
@@ -2460,6 +2470,7 @@ impl<'alloc> Input<'alloc> {
             };
 
             self.mouse_event.set_action(action).set_button(Some(btn));
+            self.response.reserve(ENCODE_ROOM);
             self.mouse_encoder
                 .encode_to_vec(&self.mouse_event, &mut self.response)?;
         }
@@ -2481,6 +2492,7 @@ impl<'alloc> Input<'alloc> {
                         .find(|(mb, _)| is_mouse_button_down(*mb))
                         .map(|(_, btn)| btn),
                 );
+            self.response.reserve(ENCODE_ROOM);
             self.mouse_encoder
                 .encode_to_vec(&self.mouse_event, &mut self.response)?;
         }
@@ -2501,10 +2513,12 @@ impl<'alloc> Input<'alloc> {
                 self.mouse_event
                     .set_button(Some(scroll_btn))
                     .set_action(mouse::Action::Press);
+                self.response.reserve(ENCODE_ROOM);
                 self.mouse_encoder
                     .encode_to_vec(&self.mouse_event, &mut self.response)?;
 
                 self.mouse_event.set_action(mouse::Action::Release);
+                self.response.reserve(ENCODE_ROOM);
                 self.mouse_encoder
                     .encode_to_vec(&self.mouse_event, &mut self.response)?;
             } else {
@@ -3422,6 +3436,50 @@ mod tests {
         assert_eq!(encode(Some("\u{f701}")), "\u{f701}".as_bytes());
         assert!(super::is_function_key_char('\u{f701}'));
         assert!(!super::is_function_key_char('a'));
+    }
+
+    #[test]
+    fn a_key_queued_after_other_bytes_isnt_lost() {
+        use libghostty_vt::{
+            Terminal, TerminalOptions,
+            key::{self, Key},
+        };
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        // Every Kitty keyboard flag, for a long sequence.
+        terminal.vt_write(b"\x1b[>31u");
+        let mut encoder = key::Encoder::new().unwrap();
+        let mut event = key::Event::new().unwrap();
+        let all = key::Mods::CTRL | key::Mods::ALT | key::Mods::SHIFT | key::Mods::SUPER;
+        event
+            .set_action(key::Action::Press)
+            .set_key(Key::A)
+            .set_mods(all)
+            .set_consumed_mods(key::Mods::empty())
+            .set_unshifted_codepoint('a')
+            .set_utf8(Some("A"));
+        encoder.set_options_from_terminal(&terminal);
+        let mut alone = Vec::new();
+        encoder.encode_to_vec(&event, &mut alone).unwrap();
+        assert!(alone.len() >= 10, "{alone:?}");
+
+        // One byte already queued in an 8-byte buffer: libghostty-vt's
+        // retry reserves too little and the key is lost. If this starts
+        // passing, the crate is fixed and ENCODE_ROOM can go.
+        let mut queued = Vec::with_capacity(8);
+        queued.extend_from_slice(b"1234567");
+        assert!(encoder.encode_to_vec(&event, &mut queued).is_err());
+
+        // With the room reserved first, it arrives whole.
+        let mut queued = Vec::with_capacity(8);
+        queued.extend_from_slice(b"1234567");
+        queued.reserve(super::ENCODE_ROOM);
+        encoder.encode_to_vec(&event, &mut queued).unwrap();
+        assert_eq!(&queued[7..], &alone[..]);
     }
 
     #[test]
