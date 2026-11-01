@@ -6,11 +6,15 @@
 //! exit status. ConPTY keeps its output pipe open after the shell exits, so
 //! `read` reports end of stream once the waiter has seen the exit.
 //!
+//! Input goes through a writer thread, as on Unix, so a child that stops
+//! reading its input fills the pipe without freezing tai's window.
+//!
 //! Unlike the Unix reader, this one's channel is unbounded. Microsoft warns
 //! that a ConPTY host must keep draining the output pipe on its own thread,
 //! or a blocking write to the input pipe can deadlock against it ("Creating
-//! a Pseudoconsole session", Preparing the communication channels). tai
-//! writes input from the frame loop, so the reader must never stop reading.
+//! a Pseudoconsole session", Preparing the communication channels). The
+//! writer thread blocks on the input pipe, so the reader must never stop
+//! reading.
 
 use std::{
     io::{Read, Write},
@@ -33,7 +37,8 @@ type Chunk = std::io::Result<Vec<u8>>;
 /// Handle to a pseudo console.
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// Input for the writer thread.
+    input: mpsc::Sender<Vec<u8>>,
     output: Receiver<Chunk>,
     /// A chunk wait_readable took from `output`, for the next read.
     waited: Mutex<Option<Chunk>>,
@@ -86,6 +91,10 @@ impl Pty {
             .try_clone_reader()
             .map_err(std::io::Error::other)?;
         let writer = pair.master.take_writer().map_err(std::io::Error::other)?;
+        let (input, queued) = mpsc::channel::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name("pty-writer".into())
+            .spawn(move || write_loop(writer, &queued))?;
 
         let (tx, output) = mpsc::channel::<Chunk>();
         std::thread::spawn(move || {
@@ -117,7 +126,7 @@ impl Pty {
 
         let pty = Self {
             master: pair.master,
-            writer: Mutex::new(writer),
+            input,
             output,
             waited: Mutex::new(None),
             exit: Arc::clone(&exit),
@@ -167,14 +176,13 @@ impl Pty {
         }
     }
 
-    /// Best-effort write to the pseudo console. Errors drop the data, as on
-    /// Unix.
+    /// Queue input for the pseudo console. The writer thread writes it in
+    /// order at the pace the child reads; nothing here waits on the pipe.
     pub fn write(&self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-        if let Ok(mut writer) = self.writer.lock() {
-            _ = writer.write_all(data).and_then(|()| writer.flush());
+        if !data.is_empty() {
+            // A closed channel means the writer hit an error; the input is
+            // dropped, as before.
+            _ = self.input.send(data.to_vec());
         }
     }
 
@@ -333,4 +341,56 @@ fn default_shell() -> PathBuf {
         .filter(|root| root.is_absolute())
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     root.join(r"System32\cmd.exe")
+}
+
+/// The writer thread: write queued input in order, blocking on the pipe
+/// while the child isn't reading, as Ghostty's I/O thread writes from a
+/// queue (`src/termio/Exec.zig`, `queueWrite`, at a887df42). It ends when
+/// the Pty is dropped or a write fails.
+fn write_loop(mut writer: impl Write, queued: &Receiver<Vec<u8>>) {
+    for data in queued {
+        if writer
+            .write_all(&data)
+            .and_then(|()| writer.flush())
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Read,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    use super::write_loop;
+
+    #[test]
+    fn queued_input_waits_for_a_slow_reader_and_arrives_whole() {
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let (input, queued) = mpsc::channel::<Vec<u8>>();
+        let thread = std::thread::spawn(move || write_loop(writer, &queued));
+
+        // A big paste, far more than a pipe holds, to a child that isn't
+        // reading yet: queueing it must not wait on the pipe.
+        let sent: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let start = Instant::now();
+        for chunk in sent.chunks(4096) {
+            input.send(chunk.to_vec()).unwrap();
+        }
+        assert!(start.elapsed() < Duration::from_millis(500));
+        drop(input);
+
+        // The child reads it later: all of it arrives, in order.
+        std::thread::sleep(Duration::from_millis(200));
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        thread.join().unwrap();
+        assert_eq!(got.len(), sent.len());
+        assert!(got == sent);
+    }
 }
