@@ -68,10 +68,20 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
    comes from a config setting or an environment variable (for example
    `$VISUAL`/`$EDITOR`, or Helix or Neovim). tai's own view is read-only
    with syntax highlighting.
-4. **Documents preview as scrollable PNG pages.** PowerPoint uses the
-   server's slide PNGs today. PDF and Word need the server to render
-   pages to PNG as well, a request to ppxai. Until then they open in the
-   OS viewer.
+4. **Documents preview as scrollable PNG pages, rendered by the server.**
+   - **LibreOffice found:** high-quality page images. The detection is
+     ppxai's, in the engine, not in the web app's JavaScript
+     (`ppxai/common/libreoffice.py`, `find_libreoffice`: the
+     `PPXAI_LIBREOFFICE` override, then `libreoffice` or `soffice` on
+     `PATH`, then the usual install folders for each OS). The server
+     reports `libreoffice_available` in its preview answers, so tai
+     needs no detection of its own, and a user who wants high-quality
+     output installs LibreOffice or sets `PPXAI_LIBREOFFICE`.
+   - **No LibreOffice:** the server's `text_fallback` (extracted text),
+     shown with a note on how to get page images.
+   - PowerPoint works this way today. PDF and Word need the server to
+     render pages to PNG as well, a request to ppxai. Until then they
+     open in the OS viewer.
 5. **Prototype first.** One window with a chat pane (Markdown, a
    streamed `/v1/oneshot` answer, through the ADR 0010 client) beside a
    libghostty-vt terminal pane, on Windows, Linux and macOS. It is
