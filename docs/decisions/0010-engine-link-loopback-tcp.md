@@ -135,3 +135,36 @@ their contract test pins a commit and expects churn.
   from loopback.
 - Startup time (4–7 s) gets in the way. Then start the server earlier or
   share one between tai windows.
+
+## Notes
+
+- **2026-11-01, the strict mode exists.** ppxai `feature/v1.19.5` at
+  `0ca511a7` adds `ppxai-server --owned` (ppxai ADR 0017,
+  `docs/decisions/0017-parent-owned-server-mode.md`). It's unreleased and
+  ships with 1.19.5. Its contract, from the ppxai session:
+  - `PPXAI_API_TOKEN` must be set in the child's environment, or the
+    server exits 2 before binding. It's honoured even under a file-only
+    secrets chain.
+  - The bearer is required on every route except CORS `OPTIONS`,
+    including `/health` and `/status`. A bearer probe of `/health`
+    answers 200 when ready, and 401 without the bearer.
+  - It binds 127.0.0.1 itself (port 0 unless `--port`; a non-loopback
+    `--host` is refused). The first stdout line is exactly one JSON
+    object, `{"host": "127.0.0.1", "port": N, "pid": P, "version":
+    "1.19.5"}`, meaning "bound"; readiness is still the `/health` probe.
+    Later stdout carries the normal startup lines, and logs go to stderr.
+  - `pid` is the real server's, not the PyInstaller bootloader's.
+  - On POSIX, EOF on a piped stdin stops the server gracefully. On
+    Windows, tai's job object covers it.
+  - Idle shutdown and the SSH hub are off, and no registry entry is
+    written. Combining it with `--uds`, `--announce`, `--detach` or
+    `--reload` exits 2.
+  - On the Windows host the first line arrived about 17 s after launch.
+    That isn't `--owned`: debug logging in the user's config shells out
+    to `git` for a version banner, which takes about 9 s there. The
+    first-line timeout must be generous.
+
+  So tai starts with `--owned`. A server older than 1.19.5 rejects the
+  flag and exits 2 with a usage error, and then tai falls back to
+  decisions 1 and 2. Decision 5 is done on ppxai's side; this record's
+  accepted risks close for servers that have the flag.
