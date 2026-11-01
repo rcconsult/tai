@@ -934,8 +934,12 @@ impl<'alloc> Renderer<'alloc> {
             WHITE,
             false,
         );
-        let screen =
+        // Camera2D::matrix flips y when there's no render target, because
+        // macroquad's own screen drawing goes through its own projection;
+        // the text pass uses this matrix directly, so flip it back.
+        let mut screen =
             Camera2D::from_display_rect(Rect::new(0.0, 0.0, dims.window_width, dims.window_height));
+        screen.zoom.y = -screen.zoom.y;
         grid.text
             .draw(&grid.instances, &mut grid.atlas, screen.matrix(), None);
     }
