@@ -50,8 +50,8 @@ keyword counts in `app.js`, and mapped to Rust:
 | Terminal view (xterm.js on a server-side PTY over a WebSocket) | tai's own libghostty-vt panes, local, and SSH in a pane | yes, natively |
 | Remote ppxai servers (`ssh-launcher-view.js`, ppxai ADR 0013's hub: launch and attach to `ppxai-server` on remote hosts over SSH) | an `ssh` child process, and the ADR 0010 client on the forwarded endpoint | yes, a feature of its own |
 | PowerPoint (the server renders each slide to PNG with LibreOffice; without it, per-slide text) | the PNGs, or the text | yes |
-| Code editor (CodeMirror 6, 30 languages, edit and save) | weak in Rust GUI crates beyond viewing and light edits | see decision 3 |
-| PDF (the browser's `<embed>`); Word (the server converts it to PDF) | needs a PDF library: `pdfium-render` bundles Google's C++ library, and MuPDF is AGPL | see decision 4 |
+| Code editor (CodeMirror 6, 30 languages, edit and save) | weak in Rust GUI crates beyond viewing and light edits | see decision 4 |
+| PDF (the browser's `<embed>`); Word (the server converts it to PDF) | needs a PDF library: `pdfium-render` bundles Google's C++ library, and MuPDF is AGPL | see decision 5 |
 
 Neither Mermaid nor KaTeX is used, so there's nothing more to port for
 diagrams or maths. The Linux session checked this table against the files
@@ -68,12 +68,34 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
    patch and the Metal leak workaround.
 2. **Terminal panes stay libghostty-vt.** The ADR 0008 cell renderer moves
    into an egui paint callback on the same wgpu device, with its shaders
-   ported to WGSL.
-3. **Code editing goes to a real editor in a terminal pane.** The editor
+   ported to WGSL. The macOS session's estimate for `src/cells.rs` (455
+   lines):
+   - **Ports as is:** the glyph atlas (shelf packing, fontdue
+     rasterising, dirty rows, the 36-byte `Instance` and its size caps),
+     except a ~25-line upload that becomes `queue.write_texture`.
+   - **Rewritten for wgpu:** `TextPass` (shader-version choice, pipeline,
+     texture-size query and draw). The two ~20-line shaders translate
+     directly to WGSL, and the texture-size cap comes from the adapter's
+     limits.
+   - **Unchanged:** the cell walk in `main.rs`.
+   - **Removed:** the immediate renderer and macroquad's side of
+     `fonts.rs`.
+3. **tai creates its wgpu instance with `VALIDATION_INDIRECT_CALL` off.**
+   On macOS 12.7 with Intel Iris Pro (eframe 0.37, wgpu 30.0.1), wgpu's
+   indirect-call validation builds a compute pipeline at device creation
+   that the Metal driver rejects ("Compiler encountered an internal
+   error"). Device creation then fails, after about 30 s per attempt.
+   `WGPU_VALIDATION_INDIRECT_CALL=0` works only where the instance reads
+   the environment (eframe does; `wgpu::Instance::default()` doesn't), so
+   tai clears the flag in code. wgpu has no GL backend on macOS, so Metal
+   is the only path there. With the flag cleared, a window repainting 40
+   changing text lines every frame ran 105 s at a steady 60 fps, with
+   memory flat at 56–63 MB: none of miniquad's Metal leak.
+4. **Code editing goes to a real editor in a terminal pane.** The editor
    comes from a config setting or an environment variable (for example
    `$VISUAL`/`$EDITOR`, or Helix or Neovim). tai's own view is read-only
    with syntax highlighting.
-4. **Documents preview as scrollable PNG pages, rendered by the server.**
+5. **Documents preview as scrollable PNG pages, rendered by the server.**
    - **LibreOffice found:** high-quality page images. The detection is
      ppxai's, in the engine, not in the web app's JavaScript
      (`ppxai/common/libreoffice.py`, `find_libreoffice`: the
@@ -87,11 +109,12 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
    - PowerPoint works this way today. PDF and Word need the server to
      render pages to PNG as well, a request to ppxai. Until then they
      open in the OS viewer.
-5. **Prototype first.** One window with a chat pane (Markdown, a
+6. **Prototype first.** One window with a chat pane (Markdown, a
    streamed `/v1/oneshot` answer, through the ADR 0010 client) beside a
    libghostty-vt terminal pane, on Windows, Linux and macOS. It is
    measured against today's macroquad build for frame time, input
-   latency and memory. If it holds up, this record becomes Accepted.
+   latency, memory, and idle CPU with egui's reactive repaint (tai idles at
+   about 4% CPU today). If it holds up, this record becomes Accepted.
 
 ## Why this and not the alternatives
 
@@ -131,5 +154,7 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
 - The prototype misses macroquad's frame time or input latency, or egui's
   text rendering isn't good enough for long Markdown answers.
 - ppxai can't render PDF pages to PNG.
+- A wgpu upgrade: recheck whether decision 3's workaround is still
+  needed on the macOS host.
 - A Rust code-editor widget matures enough to make an in-window editor
   worthwhile.
