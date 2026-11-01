@@ -11,9 +11,9 @@
 set -eu
 
 GHOSTTY_REPO="https://github.com/ghostty-org/ghostty.git"
-# ghostty-org/ghostty a887df42 "terminal: bound page map probe lengths
-# without tombstones (#13294)", pinned by libghostty-vt 0.2.2.
-GHOSTTY_COMMIT="a887df42c56f6de86c0fe6da9c4eeca37931e083"
+# ghostty-org/ghostty 521cf2c5 "Update VOUCHED list (#14798)", pinned by
+# libghostty-rs 575ed6b8.
+GHOSTTY_COMMIT="521cf2c5d30bd48028ca61546c64e7913764073d"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 dest="$root/.local/ghostty"

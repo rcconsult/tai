@@ -3,10 +3,10 @@
 #
 # Ghostty requires an exact Zig major.minor (src/build/zig.zig requireZig),
 # and the commit pinned in fetch-ghostty.sh declares minimum_zig_version
-# 0.15.2 in build.zig.zon. Change this together with that pin.
+# 0.17.0 in build.zig.zon. Change this together with that pin.
 set -eu
 
-ZIG_VERSION="0.15.2"
+ZIG_VERSION="0.17.0"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 dest="$root/.local/zig"
