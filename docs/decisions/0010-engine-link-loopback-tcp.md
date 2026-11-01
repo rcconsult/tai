@@ -164,7 +164,13 @@ their contract test pins a commit and expects churn.
     to `git` for a version banner, which takes about 9 s there. The
     first-line timeout must be generous.
 
-  So tai starts with `--owned`. A server older than 1.19.5 rejects the
-  flag and exits 2 with a usage error, and then tai falls back to
-  decisions 1 and 2. Decision 5 is done on ppxai's side; this record's
+  So tai starts with `--owned`. A server without the flag exits 2 with
+  argparse's usage error (checked at tag v1.19.4, `http.py`
+  `parse_args()`, and live on the installed Windows binary). tai falls
+  back to decisions 1 and 2 only when that stderr has both
+  `unrecognized arguments` and `--owned`. A missing token is a different
+  exit 2 (`ppxai-server: --owned needs PPXAI_API_TOKEN set by the parent
+  process`), and so are the other `--owned` refusals. tai doesn't probe
+  `--version` first: it took 7.2 s on its own on the Windows host, and
+  dev builds report 1.19.5 before and after the flag landed. Decision 5 is done on ppxai's side; this record's
   accepted risks close for servers that have the flag.
