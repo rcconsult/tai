@@ -58,7 +58,7 @@ impl TabViewer for Panes {
         ui.label(format!("{} pane: not built yet.", tab.title()));
     }
 
-    fn closeable(&mut self, _tab: &mut Tab) -> bool {
+    fn is_closeable(&self, _tab: &Tab) -> bool {
         false
     }
 }
