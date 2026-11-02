@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **tai** is a terminal app that runs the **ppxai engine harness** behind a UI built on **libghostty** (Ghostty's embeddable terminal library).
 
-**Status:** milestone (a) is scaffolded. `src/main.rs` is `ghostling_rs` from libghostty-rs v0.2.2 with tai changes, and its header records the provenance. Unit tests cover the shortcut mapping, font-size steps and paste encoding (`src/shortcuts.rs`). Font fallback to the bundled Symbols Nerd Font Mono and Iosevka Fixed is in `src/fonts.rs`, and `fonts/README.md` records where each font comes from.
+**Status:** milestone (a), the `tai` terminal, works on Linux, macOS and Windows 11. Milestone (b), `tai-gui` (ADR 0011), is early: a terminal pane and a one-shot chat pane. `src/main.rs` started as `ghostling_rs` from libghostty-rs v0.2.2, and its header records the provenance and tai's changes. Unit tests cover the shortcut mapping, font-size steps and paste encoding (`src/shortcuts.rs`). Font fallback to the bundled Symbols Nerd Font Mono and Iosevka Fixed is in `src/fonts.rs`, and `fonts/README.md` records where each font comes from.
 
 ## Build
 
@@ -14,20 +14,20 @@ Always build through `scripts/cargo.sh`, never plain `cargo`. libghostty-vt's bu
 
 - Build: `scripts/cargo.sh build` (the first build fetches Zig and Ghostty and compiles libghostty-vt, a few minutes)
 - Run: `scripts/cargo.sh run` (opens a window running `$SHELL`). tai draws with OpenGL on every platform, from GPU cell buffers (`src/cells.rs`, ADR 0008). ADR 0012 retired the immediate-mode renderer and the Metal opt-in, so an OpenGL older than 3.2 is an error. Fonts are read with skrifa and glyphs filled with zeno (`src/fonts.rs`, ADR 0012). `TAI_FRAME_STATS=1` logs per-second frame timings.
-- Shortcuts (`src/shortcuts.rs`, following Ghostty's defaults): on macOS, Cmd+C/V copy and paste and Cmd+= / Cmd+- / Cmd+0 change the font size. On Linux, it's Ctrl+Shift+C/V and Ctrl+= / Ctrl+- / Ctrl+0. Plain Ctrl+C and Ctrl+V go to the shell. The clipboard backend (`src/clipboard.rs`) is miniquad on Linux and `arboard` on macOS, because miniquad 0.4.11's macOS clipboard is a no-op stub.
+- Shortcuts (`src/shortcuts.rs`, following Ghostty's defaults): on macOS, Cmd+C/V copy and paste and Cmd+= / Cmd+- / Cmd+0 change the font size. On Linux and Windows, it's Ctrl+Shift+C/V and Ctrl+= / Ctrl+- / Ctrl+0. Plain Ctrl+C and Ctrl+V go to the shell. The clipboard backend (`src/clipboard.rs`) is miniquad on Linux and Windows and `arboard` on macOS, because miniquad 0.4.11's macOS clipboard is a no-op stub.
 - GUI ([ADR 0011](docs/decisions/0011-native-gui-egui.md)): `scripts/cargo.sh run --features gui --bin tai-gui` runs the egui app (`src/bin/tai-gui/`): tab stacks with a terminal pane and a chat pane that starts `ppxai-server --owned` itself. It needs Rust 1.95+ and a ppxai build with `--owned` (`TAI_PPXAI_SERVER` sets the path). It shares `cells.rs`, `fonts.rs`, `shortcuts.rs` and the pty modules through `#[path]`. On Windows it uses wgpu's GL backend unless `WGPU_BACKEND` says otherwise; on the Intel Iris Pro Mac it needs `WGPU_VALIDATION_INDIRECT_CALL=0`. `TAI_FRAME_STATS=1` logs frames, ui time and egui's repaint causes.
 - Lint: `scripts/cargo.sh fmt --check` and `scripts/cargo.sh clippy`, and with `--features gui --all-targets` for tai-gui
 - Test: `scripts/cargo.sh test`, or `scripts/cargo.sh test <name>` for a single test
 
 `vendor/macroquad` is macroquad 0.4.16 with a clipboard fix, used through `[patch.crates-io]`. Without the fix, macroquad's built-in UI empties the system clipboard on every Ctrl+C. `vendor/macroquad/TAI-PATCHES.md` lists the patches. When bumping macroquad, check whether upstream has fixed issue #546 before dropping the vendored copy.
 
-Three pins move together: the `libghostty-vt` version in `Cargo.toml`, `GHOSTTY_COMMIT` in `scripts/fetch-ghostty.sh` (it must equal the crate's `crates/libghostty-vt-sys/build.rs` pin), and `ZIG_VERSION` in `scripts/fetch-zig.sh` (it must match that Ghostty commit's `build.zig.zon` `minimum_zig_version`). `patches/ghostty/` holds upstream fixes backported onto the pin, which `fetch-ghostty.sh` applies; when the pin moves, drop each patch the new pin already contains.
+Three pins move together: the `libghostty-vt` git rev in `Cargo.toml` (a libghostty-rs commit, since 0.2.2 lacks `set_resize_pull_scrollback`), `GHOSTTY_COMMIT` in `scripts/fetch-ghostty.sh` (it must equal the crate's `crates/libghostty-vt-sys/build.rs` pin), and `ZIG_VERSION` in `scripts/fetch-zig.sh` (it must match that Ghostty commit's `build.zig.zon` `minimum_zig_version`). `patches/ghostty/` holds upstream fixes backported onto the pin, which `fetch-ghostty.sh` applies; when the pin moves, drop each patch the new pin already contains. The current pin needs none, so the directory doesn't exist.
 
 ## Stack
 
 [ADR 0001](docs/decisions/0001-stack-rust-libghostty-vt-ppxai-server.md) records the decision. In short:
 
-- **Rust**, using **libghostty-vt** through the crates.io `libghostty-vt` crate. Pin the Ghostty commit with `GHOSTTY_SOURCE_DIR` (see Build). Full libghostty (`ghostty.h`) supports Apple platforms only, and Ghostty says it's not for outside embedders.
+- **Rust**, using **libghostty-vt** through the `libghostty-vt` crate, pinned to a libghostty-rs git rev. Pin the Ghostty commit with `GHOSTTY_SOURCE_DIR` (see Build). Full libghostty (`ghostty.h`) supports Apple platforms only, and Ghostty says it's not for outside embedders.
 - libghostty-vt has no renderer and no PTY. tai draws the screen and spawns the child process itself.
 - **Milestone (a):** a PTY running `$SHELL` or ppxai's TUI, rendered with macroquad (from `ghostling_rs`, with audio off). **Milestone (b):** a native UI on egui over wgpu, with terminals as panes (ADR 0011, accepted after the `tai-gui` prototype).
 - **Engine:** tai launches `ppxai-server --owned` with a per-launch `PPXAI_API_TOKEN` as its own child process, on every platform, and reads the port from its first stdout line ([ADR 0010](docs/decisions/0010-engine-link-loopback-tcp.md); `--owned` is ppxai ADR 0017, in builds from `feature/v1.19.5` at `0ca511a7`). `src/bin/tai-gui/engine.rs` implements it. Don't run the engine in-process, which would force a Python host. Don't use stdio JSON-RPC either: it has no interrupt or consent handling.
