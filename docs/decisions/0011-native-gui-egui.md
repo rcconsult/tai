@@ -254,7 +254,8 @@ above; memory wasn't re-taken.
 - Linux `tai`'s typing median rose from 3.5 to 4.7 ms. The cause isn't
   known; `tai`'s 480% llvmpipe spin may slow the probe's screen grabs
   (0.9 ms per grab against 0.5 ms for `tai-gui`).
-- Linux idle CPU is the test host, not `tai`: llvmpipe with no vsync.
+- Linux idle CPU is `tai`'s own, but it comes from the test host: under
+  Xvfb `tai` draws with llvmpipe and nothing caps its frame rate.
 
 **Findings** of the first measurement.
 - egui's reactive repaint gives an idle `tai-gui` no frames at all,
