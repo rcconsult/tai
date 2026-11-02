@@ -233,7 +233,30 @@ Pro, Metal, `WGPU_VALIDATION_INDIRECT_CALL=0`.
 
 The engine is a separate process: about 90-100 MB.
 
-**Findings.**
+**Re-measured on 2026-11-02** at main `d9f0cf1`, after the Unix pty
+began gathering reads into one chunk (`3c0a85a`) and `tai-gui` began
+rebuilding only changed rows (`9d1c285`). Same hosts and methods as
+above; memory wasn't re-taken.
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Idle CPU, shell idle, `tai` → `tai-gui` | not re-taken | 480% → 0.1% | 2.7-3.9% → 0% |
+| Keypress to pixels, median | not re-taken | 4.7 → 4.85 ms | not measured |
+| Output flood, `tai` → `tai-gui` | 6.63-6.69 → 6.88 s (100,000 lines, shell-bound) | 1.26 → 1.11 s (`seq 1 3000000`) | 7.8-8.3 → 6.5-7.0 s (`seq 1 200000`) |
+| CPU during the flood, `tai` → `tai-gui` | not measured | not measured | 9.5-10.8% → 17.6-23.0% |
+
+- The flood gap is gone: `tai-gui` is now faster than `tai` on Linux
+  and macOS, and both halved on Linux. Windows is bound by PowerShell
+  generating the lines, and the gather change is Unix-only.
+- macOS flood time is mostly frame-bound: a first set of runs with the
+  display off gave 1.2 s (`tai`) and 0.36 s (`tai-gui`), so it isn't in
+  the table.
+- Linux `tai`'s typing median rose from 3.5 to 4.7 ms. The cause isn't
+  known; `tai`'s 480% llvmpipe spin may slow the probe's screen grabs
+  (0.9 ms per grab against 0.5 ms for `tai-gui`).
+- Linux idle CPU is the test host, not `tai`: llvmpipe with no vsync.
+
+**Findings** of the first measurement.
 - egui's reactive repaint gives an idle `tai-gui` no frames at all,
   once the pty's reader wakes egui only when output arrives, at most
   once per frame. A blinking text cursor alone kept egui at about 30
@@ -243,7 +266,8 @@ The engine is a separate process: about 90-100 MB.
   Linux median from 7.5 to 4.4 ms.
 - The flood gap on Linux (+22%) is per-frame work: the pane rebuilds
   and uploads every visible row on any change, where `tai` rebuilds
-  only dirty rows (ADR 0008). That's the first thing to tune. On macOS
+  only dirty rows (ADR 0008). That's the first thing to tune. (Done in
+  `9d1c285`; see the re-measure above.) On macOS
   `tai-gui` was faster but used about twice the CPU (20-26% against
   9-10%), and its ui time grew from about 0.7 to 1.1 ms over a flood.
 - Windows memory: wgpu's Vulkan backend on the AMD driver costs about
@@ -257,8 +281,10 @@ The engine is a separate process: about 90-100 MB.
 - Hazards found: egui-winit turns Ctrl+C/X/V into Copy/Cut/Paste events
   with no key event, so the terminal pane sends Ctrl+C and Ctrl+X on
   itself; libghostty-vt 0.2.2's `encode_to_vec` can drop a key when its
-  retry reserves too little (worked around in `tai-gui`, latent in
-  `tai`); clicked links in model output open only for http and https.
+  retry reserves too little (now worked around in both binaries,
+  `9e81ca4`; the unfiled upstream issue is
+  `docs/upstream/libghostty-rs-encode-to-vec.md`); clicked links in
+  model output open only for http and https.
 
 ## Triggers to revisit
 
