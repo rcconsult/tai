@@ -60,6 +60,62 @@ pub fn is_space(ch: char) -> bool {
     )
 }
 
+/// Whether `ch` is "symbol-like", as Ghostty's `is_symbol` decides
+/// (`src/build/uucode_config.zig` at 521cf2c5): private use, or one of the
+/// symbol and pictograph blocks. Only these may grow into a blank next cell.
+pub fn is_symbol(ch: char) -> bool {
+    matches!(
+        u32::from(ch),
+        0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd // private use
+            | 0x2190..=0x21ff // Arrows
+            | 0x2460..=0x24ff // Enclosed Alphanumerics
+            | 0x2600..=0x26ff // Miscellaneous Symbols
+            | 0x2700..=0x27bf // Dingbats
+            | 0x1f100..=0x1f1ff // Enclosed Alphanumeric Supplement
+            | 0x1f300..=0x1f5ff // Miscellaneous Symbols and Pictographs
+            | 0x1f600..=0x1f64f // Emoticons
+            | 0x1f680..=0x1f6ff // Transport and Map Symbols
+    )
+}
+
+/// Box drawing, block elements, legacy computing symbols and Powerline
+/// glyphs: Ghostty's `isGraphicsElement` (`src/renderer/cell.zig`).
+fn is_graphics_element(ch: char) -> bool {
+    matches!(
+        u32::from(ch),
+        0x2500..=0x259f | 0x1fb00..=0x1fbff | 0x1cc00..=0x1cebf | 0xe0b0..=0xe0d7
+    )
+}
+
+/// Ghostty's `constraintWidth` (`src/renderer/cell.zig` at 521cf2c5), fed
+/// one row's cells from left to right. A narrow symbol spans two cells when
+/// the next cell is empty or a space, unless it's in the last column or the
+/// cell before it holds a symbol other than a graphics element, so a run of
+/// icons stays one per cell. A wide cell always spans two: its next cell is
+/// its empty spacer tail, so `next` says a wide symbol grows into it.
+#[derive(Default)]
+pub struct SymbolSpan {
+    /// The last cell's first codepoint.
+    prev: Option<char>,
+    /// Whether the last cell is a narrow symbol that may take this one.
+    open: bool,
+}
+
+impl SymbolSpan {
+    /// Reads the next cell's first codepoint, `None` when it's empty.
+    /// Returns whether the symbol in the cell before it spans two cells.
+    pub fn next(&mut self, cp: Option<char>) -> bool {
+        let grow =
+            std::mem::take(&mut self.open) && cp.is_none_or(|ch| matches!(ch, ' ' | '\u{2002}'));
+        self.open = cp.is_some_and(is_symbol)
+            && !self
+                .prev
+                .is_some_and(|p| is_symbol(p) && !is_graphics_element(p));
+        self.prev = cp;
+        grow
+    }
+}
+
 /// A glyph's bitmap box and advance at one size, in pixels. `xmin` and
 /// `ymin` are the box's left and bottom edges from the pen position on the
 /// baseline, with y up, as fontdue reported them.
@@ -687,6 +743,49 @@ impl Coverage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The columns whose narrow symbol spans two cells, for a row of narrow
+    /// cells given as text, `_` standing for an empty cell.
+    fn grown(row: &str) -> Vec<usize> {
+        let mut span = SymbolSpan::default();
+        let mut out = Vec::new();
+        for (i, ch) in row.chars().enumerate() {
+            if span.next((ch != '_').then_some(ch)) {
+                out.push(i - 1);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_narrow_symbol_spans_two_cells_before_a_space_or_empty_cell() {
+        // ☸ (Miscellaneous Symbols) and a Nerd Font icon (private use).
+        assert_eq!(grown("☸ helm"), [0]);
+        assert_eq!(grown("x\u{f113}_y"), [1]);
+        assert_eq!(grown("☸\u{2002}x"), [0]);
+    }
+
+    #[test]
+    fn a_narrow_symbol_stays_one_cell_otherwise() {
+        // Before a letter, or before a space Ghostty doesn't count.
+        assert!(grown("☸helm").is_empty());
+        assert!(grown("☸\u{a0}x").is_empty());
+        // Not a symbol: ∀ is Mathematical Operators, é a letter.
+        assert!(grown("∀ x").is_empty());
+        assert!(grown("é x").is_empty());
+        // The last column has no next cell.
+        assert!(grown("ab☸").is_empty());
+    }
+
+    #[test]
+    fn a_symbol_after_a_symbol_stays_one_cell() {
+        // So a run of icons keeps one per cell; the first may still grow.
+        assert!(grown("☸☸ x").is_empty());
+        assert_eq!(grown("☸ ☸ x"), [0, 2]);
+        // A graphics element before it doesn't count: Powerline, a block.
+        assert_eq!(grown("\u{e0b0}\u{f113} x"), [1]);
+        assert_eq!(grown("█☸ x"), [1]);
+    }
 
     #[test]
     fn ascii_uses_the_primary_font() {
