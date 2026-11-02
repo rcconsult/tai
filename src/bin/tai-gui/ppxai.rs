@@ -13,11 +13,12 @@
 //! - `/v1/oneshot` is stable.
 //! - `/v1/agent/*` isn't sealed. tai relies only on what ppxai's fence
 //!   (`tests/test_run_session_contract.py`) pins: `session_id`,
-//!   `merged_at`, `?session=`, `?status=` and the two structured 409s of
-//!   `/sessions/merge-run-result`. The other fields are read when present.
-//! - `GET /status`'s `session_name`, the slot's conversation, comes from
-//!   the engine's state schema (`engine/app_state_schema.json`) and isn't
-//!   in the fence.
+//!   `merged_at`, `?session=`, `?status=`, the two structured 409s of
+//!   `/sessions/merge-run-result`, and `GET /status`'s `session_name`, the
+//!   slot's conversation. The other fields are read when present.
+//! - A conversation name is opaque: `session_` and more, unique per
+//!   conversation since ppxai `bac85e6e`. `GET /status`'s `session_id` is
+//!   the slot, not the conversation.
 //!
 //! `contract_against_a_live_server` below checks all of it against a real
 //! `ppxai-server --owned`.
@@ -325,7 +326,7 @@ mod tests {
     use super::{Answer, Client, MergeError, Run, RunFilter, detail, encode, json};
 
     // The shapes below are the ones ppxai's fence pins
-    // (tests/test_run_session_contract.py at f7c6acee).
+    // (tests/test_run_session_contract.py at bac85e6e).
 
     #[test]
     fn a_run_reads_its_conversation_and_merge_time() {
@@ -482,8 +483,10 @@ mod tests {
 
     /// ppxai ADR 0018 against a real server: run it with
     /// `scripts/cargo.sh test --features gui --bin tai-gui -- --ignored contract`.
-    /// It needs a ppxai-server with `--owned` and ADR 0018 (feature/v1.19.5
-    /// at f7c6acee or later; `TAI_PPXAI_SERVER` picks it), a provider that
+    /// It needs a ppxai-server with `--owned`, ADR 0018 and unique
+    /// conversation names (feature/v1.19.5 at bac85e6e, "fix(session): two
+    /// conversations started in the same second get distinct names", or
+    /// later; `TAI_PPXAI_SERVER` picks it), a provider that
     /// answers, and `execution.collect` not set to "no". It starts one
     /// tool-free run.
     #[test]
@@ -503,12 +506,8 @@ mod tests {
 
         let a = Client::new(&link).unwrap();
         let b = Client::new(&link).unwrap();
+        // Back to back, in one second: before bac85e6e they shared a name.
         let conv_a = a.conversation().unwrap();
-        // ppxai names a new conversation by the second
-        // (`session_%Y%m%d_%H%M%S`, `engine/session.py`, f7c6acee), so two
-        // slots made in the same second share a name. Reported to ppxai;
-        // until it's fixed, the second slot waits a second.
-        std::thread::sleep(Duration::from_millis(1100));
         let conv_b = b.conversation().unwrap();
         assert_ne!(conv_a, conv_b, "two slots share a conversation");
 
