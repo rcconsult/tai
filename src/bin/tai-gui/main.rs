@@ -49,6 +49,7 @@ mod shortcuts;
 mod chat;
 mod engine;
 mod gpu;
+mod ppxai;
 mod terminal;
 
 // The pty modules size the pseudo terminal from `crate::Dimensions`.

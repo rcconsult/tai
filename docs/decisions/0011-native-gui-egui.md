@@ -408,7 +408,9 @@ and what the RFC has to settle:
 reviewed the RFC at ppxai `feature/v1.19.5` `d0c8124c`. ppxai implemented
 it in `f7c6acee`, "feat(agent): runs know their conversation; a result
 merges once (ADR 0018)" (`docs/decisions/0018-runs-know-their-conversation.md`;
-fence test `tests/test_run_session_contract.py`). tai doesn't use it yet.
+fence test `tests/test_run_session_contract.py`). tai's client for it is
+`src/bin/tai-gui/ppxai.rs`, and `contract_against_a_live_server` there
+checks it against ppxai `f7c6acee`. No view uses it yet.
 - **Which session:** the conversation name (`session_…`, the saved
   chat), not the `X-Session-Id` engine slot.
 - **A session's runs:** `RunMetaResponse` gains `session_id`. On
@@ -438,4 +440,11 @@ fence test `tests/test_run_session_contract.py`). tai doesn't use it yet.
 - **What tai may pin:** `session_id`, `merged_at`, `?session=`,
   `?status=` and the two 409 codes with their keys. ppxai adds a fence
   test for exactly these. The rest of `RunMetaResponse` and
-  `/v1/agent/*` stays unsealed.
+  `/v1/agent/*` stays unsealed. tai reads a slot's conversation from
+  `GET /status` (`session_name`), which the fence doesn't cover.
+- **Hazard found by tai's contract test:** ppxai names a new
+  conversation by the second (`session_%Y%m%d_%H%M%S`,
+  `engine/session.py`), so two slots made in the same second share a
+  name, and with it their runs and the merge guard. Reported to ppxai on
+  2026-11-02. Until it's fixed, tai mustn't open two slots within a
+  second; the test waits between them.

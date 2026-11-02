@@ -1,5 +1,5 @@
 //! The chat pane, ADR 0011 step 4: a prompt sent to `/v1/oneshot` through
-//! the engine link, the answer rendered as Markdown.
+//! the engine link (`ppxai.rs`), the answer rendered as Markdown.
 //!
 //! One-shot only: each prompt stands alone, with no session or history on
 //! the server, and nothing streams. `/chat` with SSE, interrupt and consent
@@ -25,11 +25,8 @@ use crate::{
     discovery::{self, FontFile},
     engine::{Engine, State},
     fonts,
+    ppxai::{self, Client},
 };
-
-/// How long a one-shot answer may take. Models can be slow; ppxai's own
-/// enrichment path has its own timeout and answers 504 past it.
-const ONESHOT_TIMEOUT: Duration = Duration::from_secs(300);
 
 enum Entry {
     Prompt(String),
@@ -38,6 +35,9 @@ enum Entry {
 }
 
 pub struct ChatPane {
+    /// The engine slot this pane's calls go through, made once the
+    /// engine is ready.
+    client: Option<Client>,
     entries: Vec<Entry>,
     input: String,
     /// The answer to the prompt in flight, filled by its thread.
@@ -126,6 +126,7 @@ impl ChatFonts {
 impl ChatPane {
     pub fn new() -> Self {
         Self {
+            client: None,
             entries: Vec::new(),
             input: String::new(),
             pending: None,
@@ -136,10 +137,16 @@ impl ChatPane {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, engine: &Engine) {
         self.collect_answer(ui.ctx());
-        let link = engine.state.lock().ok().and_then(|state| match &*state {
-            State::Ready(link) => Some(link.clone()),
-            _ => None,
-        });
+        if self.client.is_none()
+            && let Ok(state) = engine.state.lock()
+            && let State::Ready(link) = &*state
+        {
+            match Client::new(link) {
+                Ok(client) => self.client = Some(client),
+                Err(why) => tracing::error!("chat: {why}"),
+            }
+        }
+        let client = self.client.clone();
 
         egui::Panel::bottom("chat-input")
             .resizable(false)
@@ -151,7 +158,7 @@ impl ChatPane {
                 // a new line. Taken before the text box sees the key.
                 let send = ui.memory(|m| m.has_focus(input_id))
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-                let ready = link.is_some() && self.pending.is_none();
+                let ready = client.is_some() && self.pending.is_none();
                 let typed = ui.add(
                     egui::TextEdit::multiline(&mut self.input)
                         .id(input_id)
@@ -169,10 +176,10 @@ impl ChatPane {
                 if send
                     && ready
                     && !self.input.trim().is_empty()
-                    && let Some(link) = link.clone()
+                    && let Some(client) = client.clone()
                 {
                     let prompt = std::mem::take(&mut self.input).trim().to_string();
-                    self.send(prompt, link, ui.ctx().clone());
+                    self.send(prompt, client, ui.ctx().clone());
                 }
                 ui.add_space(4.0);
             });
@@ -248,17 +255,15 @@ impl ChatPane {
         }
     }
 
-    fn send(&mut self, prompt: String, link: crate::engine::Link, ctx: egui::Context) {
+    fn send(&mut self, prompt: String, client: Client, ctx: egui::Context) {
         self.entries.push(Entry::Prompt(prompt.clone()));
         let slot = Arc::new(Mutex::new(None));
         self.pending = Some((Instant::now(), Arc::clone(&slot)));
         let spawned = std::thread::Builder::new()
             .name("oneshot".into())
             .spawn(move || {
-                let body = serde_json::json!({ "prompt": prompt });
-                let entry = match link.post_json("/v1/oneshot", &body, ONESHOT_TIMEOUT) {
-                    Ok((200, text)) => answer(&text),
-                    Ok((status, text)) => Entry::Error(format!("{status}: {}", detail(&text))),
+                let entry = match client.oneshot(&prompt) {
+                    Ok(answer) => entry(answer),
                     Err(e) => Entry::Error(e),
                 };
                 if let Ok(mut slot) = slot.lock() {
@@ -290,25 +295,19 @@ impl ChatPane {
     }
 }
 
-/// A 200 from /v1/oneshot: the content, and a line naming the model and
-/// the tokens used.
-fn answer(body: &str) -> Entry {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Entry::Error(format!("not JSON: {body}"));
-    };
-    let text = v["content"].as_str().unwrap_or_default().to_string();
-    let mut meta = format!(
-        "{} · {}",
-        v["provider"].as_str().unwrap_or("?"),
-        v["model"].as_str().unwrap_or("?")
-    );
-    if let Some(total) = v["usage"]["total_tokens"].as_u64() {
+/// An answer, with a line naming the model and the tokens used.
+fn entry(answer: ppxai::Answer) -> Entry {
+    let mut meta = format!("{} · {}", answer.provider, answer.model);
+    if let Some(total) = answer.total_tokens {
         meta.push_str(&format!(" · {total} tokens"));
     }
-    if let Some(reason) = v["finish_reason"].as_str().filter(|r| *r != "stop") {
+    if let Some(reason) = answer.finish_reason.filter(|r| r != "stop") {
         meta.push_str(&format!(" · finished: {reason}"));
     }
-    Entry::Answer { text, meta }
+    Entry::Answer {
+        text: answer.content,
+        meta,
+    }
 }
 
 /// Whether a link is http or https, the only schemes the chat opens.
@@ -317,21 +316,10 @@ fn is_web_link(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://")
 }
 
-/// FastAPI's `{"detail": ...}`, or the body as it is.
-fn detail(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| match &v["detail"] {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Null => None,
-            other => Some(other.to_string()),
-        })
-        .unwrap_or_else(|| body.to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Entry, answer, detail, is_web_link};
+    use super::{Entry, entry, is_web_link};
+    use crate::ppxai::Answer;
 
     #[test]
     fn only_web_links_open() {
@@ -343,11 +331,19 @@ mod tests {
         assert!(!is_web_link("httpx://example.com"));
     }
 
+    fn answer(tokens: Option<u64>, finish: &str) -> Answer {
+        Answer {
+            content: "**hi**".into(),
+            provider: "p1".into(),
+            model: "m1".into(),
+            total_tokens: tokens,
+            finish_reason: Some(finish.into()),
+        }
+    }
+
     #[test]
     fn an_answer_names_provider_model_and_tokens() {
-        let body = r#"{"content": "**hi**", "finish_reason": "stop", "model": "m1",
-            "provider": "p1", "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}"#;
-        let Entry::Answer { text, meta } = answer(body) else {
+        let Entry::Answer { text, meta } = entry(answer(Some(3), "stop")) else {
             panic!("not an answer");
         };
         assert_eq!(text, "**hi**");
@@ -356,19 +352,9 @@ mod tests {
 
     #[test]
     fn a_cut_off_answer_says_why() {
-        let body = r#"{"content": "", "finish_reason": "length", "model": "m", "provider": "p", "usage": null}"#;
-        let Entry::Answer { meta, .. } = answer(body) else {
+        let Entry::Answer { meta, .. } = entry(answer(None, "length")) else {
             panic!("not an answer");
         };
-        assert_eq!(meta, "p · m · finished: length");
-    }
-
-    #[test]
-    fn errors_show_fastapis_detail() {
-        assert_eq!(
-            detail(r#"{"detail": "Provider call failed: boom"}"#),
-            "Provider call failed: boom"
-        );
-        assert_eq!(detail("plain text"), "plain text");
+        assert_eq!(meta, "p1 · m1 · finished: length");
     }
 }
