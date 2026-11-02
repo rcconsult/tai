@@ -80,8 +80,10 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
   investigation.
 - Emoji are monochrome; colour emoji aren't drawn yet.
 - tai doesn't shape text, so scripts that need shaping, such as Arabic or
-  Devanagari, draw poorly. A grapheme cluster, such as an emoji ZWJ
-  sequence, takes the font of its first character.
+  Devanagari, draw poorly. A grapheme cluster draws its first character
+  and the combining marks on it, such as é written as e and U+0301, in
+  one font. An emoji ZWJ sequence, skin tone, flag or keycap needs a
+  ligature, so it shows only its first emoji or character.
 - macroquad is vendored with a clipboard fix (`vendor/macroquad/TAI-PATCHES.md`).
 - Windows: tai bundles Microsoft's ConPTY (`conpty.dll` and
   `OpenConsole.exe`, next to `tai.exe`; ADR 0007), because Windows' own
