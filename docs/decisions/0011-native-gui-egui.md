@@ -241,7 +241,7 @@ above; memory wasn't re-taken.
 | | Windows | Linux | macOS |
 |---|---|---|---|
 | Idle CPU, shell idle, `tai` → `tai-gui` | not re-taken | 480% → 0.1% | 2.7-3.9% → 0% |
-| Keypress to pixels, median | not re-taken | 4.7 → 4.85 ms | not measured |
+| Keypress to pixels, median | not re-taken | 3.5 → 4.2 ms | not measured |
 | Output flood, `tai` → `tai-gui` | 6.63-6.69 → 6.88 s (100,000 lines, shell-bound) | 1.26 → 1.11 s (`seq 1 3000000`) | 7.8-8.3 → 6.5-7.0 s (`seq 1 200000`) |
 | CPU during the flood, `tai` → `tai-gui` | not measured | not measured | 9.5-10.8% → 17.6-23.0% |
 
@@ -251,9 +251,11 @@ above; memory wasn't re-taken.
 - macOS flood time is mostly frame-bound: a first set of runs with the
   display off gave 1.2 s (`tai`) and 0.36 s (`tai-gui`), so it isn't in
   the table.
-- Linux `tai`'s typing median rose from 3.5 to 4.7 ms. The cause isn't
-  known; `tai`'s 480% llvmpipe spin may slow the probe's screen grabs
-  (0.9 ms per grab against 0.5 ms for `tai-gui`).
+- Linux typing is unchanged. A first re-take gave 4.7 → 4.85 ms because
+  it watched a larger screen region (640×200 for `tai`) than the original
+  probe (400×40); each grab then took about 0.9 ms instead of 0.25 ms,
+  which the probe counts as latency. With the original regions, `tai`
+  gives 3.4-3.5 ms and `tai-gui` 4.2-4.3 ms.
 - Linux idle CPU is `tai`'s own, but it comes from the test host: under
   Xvfb `tai` draws with llvmpipe and nothing caps its frame rate.
 
