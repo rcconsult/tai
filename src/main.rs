@@ -50,7 +50,7 @@ use libghostty_vt::{
     },
 };
 
-use crate::fonts::{Coverage, Face, Typeface, is_space};
+use crate::fonts::{Coverage, Face, SymbolSpan, Typeface};
 use crate::pty::{Child, Pty, PtyError};
 use crate::shortcuts::Action;
 
@@ -1186,8 +1186,9 @@ fn walk_row(
 ) -> Result<()> {
     placeholder_cells.clear();
     let mut x = PADDING;
-    // Whether the last icon is waiting to learn if the next cell is blank.
+    // Whether the last cell drew an icon, which may take this cell.
     let mut icon_open = false;
+    let mut span = SymbolSpan::default();
     while let Some(cell) = cell_it.next() {
         // Selection membership is computed by libghostty from the
         // terminal-owned selection. Selected cells use reverse-video colors,
@@ -1199,8 +1200,9 @@ fn walk_row(
             // The whole grapheme cluster as UTF-8 text.
             cell.graphemes_utf8(text)?;
         }
+        let grow = span.next((graphemes > 0).then(|| text.chars().next()).flatten());
         if std::mem::take(&mut icon_open)
-            && (graphemes == 0 || text.chars().next().is_some_and(is_space))
+            && grow
             && let Some(icon) = icons.last_mut()
         {
             icon.cells = 2;
@@ -1266,8 +1268,8 @@ fn walk_row(
                 face,
                 Face::Symbols | Face::Iosevka | Face::Emoji | Face::Discovered(_)
             ) {
-                // A wide cell spans two cells; a narrow one may take the
-                // next cell too if that turns out blank.
+                // A wide cell spans two cells; a narrow symbol may take
+                // the next cell too (`SymbolSpan`).
                 let wide = cell.raw_cell()?.wide()? == CellWide::Wide;
                 icons.push(Icon {
                     text: text.clone(),

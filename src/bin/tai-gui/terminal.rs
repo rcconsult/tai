@@ -29,7 +29,7 @@ use macroquad::color::Color;
 
 use crate::{
     cells::{GlyphAtlas, Instance},
-    fonts::{Coverage, Face},
+    fonts::{Coverage, Face, SymbolSpan},
     gpu::{AtlasUpload, CellFrame},
     pty::{Child, Pty, PtyError},
     selection, shortcuts,
@@ -539,8 +539,26 @@ impl TerminalPane {
                 let mut cell_it = self.cell_it.update(row)?;
                 let mut x = PADDING;
                 let mut col: u16 = 0;
+                let mut span = SymbolSpan::default();
+                let mut held: Option<(Glyph, String)> = None;
                 while let Some(cell) = cell_it.next() {
                     let graphemes = cell.graphemes_len()?;
+                    if graphemes > 0 {
+                        cell.graphemes_utf8(&mut text)?;
+                    }
+                    let grow = span.next((graphemes > 0).then(|| text.chars().next()).flatten());
+                    if let Some((mut glyph, held_text)) = held.take() {
+                        if grow {
+                            glyph.cells = 2;
+                        }
+                        glyph.push(
+                            &mut self.atlas,
+                            &self.coverage,
+                            &mut cached.text,
+                            &held_text,
+                            dims,
+                        );
+                    }
                     let selected = cell.is_selected()?;
                     let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
                     let bg = cell.bg_color()?;
@@ -571,35 +589,48 @@ impl TerminalPane {
                         cached.bg.push(Instance::solid(cell_rect, rgba(bg)));
                     }
                     if graphemes > 0 {
-                        cell.graphemes_utf8(&mut text)?;
                         // One face for the whole cluster, trimmed to what
                         // tai draws (see walk_row in src/main.rs).
                         let face = self.coverage.cluster_face(&mut text);
                         if face != Face::Blank && !text.is_empty() {
                             // A wide character is drawn two cells wide, as
-                            // Ghostty's constraintWidth does for grid width 2
-                            // (src/renderer/cell.zig at a887df42).
+                            // Ghostty's constraintWidth does (src/renderer/
+                            // cell.zig at 521cf2c5). A narrow one from a
+                            // fallback face waits for the next cell, which
+                            // it may take too (`SymbolSpan`).
                             let wide = cell.raw_cell()?.wide()? == CellWide::Wide;
-                            let place =
-                                self.coverage
-                                    .place(face, dims.font_size, if wide { 2 } else { 1 });
-                            let fg = rgba(fg);
-                            self.atlas.push_text(
-                                &mut cached.text,
-                                self.coverage.font(face),
+                            let glyph = Glyph {
                                 face,
-                                &text,
                                 x,
-                                y + dims.baseline - place.rise,
-                                place.font_size,
-                                dims.dpi_scale,
-                                Color::from_rgba(fg[0], fg[1], fg[2], fg[3]),
+                                y,
+                                fg: rgba(fg),
                                 bold,
-                            );
+                                cells: if wide { 2 } else { 1 },
+                            };
+                            if wide || face == Face::Primary {
+                                glyph.push(
+                                    &mut self.atlas,
+                                    &self.coverage,
+                                    &mut cached.text,
+                                    &text,
+                                    dims,
+                                );
+                            } else {
+                                held = Some((glyph, text.clone()));
+                            }
                         }
                     }
                     x += dims.cell_width;
                     col += 1;
+                }
+                if let Some((glyph, text)) = held {
+                    glyph.push(
+                        &mut self.atlas,
+                        &self.coverage,
+                        &mut cached.text,
+                        &text,
+                        dims,
+                    );
                 }
                 row.set_dirty(false)?;
             }
@@ -755,6 +786,44 @@ fn draw_badge(ui: &egui::Ui, rect: egui::Rect, text: &str) {
 struct RowInstances {
     bg: Vec<Instance>,
     text: Vec<Instance>,
+}
+
+/// Where and how one cell's glyph is drawn.
+struct Glyph {
+    face: Face,
+    x: f32,
+    y: f32,
+    fg: [u8; 4],
+    bold: bool,
+    /// How many cells it spans: 2 for a wide cell, or a narrow symbol that
+    /// takes the next cell (`SymbolSpan`).
+    cells: u8,
+}
+
+impl Glyph {
+    fn push(
+        &self,
+        atlas: &mut GlyphAtlas,
+        coverage: &Coverage,
+        out: &mut Vec<Instance>,
+        text: &str,
+        dims: Dimensions,
+    ) {
+        let place = coverage.place(self.face, dims.font_size, self.cells);
+        let fg = self.fg;
+        atlas.push_text(
+            out,
+            coverage.font(self.face),
+            self.face,
+            text,
+            self.x,
+            self.y + dims.baseline - place.rise,
+            place.font_size,
+            dims.dpi_scale,
+            Color::from_rgba(fg[0], fg[1], fg[2], fg[3]),
+            self.bold,
+        );
+    }
 }
 
 fn rgba(c: RgbColor) -> [u8; 4] {
