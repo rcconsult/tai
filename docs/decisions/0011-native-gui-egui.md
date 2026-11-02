@@ -3,6 +3,12 @@
 - **Status:** Accepted 2026-11-01 (owner), after the prototype (branch
   `gui-proto`; see "Prototype results"). On Windows, wgpu uses its GL
   backend by default until the Vulkan memory cost or DX12 is resolved.
+  (2026-11-02: the prototype is on main as `tai-gui`. Its terminal pane
+  now also has selection with the badge, wide cells and symbol spans.
+  Still to build: images and mouse reporting in the pane, streaming
+  `/chat` with interrupt and consent, agent runs, previews, workspace
+  tabs and the plain-mode fallback. The design of runs started from a
+  session was settled with ppxai; see the last section.)
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host.
 - **Amends:** decision 3 of [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
@@ -81,6 +87,9 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
    - **Unchanged:** the cell walk in `main.rs`.
    - **Removed:** the immediate renderer and macroquad's side of
      `fonts.rs`.
+
+   (2026-11-02: ADR 0012 replaced fontdue with skrifa and zeno in both
+   binaries, so the atlas no longer rasterises with fontdue.)
 3. **wgpu's indirect-call validation stays on by default, and an
    environment variable turns it off.**
    - **The problem:** on macOS 12.7 with Intel Iris Pro (eframe 0.37,
@@ -393,3 +402,32 @@ and what the RFC has to settle:
   - **Under `auto`:** the client merges, not the server. So tai must
     target the right session and remember merged runs itself, or the
     RFC moves both to the server. **RFC item.**
+
+**Settled on 2026-11-02 (design only).** The owner and the ppxai
+session reviewed the RFC at ppxai `feature/v1.19.5` `d0c8124c`. Nothing
+is implemented yet; ppxai will record it in an ADR of its own once the
+owner gives the go.
+- **Which session:** the conversation name (`session_…`, the saved
+  chat), not the `X-Session-Id` engine slot.
+- **A session's runs:** `RunMeta` gains `session_id`, stamped by the
+  server from the caller's active conversation when `/task` or `/run`
+  starts the run. A client can't set it. Sub-agents inherit it. A run
+  started by a raw `POST /v1/agent/run` or `/task` has `null`.
+  `GET /v1/agent/runs?session=<name>` filters by it.
+- **Merging:** `merge-run-result` merges only into the run's own
+  conversation, and only while it's the caller's active one. Otherwise
+  it answers 409 with
+  `{"code": "session_mismatch", "message": …, "run_session_id": …}`,
+  and the client switches first. The server records `merged_at` in the
+  run registry, so the TUI's collect and the HTTP route share one guard.
+  A second merge answers 409 with
+  `{"code": "already_merged", "message": …, "merged_at": …}`. A run with
+  a `null` session merges into the active conversation, once. ppxai's
+  other 409s keep plain-string details, so tai must accept both forms.
+- **Waiting runs:** `GET /v1/agent/runs?status=waiting`, combinable with
+  `?session=`. There's no caller-wide events stream for now; each run
+  has its own (`/runs/{id}/events?live=true`).
+- **What tai may pin:** `session_id`, `merged_at`, `?session=`,
+  `?status=` and the two 409 codes with their keys. ppxai adds a fence
+  test for exactly these. The rest of `RunMetaResponse` and
+  `/v1/agent/*` stays unsealed.

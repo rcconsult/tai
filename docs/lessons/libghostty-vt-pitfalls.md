@@ -143,4 +143,5 @@ in one frame. Both binaries now reserve 64 bytes before every encode
 bytes queued in an 8-byte buffer, and fails once the crate is fixed; drop
 the workaround then. Still present upstream (libghostty-rs) at 575ed6b8ce.
 `docs/upstream/libghostty-rs-encode-to-vec.md` is the issue to file,
-with the two-line fix; it hasn't been filed yet.
+with the two-line fix. The owner has put filing it on hold, since the
+workaround holds; it's kept for reference.

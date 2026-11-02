@@ -1,6 +1,11 @@
 # ADR 0001: Rust + libghostty-vt for the UI, ppxai-server as a child process for the engine
 
-- **Status:** Accepted 2026-10-24 (owner). Nothing is implemented yet.
+- **Status:** Accepted 2026-10-24 (owner). (2026-11-02: decisions 1 and 2
+  are implemented, `tai` on all three platforms. Decision 3 is under way
+  as `tai-gui`, on egui (ADR 0011). Decision 4's engine link is in
+  `src/bin/tai-gui/engine.rs`, by ADR 0010. Decision 5's client covers
+  only `/v1/oneshot` so far (`engine.rs` and `chat.rs`), and decision 6's
+  contract test doesn't exist yet.)
 - **Deciders:** owner. Two Claude sessions, one on each dev host (Linux x86_64, macOS 12 Intel), wrote the options and reviewed each other's work.
 - **Superseded in part by:** [ADR 0010](0010-engine-link-loopback-tcp.md) (decision 4: loopback TCP replaces `--uds --announce`).
 - **Related:** ppxai `docs/api-gateway.md` (API stability tiers), ppxai ADR 0003 (agent platform, `/v1/agent/*`), ppxai ADR 0016 (cheap engine import).

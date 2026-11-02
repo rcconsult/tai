@@ -3,7 +3,11 @@
 - **Status:** Accepted 2026-10-24 (owner). Decisions 1-6 are implemented on
   main and verified on Windows 11, with Linux and macOS re-verified after
   the shared changes. Decision 7 (the engine link) waits for milestone (b);
-  its open questions below still hold.
+  its open questions below still hold. (2026-11-02: decision 7 is
+  implemented, by ADR 0010, in `tai-gui` on Windows. ppxai's `--owned`
+  mode settles the auth and port-race questions below, and ADR 0010
+  chose TCP everywhere. The other two open questions, `_is_bootstrap_mint`
+  and display scaling, aren't recorded as checked.)
 - **Deciders:** owner. Written by the Claude session on the Windows dev host
   (Windows 11 Pro x86_64), with input from the Linux and macOS sessions.
 - **Superseded in part by:** [ADR 0010](0010-engine-link-loopback-tcp.md)

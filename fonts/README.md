@@ -1,6 +1,7 @@
 # Bundled fonts
 
-All four fonts are compiled into the binary (`src/fonts.rs`).
+All four fonts are compiled into the binary (`src/fonts.rs`). Fonts the
+OS supplies for anything else are read in place, not bundled.
 
 | File | Source | Licence |
 |---|---|---|
@@ -40,11 +41,23 @@ Unicode spaces (U+00A0, U+2000-200A, U+202F, U+205F, U+3000) draw as
 empty cells with no font lookup. Otherwise JetBrains Mono draws
 everything it has. A codepoint it lacks is drawn with the first of
 Symbols Nerd Font Mono, Iosevka Fixed and Noto Emoji that has a glyph
-for it (glyph index not 0). Fallback glyphs are scaled to one cell, or to two when
-the next cell is blank (Ghostty does the same), never taller than
+for it (glyph index not 0). If none has it, tai asks the OS for a font
+(ADR 0012): DirectWrite on Windows, CoreText on macOS, fontconfig on
+Linux.
+
+Bundled fallback glyphs are scaled to one cell, never taller than
 JetBrains Mono's line, and centred on the row. Iosevka's line height
 caps its glyphs at one cell; Noto Emoji's caps them at just under its
-line height.
+line height. Faces found through the OS are sized by ideograph width, as
+Ghostty does, and aren't capped at the line.
+
+A narrow symbol may spread over two cells when the next cell is blank or
+a space. Symbols here are Private Use, arrows, dingbats, emoticons,
+transport and map symbols, and the miscellaneous-symbols and enclosed
+blocks. A symbol doesn't spread when the previous cell is also a symbol,
+unless that one is a box-drawing, block, legacy-computing or Powerline
+glyph. That's Ghostty's `constraintWidth` rule
+(`src/renderer/cell.zig`), in `fonts::SymbolSpan`.
 
 Iosevka covers general symbols such as ⎈ U+2388 (kube-ps1) and ⏵ U+23F5,
 and all of braille (U+2800-28FF).
@@ -56,4 +69,4 @@ colour fallback is Apple Color Emoji on macOS and the bundled Noto Color
 Emoji elsewhere; tai has no colour glyphs yet, because it only fills
 outlines. VS15 and VS16 (U+FE0E, U+FE0F), which pick text or
 emoji presentation, aren't drawn, as in Ghostty. Still missing: colour
-emoji and CJK.
+emoji. CJK comes from the OS (above).

@@ -11,7 +11,7 @@
 - **Related:** [ADR 0002](0002-windows-11-support.md) (ConPTY through
   `portable-pty`). ADRs 0005 (Kitty images) and 0006 (Sixel translated to
   Kitty), on their own branches, need image sequences to reach tai, which
-  this record makes possible on Windows.
+  this record makes possible on Windows. (2026-11-02: both are on main.)
 
 ## Context
 

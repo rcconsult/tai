@@ -3,7 +3,10 @@
 - **Status:** Accepted 2026-10-24 (owner). Decisions 1, 3 and 4 are on main
   (4 through the Iosevka fallback's blank spaces). Decision 2 is in
   `src/locale.rs`. Decision 5 has nothing to apply to yet: tai does no
-  text layout of its own.
+  text layout of its own. (2026-11-02: `tai-gui`'s chat pane now lays out
+  text, through egui, which measures with its own tables rather than
+  `libghostty_vt::unicode`. Nothing there has to line up with the grid
+  yet. Selection works in grid cells, so it needs no width table.)
 - **Deciders:** owner. Written by the Claude session on the Windows dev host.
 - **Related:** [ADR 0002](0002-windows-11-support.md) (Windows), popos-tai's
   `fonts-fallback` branch (a fallback font for missing glyphs).

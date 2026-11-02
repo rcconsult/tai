@@ -1,7 +1,13 @@
 # ADR 0006: Accept Sixel by translating it into Kitty images
 
 - **Status:** Accepted 2026-10-25 (owner). Not implemented yet; the checks
-  listed under decision 3 and Accepted risks are still open.
+  listed under decision 3 and Accepted risks are still open. (2026-11-02:
+  implemented in `src/sixel.rs`, `7151b25`, with ADR 0009's changes. The
+  scanner tests listed under Accepted risks are in `src/sixel.rs`; a raw
+  `0x90` is treated as text, as libghostty-vt does. Decision 3's cursor
+  check was done against xterm under ADR 0009. Two checks aren't
+  recorded: the XTSMGRAPHICS hang check and the Windows cursor check
+  after a resize.)
 - **Superseded in part by:** [ADR 0009](0009-sixel-not-advertised.md)
   replaces decision 1 (Sixel is advertised only with `TAI_SIXEL=1`) and
   decision 3 (the cursor follows xterm, not WezTerm).

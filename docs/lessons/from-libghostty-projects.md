@@ -24,14 +24,14 @@ when rows grow or columns reflow, so after such a resize the two active
 screens disagree. con-terminal turns the option off for Windows only. They
 found it by audit, not from a reproduced failure.
 
-**In tai:** tai's pin (a887df42) predates the option, and libghostty-vt
-0.2.2 doesn't expose it; libghostty-rs master has
-`Terminal::set_resize_pull_scrollback`. tai's own resize garbling went
-away with the bundled ConPTY (`windows-pitfalls.md`, "tai may run another
-app's ConPTY"), so this is a remaining risk, not a known bug. Taking it
-means moving the three pins together (CLAUDE.md, Build). When you do,
-turn the option off on Windows only, and test row growth and column
-reflow separately.
+**In tai:** done in `c01ef87` ("Move the Ghostty pins; turn off
+scrollback pull on resize on Windows"). The pins moved to Ghostty
+521cf2c5 and libghostty-rs 575ed6b8, and both binaries call
+`set_resize_pull_scrollback(Some(false))` on Windows only (`src/main.rs`,
+`src/bin/tai-gui/terminal.rs`). Before that, tai's own resize garbling
+had already gone away with the bundled ConPTY (`windows-pitfalls.md`,
+"tai may run another app's ConPTY"), so this closed a risk, not a known
+bug.
 
 ## 2. IME: composed text and raw keys take separate paths
 

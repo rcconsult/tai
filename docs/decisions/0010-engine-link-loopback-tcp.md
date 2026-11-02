@@ -2,7 +2,11 @@
 
 - **Status:** Accepted 2026-11-01 (owner): loopback TCP on every
   platform now, with ppxai's strict mode (decision 5) scheduled to close
-  the accepted risks.
+  the accepted risks. (2026-11-02: `tai-gui` implements decision 5's
+  `--owned` path, in `src/bin/tai-gui/engine.rs`. The fallback to
+  decisions 1 and 2 for a server without the flag isn't built; tai-gui
+  says what's wrong instead. ppxai 1.19.5, which has the flag, isn't
+  released yet.)
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host, with input from the macOS and Linux sessions and from the ppxai
   session on the Windows host.
