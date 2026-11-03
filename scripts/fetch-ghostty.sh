@@ -43,7 +43,8 @@ fi
 set -- "$root"/patches/ghostty/*.patch
 [ -e "$1" ] || set --
 # What the checkout should be: the pin plus these patches, byte for byte.
-want=$({ echo "$GHOSTTY_COMMIT"; cat "$@"; } | git hash-object --stdin)
+# With no patches, a bare `cat` would read stdin and hang a background run.
+want=$({ echo "$GHOSTTY_COMMIT"; [ $# -eq 0 ] || cat "$@"; } | git hash-object --stdin)
 stamp="$dest/.git/tai-patches"
 base=$(git -C "$dest" rev-parse -q --verify "HEAD~$#" 2>/dev/null || true)
 
