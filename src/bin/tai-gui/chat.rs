@@ -301,13 +301,22 @@ fn entry(answer: ppxai::Answer) -> Entry {
     if let Some(total) = answer.total_tokens {
         meta.push_str(&format!(" · {total} tokens"));
     }
-    if let Some(reason) = answer.finish_reason.filter(|r| r != "stop") {
+    if let Some(reason) = answer.finish_reason.as_deref().and_then(finish_reason) {
         meta.push_str(&format!(" · finished: {reason}"));
     }
     Entry::Answer {
         text: answer.content,
         meta,
     }
+}
+
+/// Why an answer ended, or `None` when it ended normally. ppxai passes the
+/// provider's own value through (bac85e6e): OpenAI's `stop`, Anthropic's
+/// `end_turn`, and Gemini's enum as `str()` prints it, `FinishReason.STOP`
+/// (`engine/providers/gemini.py`).
+fn finish_reason(raw: &str) -> Option<String> {
+    let reason = raw.rsplit('.').next().unwrap_or(raw).to_ascii_lowercase();
+    (!matches!(reason.as_str(), "stop" | "end_turn")).then_some(reason)
 }
 
 /// Whether a link is http or https, the only schemes the chat opens.
@@ -356,5 +365,19 @@ mod tests {
             panic!("not an answer");
         };
         assert_eq!(meta, "p1 · m1 · finished: length");
+    }
+
+    #[test]
+    fn a_normal_end_is_not_shown_in_any_provider_spelling() {
+        for normal in ["stop", "end_turn", "FinishReason.STOP"] {
+            let Entry::Answer { meta, .. } = entry(answer(None, normal)) else {
+                panic!("not an answer");
+            };
+            assert_eq!(meta, "p1 · m1", "{normal}");
+        }
+        let Entry::Answer { meta, .. } = entry(answer(None, "FinishReason.MAX_TOKENS")) else {
+            panic!("not an answer");
+        };
+        assert_eq!(meta, "p1 · m1 · finished: max_tokens");
     }
 }
