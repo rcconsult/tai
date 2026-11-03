@@ -408,7 +408,9 @@ and what the RFC has to settle:
 reviewed the RFC at ppxai `feature/v1.19.5` `d0c8124c`. ppxai implemented
 it in `f7c6acee`, "feat(agent): runs know their conversation; a result
 merges once (ADR 0018)" (`docs/decisions/0018-runs-know-their-conversation.md`;
-fence test `tests/test_run_session_contract.py`). tai doesn't use it yet.
+fence test `tests/test_run_session_contract.py`). tai's client for it is
+`src/bin/tai-gui/ppxai.rs`, and `contract_against_a_live_server` there
+checks it against ppxai `bac85e6e`. No view uses it yet.
 - **Which session:** the conversation name (`session_…`, the saved
   chat), not the `X-Session-Id` engine slot.
 - **A session's runs:** `RunMetaResponse` gains `session_id`. On
@@ -438,4 +440,12 @@ fence test `tests/test_run_session_contract.py`). tai doesn't use it yet.
 - **What tai may pin:** `session_id`, `merged_at`, `?session=`,
   `?status=` and the two 409 codes with their keys. ppxai adds a fence
   test for exactly these. The rest of `RunMetaResponse` and
-  `/v1/agent/*` stays unsealed.
+  `/v1/agent/*` stays unsealed. tai reads a slot's conversation from
+  `GET /status`'s `session_name`, which the fence also pins. That
+  route's `session_id` is the slot, not the conversation.
+- **Found by tai's contract test, fixed in ppxai:** ppxai named a new
+  conversation by the second, so two slots made in the same second
+  shared a name, and with it their runs and the merge guard. ppxai
+  `bac85e6e`, "fix(session): two conversations started in the same
+  second get distinct names", adds a random suffix. Treat the name as
+  opaque.

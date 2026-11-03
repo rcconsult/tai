@@ -51,18 +51,30 @@ pub struct Link {
     pub pid: u64,
     token: String,
     agent: ureq::Agent,
+    /// The engine slot every request names in `X-Session-Id`, if any
+    /// (`ppxai.rs`).
+    slot: Option<String>,
 }
 
 impl Link {
+    /// The same server, with every request naming engine slot `slot`.
+    pub fn in_slot(&self, slot: String) -> Self {
+        Self {
+            slot: Some(slot),
+            ..self.clone()
+        }
+    }
+
     /// GET `path` with tai's bearer: the status and the body.
-    #[allow(dead_code)]
     pub fn get(&self, path: &str) -> Result<(u16, String), String> {
-        let mut response = self
+        let mut request = self
             .agent
             .get(format!("{}{path}", self.base))
-            .header("Authorization", format!("Bearer {}", self.token))
-            .call()
-            .map_err(|e| e.to_string())?;
+            .header("Authorization", format!("Bearer {}", self.token));
+        if let Some(slot) = &self.slot {
+            request = request.header("X-Session-Id", slot);
+        }
+        let mut response = request.call().map_err(|e| e.to_string())?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
@@ -79,16 +91,18 @@ impl Link {
         body: &serde_json::Value,
         timeout: Duration,
     ) -> Result<(u16, String), String> {
-        let mut response = self
+        let mut request = self
             .agent
             .post(format!("{}{path}", self.base))
             .config()
             .timeout_global(Some(timeout))
             .build()
             .header("Authorization", format!("Bearer {}", self.token))
-            .header("Content-Type", "application/json")
-            .send(body.to_string())
-            .map_err(|e| e.to_string())?;
+            .header("Content-Type", "application/json");
+        if let Some(slot) = &self.slot {
+            request = request.header("X-Session-Id", slot);
+        }
+        let mut response = request.send(body.to_string()).map_err(|e| e.to_string())?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
@@ -285,6 +299,7 @@ fn launch(server: &Mutex<Option<Server>>, step: &dyn Fn(&'static str)) -> Result
         pid: bound.pid,
         token,
         agent,
+        slot: None,
     };
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
@@ -361,8 +376,13 @@ fn find_server() -> Result<PathBuf, String> {
 
 /// A fresh random token, 32 bytes as hex.
 fn new_token() -> Result<String, String> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|e| format!("no randomness for the token: {e}"))?;
+    random_hex(32).map_err(|e| format!("no randomness for the token: {e}"))
+}
+
+/// `n` random bytes as hex.
+pub fn random_hex(n: usize) -> Result<String, getrandom::Error> {
+    let mut bytes = vec![0u8; n];
+    getrandom::fill(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
