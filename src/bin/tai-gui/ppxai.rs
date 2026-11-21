@@ -20,6 +20,13 @@
 //!   (`docs/api-gateway.md`, "What's not in the gateway tier"), read for
 //!   the chat pane's provider and model picker. The contract test covers
 //!   them.
+//! - `/chat` (SSE), `/interrupt`, `/consent`, `/shell-consent`, `GET` and
+//!   `POST /tools`, `GET /commands` and `POST /command/<name>` are internal
+//!   and may change with any ppxai release; they're the conversation the
+//!   web app has. The command set is ppxai's roster (ppxai ADR 0007), not
+//!   a list in tai.
+//!   `ChatEvent` reads only the events tai shows, so a new event type
+//!   doesn't break a stream. The contract test covers them.
 //! - A conversation name is opaque: `session_` and more, unique per
 //!   conversation since ppxai `bac85e6e`. `GET /status`'s `session_id` is
 //!   the slot, not the conversation.
@@ -31,7 +38,11 @@
 // run views exist (ADR 0011, "Reference: runs spawned from a chat session").
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::time::Duration;
+use std::{
+    io::BufRead,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use serde_json::Value;
 
@@ -42,6 +53,12 @@ use crate::engine::{Link, random_hex};
 const ONESHOT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long starting a run or merging its result may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a slash command may take; `/doctor probe` calls providers.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// The client id tai-gui gives the roster and commands. ppxai knows only
+/// its own clients (`KNOWN_CLIENTS`, `commands/factory.py`) and answers
+/// 400 to others; tai-gui follows the web app, so it speaks as it.
+const COMMAND_CLIENT: &str = "web";
 
 /// ppxai through one engine slot.
 #[derive(Clone)]
@@ -169,6 +186,531 @@ impl Client {
             Ok((200, _)) => Ok(()),
             Ok((status, text)) => Err(MergeError::parse(status, &text)),
             Err(e) => Err(MergeError::Failed(e)),
+        }
+    }
+}
+
+impl Client {
+    /// Send `message` to the slot's conversation, `POST /chat`, and hand
+    /// each event tai shows to `on` as it arrives. With a provider or a
+    /// model, ppxai switches the conversation to it first and keeps the
+    /// history. Returns once the stream ends, or soon after `stop` is set:
+    /// ppxai sends a keepalive at least every 5 s, so the reader wakes.
+    pub fn chat(
+        &self,
+        message: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        stop: &AtomicBool,
+        mut on: impl FnMut(ChatEvent),
+    ) -> Result<(), String> {
+        let mut body = serde_json::json!({ "message": message });
+        if let Some(provider) = provider {
+            body["provider"] = provider.into();
+        }
+        if let Some(model) = model {
+            body["model"] = model.into();
+        }
+        let reader = match self.link.post_stream("/chat", &body)? {
+            Ok(reader) => reader,
+            Err((status, text)) => return Err(format!("{status}: {}", detail(&text))),
+        };
+        for line in reader.lines() {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let line = line.map_err(|e| format!("the stream broke: {e}"))?;
+            match sse_line(&line) {
+                Some(Sse::Done) => return Ok(()),
+                Some(Sse::Event(v)) => {
+                    if let Some(event) = ChatEvent::parse(&v) {
+                        on(event);
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop the slot's answer in flight, `POST /interrupt`. Its stream then
+    /// ends with the error "Interrupted by user".
+    pub fn interrupt(&self) -> Result<(), String> {
+        let body = serde_json::json!({});
+        match self.link.post_json("/interrupt", &body, CALL_TIMEOUT)? {
+            (200, _) => Ok(()),
+            (status, text) => Err(format!("/interrupt: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// Answer a consent request: `y`, `n`, `always` or `never` (ppxai
+    /// `common/consent.py`). ppxai matches it to the request by the exact
+    /// path or command the request named.
+    pub fn consent(&self, request: &Consent, response: &str) -> Result<(), String> {
+        let (path, body) = match request {
+            Consent::File { path } => (
+                "/consent",
+                serde_json::json!({ "file_path": path, "response": response }),
+            ),
+            Consent::Shell {
+                command,
+                working_dir,
+                ..
+            } => (
+                "/shell-consent",
+                serde_json::json!({
+                    "command": command,
+                    "working_dir": working_dir,
+                    "response": response,
+                }),
+            ),
+        };
+        match self.link.post_json(path, &body, CALL_TIMEOUT)? {
+            (200, _) => Ok(()),
+            (status, text) => Err(format!("{path}: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// Whether the conversation's tools are on, `GET /tools`. ppxai starts
+    /// a slot with them off.
+    pub fn tools(&self) -> Result<bool, String> {
+        match self.link.get("/tools")? {
+            (200, text) => json(&text)?["enabled"]
+                .as_bool()
+                .ok_or_else(|| format!("/tools has no enabled: {text}")),
+            (status, text) => Err(format!("/tools: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// Turn the conversation's tools on or off, `POST /tools`: whether
+    /// they're on now.
+    pub fn set_tools(&self, enabled: bool) -> Result<bool, String> {
+        let body = serde_json::json!({ "enabled": enabled });
+        match self.link.post_json("/tools", &body, CALL_TIMEOUT)? {
+            (200, text) => json(&text)?["enabled"]
+                .as_bool()
+                .ok_or_else(|| format!("/tools has no enabled: {text}")),
+            (status, text) => Err(format!("/tools: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// ppxai's slash commands as this client sees them, `GET /commands`.
+    pub fn commands(&self) -> Result<Roster, String> {
+        let path = format!("/commands?client={COMMAND_CLIENT}");
+        match self.link.get(&path)? {
+            (200, text) => Roster::parse(&json(&text)?),
+            (status, text) => Err(format!("/commands: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// Run slash command `name` on the server, `POST /command/<name>`. An
+    /// unknown name gets ppxai's own 404 message.
+    pub fn command(&self, name: &str, args: &str) -> Result<CommandOutcome, String> {
+        let body = serde_json::json!({ "args": args, "client": COMMAND_CLIENT });
+        let path = format!("/command/{}", encode(name));
+        match self.link.post_json(&path, &body, COMMAND_TIMEOUT)? {
+            (200, text) => Ok(CommandOutcome::parse(&json(&text)?)),
+            (_, text) => Err(detail(&text)),
+        }
+    }
+}
+
+/// ppxai's command roster (`CommandFactory.roster`, ppxai ADR 0007).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Roster {
+    pub commands: Vec<CommandSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandSpec {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub description: String,
+    pub usage: String,
+    pub hidden: bool,
+    /// Whether the client runs it (`dispatch: "client"`) instead of
+    /// sending it to `POST /command/<name>`.
+    pub client_dispatch: bool,
+    /// The client behaviour ppxai binds to it, such as `run.controller` or
+    /// `coding.stream`; the client owns the code.
+    pub client_action: Option<String>,
+    /// The subcommands whose value is a secret, never to be echoed.
+    pub sensitive: Vec<String>,
+    /// The subcommand names.
+    pub subcommands: Vec<String>,
+}
+
+impl Roster {
+    fn parse(v: &Value) -> Result<Self, String> {
+        let list = v["commands"]
+            .as_array()
+            .ok_or_else(|| format!("/commands has no commands: {v}"))?;
+        let strings = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        };
+        let commands = list
+            .iter()
+            .filter_map(|c| {
+                let subs = c["subcommands"].as_array().cloned().unwrap_or_default();
+                Some(CommandSpec {
+                    name: c["name"].as_str()?.to_string(),
+                    aliases: strings(&c["aliases"]),
+                    description: c["description"].as_str().unwrap_or_default().to_string(),
+                    usage: c["usage"].as_str().unwrap_or_default().to_string(),
+                    hidden: c["hidden"].as_bool().unwrap_or(false),
+                    client_dispatch: c["dispatch"] == "client",
+                    client_action: c["client_action"].as_str().map(str::to_string),
+                    sensitive: subs
+                        .iter()
+                        .filter(|s| s["sensitive"] == true)
+                        .filter_map(|s| s["name"].as_str().map(str::to_string))
+                        .collect(),
+                    subcommands: subs
+                        .iter()
+                        .filter_map(|s| s["name"].as_str().map(str::to_string))
+                        .collect(),
+                })
+            })
+            .collect();
+        Ok(Self { commands })
+    }
+
+    /// The command `name` (without the slash) names, by name or alias,
+    /// ignoring case.
+    pub fn resolve(&self, name: &str) -> Option<&CommandSpec> {
+        let name = name.to_ascii_lowercase();
+        self.commands
+            .iter()
+            .find(|c| c.name == name || c.aliases.contains(&name))
+    }
+}
+
+/// What `POST /command/<name>` answered: its result as Markdown, whether it
+/// failed, and the state it changed.
+#[derive(Debug, PartialEq)]
+pub struct CommandOutcome {
+    pub ok: bool,
+    /// The result's `status` was `error`.
+    pub error: bool,
+    pub markdown: String,
+    /// `tools_enabled` from the envelope's `state_sync` events.
+    pub tools_enabled: Option<bool>,
+}
+
+impl CommandOutcome {
+    fn parse(v: &Value) -> Self {
+        let tools_enabled = v["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["type"] == "state_sync")
+            .filter_map(|e| e["data"]["tools_enabled"].as_bool())
+            .next_back();
+        Self {
+            ok: v["ok"].as_bool().unwrap_or(true),
+            error: v["result"]["status"] == "error",
+            markdown: result_markdown(&v["result"]),
+            tools_enabled,
+        }
+    }
+}
+
+/// A `CommandResult.to_dict()` as Markdown (ppxai `commands/results.py`),
+/// the way the web app's `ResultRenderer` shows each type. An unknown type
+/// shows its message, or its JSON.
+fn result_markdown(r: &Value) -> String {
+    let message = r["message"].as_str().unwrap_or_default();
+    let mut parts: Vec<String> = Vec::new();
+    let title = |parts: &mut Vec<String>| {
+        if !message.is_empty() {
+            parts.push(format!("**{}**", escape_markdown(message)));
+        }
+    };
+    let cell = |v: &Value| -> String {
+        let text = match v {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        escape_markdown(&text).replace('\n', " ")
+    };
+    match r["type"].as_str().unwrap_or_default() {
+        "MarkdownResult" => match r["content"].as_str() {
+            Some(content) => parts.push(content.to_string()),
+            None => title(&mut parts),
+        },
+        "CompositeResult" => {
+            title(&mut parts);
+            for sub in r["results"].as_array().into_iter().flatten() {
+                parts.push(result_markdown(sub));
+            }
+        }
+        "TableResult" => {
+            title(&mut parts);
+            let columns: Vec<String> = r["columns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(cell)
+                .collect();
+            let rows = r["rows"].as_array().cloned().unwrap_or_default();
+            if !columns.is_empty() && !rows.is_empty() {
+                let mut table = format!(
+                    "| {} |\n|{}\n",
+                    columns.join(" | "),
+                    "---|".repeat(columns.len())
+                );
+                for row in &rows {
+                    let cells: Vec<String> = match row {
+                        Value::Array(cells) => cells.iter().map(cell).collect(),
+                        Value::Object(map) => columns
+                            .iter()
+                            .map(|c| map.get(c).map(cell).unwrap_or_default())
+                            .collect(),
+                        other => vec![cell(other)],
+                    };
+                    table.push_str(&format!("| {} |\n", cells.join(" | ")));
+                }
+                parts.push(table);
+            }
+        }
+        "KeyValueResult" => {
+            title(&mut parts);
+            let pairs: Vec<String> = r["pairs"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| format!("- **{}:** {}", escape_markdown(k), cell(v)))
+                .collect();
+            if !pairs.is_empty() {
+                parts.push(pairs.join("\n"));
+            }
+        }
+        "ListResult" => {
+            title(&mut parts);
+            let items: Vec<String> = r["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| format!("- {}", cell(item.get("text").unwrap_or(item))))
+                .collect();
+            if !items.is_empty() {
+                parts.push(items.join("\n"));
+            }
+        }
+        "DirectoryTreeResult" => {
+            let mut lines = Vec::new();
+            tree_lines(&r["root"], 0, &mut lines);
+            if !lines.is_empty() {
+                parts.push(format!("```text\n{}\n```", lines.join("\n")));
+            }
+            title(&mut parts);
+        }
+        _ => {
+            title(&mut parts);
+            if parts.is_empty() && !r.is_null() {
+                parts.push(format!(
+                    "```json\n{}\n```",
+                    serde_json::to_string_pretty(r).unwrap_or_default()
+                ));
+            }
+        }
+    }
+    match &r["details"] {
+        Value::String(d) if !d.is_empty() => parts.push(escape_markdown(d)),
+        Value::Array(list) if !list.is_empty() => parts.push(
+            list.iter()
+                .map(|d| format!("- {}", cell(d)))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => {}
+    }
+    parts.join("\n\n")
+}
+
+/// A `DirectoryTreeResult` node and its children, indented, at most 500
+/// lines: a tree of a home directory has thousands.
+fn tree_lines(node: &Value, depth: usize, out: &mut Vec<String>) {
+    const MAX: usize = 500;
+    let Some(label) = node["label"].as_str() else {
+        return;
+    };
+    if out.len() == MAX {
+        out.push("…".into());
+        return;
+    }
+    if out.len() > MAX {
+        return;
+    }
+    out.push(format!("{}{label}", "  ".repeat(depth)));
+    for child in node["children"].as_array().into_iter().flatten() {
+        tree_lines(child, depth + 1, out);
+    }
+}
+
+/// Text from the server shown as Markdown without being read as Markdown:
+/// its punctuation escaped.
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(
+            ch,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '#' | '|' | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// One line of an SSE stream that carries something: ppxai frames each
+/// event as `data: {json}` and ends with `data: [DONE]`, sends `: keepalive`
+/// comments, and uses no `event:` lines (ppxai `server/streaming.py`).
+#[derive(Debug, PartialEq)]
+enum Sse {
+    Event(Value),
+    Done,
+}
+
+fn sse_line(line: &str) -> Option<Sse> {
+    let data = line.strip_prefix("data:")?.trim_start();
+    if data == "[DONE]" {
+        return Some(Sse::Done);
+    }
+    match serde_json::from_str(data) {
+        Ok(v) => Some(Sse::Event(v)),
+        Err(e) => {
+            tracing::warn!("chat: an SSE line that isn't JSON ({e}): {data}");
+            None
+        }
+    }
+}
+
+/// An event of a `/chat` stream that tai shows (ppxai `EventType`,
+/// `engine/types.py`). The others, such as `state_sync` and the agent
+/// loop's, are dropped.
+#[derive(Debug, PartialEq)]
+pub enum ChatEvent {
+    /// The answer starts; the model answering.
+    Start {
+        model: Option<String>,
+    },
+    Chunk(String),
+    Reasoning(String),
+    /// The answer is complete. `text` is the whole of it, empty when ppxai
+    /// had none to give; tokens are this turn's.
+    End {
+        text: String,
+        tokens: Option<u64>,
+    },
+    Tool(ToolStep),
+    Consent(Consent),
+    /// `status`: a line for the transcript.
+    Status(String),
+    /// `info`: what the engine is doing, while the answer is still empty.
+    Info(String),
+    Warning(String),
+    /// `error`; an interrupted stream ends with "Interrupted by user".
+    Error(String),
+}
+
+/// A tool call, its result or its error, as `tool_call`, `tool_result`
+/// and `tool_error` carry them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolStep {
+    pub kind: ToolKind,
+    pub tool: String,
+    /// The call's arguments, the result or the error, as text.
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ToolKind {
+    Call,
+    Result,
+    Error,
+}
+
+/// What a `consent_request` asks to do (ppxai `engine/consent_ops.py`).
+/// Unanswered, ppxai denies it after 300 s for a file, 60 s for a command.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Consent {
+    /// Edit a file; the path is resolved and absolute.
+    File { path: String },
+    /// Run a shell command. ppxai asks only for commands it doesn't rate
+    /// `safe`, and refuses `never` ones without asking.
+    Shell {
+        command: String,
+        working_dir: String,
+        risk: Option<String>,
+    },
+}
+
+impl ChatEvent {
+    fn parse(v: &Value) -> Option<Self> {
+        let data = &v["data"];
+        let string = || match data {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        let text = |value: &Value| match value {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+        };
+        let tool = |kind, key| {
+            Some(Self::Tool(ToolStep {
+                kind,
+                tool: data["tool"].as_str().unwrap_or("?").to_string(),
+                detail: text(&data[key]),
+            }))
+        };
+        match v["type"].as_str()? {
+            "stream_start" => Some(Self::Start {
+                model: data["model"].as_str().map(str::to_string),
+            }),
+            "stream_chunk" => Some(Self::Chunk(string())),
+            "reasoning_chunk" => Some(Self::Reasoning(string())),
+            "stream_end" => {
+                let usage = &v["metadata"]["usage"];
+                let tokens = usage["total_tokens"].as_u64().or_else(|| {
+                    Some(usage["prompt_tokens"].as_u64()? + usage["completion_tokens"].as_u64()?)
+                });
+                Some(Self::End {
+                    text: data.as_str().unwrap_or_default().to_string(),
+                    tokens: tokens.filter(|&n| n > 0),
+                })
+            }
+            "tool_call" => tool(ToolKind::Call, "arguments"),
+            "tool_result" => tool(ToolKind::Result, "result"),
+            "tool_error" => tool(ToolKind::Error, "error"),
+            "consent_request" => {
+                if data["type"] == "shell" || data["command"].is_string() {
+                    Some(Self::Consent(Consent::Shell {
+                        command: data["command"].as_str()?.to_string(),
+                        working_dir: data["working_dir"].as_str().unwrap_or(".").to_string(),
+                        risk: data["risk_level"].as_str().map(str::to_string),
+                    }))
+                } else {
+                    Some(Self::Consent(Consent::File {
+                        path: data["file_path"].as_str()?.to_string(),
+                    }))
+                }
+            }
+            "status" => Some(Self::Status(string())),
+            "info" => Some(Self::Info(string())),
+            "warning" => Some(Self::Warning(
+                data["message"].as_str().map_or_else(string, str::to_string),
+            )),
+            "error" => Some(Self::Error(string())),
+            _ => None,
         }
     }
 }
@@ -453,11 +995,14 @@ fn encode(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::atomic::AtomicBool,
+        time::{Duration, Instant},
+    };
 
     use super::{
-        Answer, Client, MergeError, Model, Provider, Providers, Run, RunFilter, Source, detail,
-        encode, json,
+        Answer, ChatEvent, Client, CommandOutcome, Consent, MergeError, Model, Provider, Providers,
+        Roster, Run, RunFilter, Source, Sse, ToolKind, ToolStep, detail, encode, json, sse_line,
     };
 
     // The shapes below are the ones ppxai's fence pins
@@ -665,6 +1210,120 @@ mod tests {
     }
 
     #[test]
+    fn sse_lines_are_events_done_or_nothing() {
+        assert_eq!(
+            sse_line(r#"data: {"type":"stream_chunk","data":"hi"}"#),
+            Some(Sse::Event(
+                serde_json::json!({"type":"stream_chunk","data":"hi"})
+            ))
+        );
+        assert_eq!(sse_line("data: [DONE]"), Some(Sse::Done));
+        assert_eq!(sse_line(": keepalive"), None);
+        assert_eq!(sse_line(""), None);
+        assert_eq!(sse_line("data: not json"), None);
+    }
+
+    #[test]
+    fn chat_events_read_what_tai_shows() {
+        let parse = |v: serde_json::Value| ChatEvent::parse(&v);
+        assert_eq!(
+            parse(serde_json::json!({"type":"stream_start","data":{"model":"m"}})),
+            Some(ChatEvent::Start {
+                model: Some("m".into())
+            })
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"stream_end","data":"all",
+                "metadata":{"usage":{"prompt_tokens":3,"completion_tokens":4}}})),
+            Some(ChatEvent::End {
+                text: "all".into(),
+                tokens: Some(7)
+            })
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"tool_call",
+                "data":{"tool":"read_file","arguments":{"path":"a"}}})),
+            Some(ChatEvent::Tool(ToolStep {
+                kind: ToolKind::Call,
+                tool: "read_file".into(),
+                detail: "{\n  \"path\": \"a\"\n}".into(),
+            }))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"consent_request",
+                "data":{"command":"rm x","working_dir":"/w","risk_level":"dangerous","type":"shell"}})),
+            Some(ChatEvent::Consent(Consent::Shell {
+                command: "rm x".into(),
+                working_dir: "/w".into(),
+                risk: Some("dangerous".into()),
+            }))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"consent_request","data":{"file_path":"/w/a.rs"}})),
+            Some(ChatEvent::Consent(Consent::File {
+                path: "/w/a.rs".into()
+            }))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"warning","data":{"message":"careful"}})),
+            Some(ChatEvent::Warning("careful".into()))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"state_sync","data":{}})),
+            None
+        );
+        assert_eq!(parse(serde_json::json!({"data":"no type"})), None);
+    }
+
+    #[test]
+    fn the_roster_resolves_names_and_aliases() {
+        let roster = Roster::parse(&serde_json::json!({"version": 1, "commands": [
+            {"name":"clear","aliases":["c"],"description":"Clear","usage":"/clear",
+             "hidden":false,"dispatch":"server","client_action":null,"subcommands":[]},
+            {"name":"token","aliases":[],"description":"Token","usage":"/token",
+             "hidden":false,"dispatch":"client","client_action":"token.manage",
+             "subcommands":[{"name":"set","sensitive":true},{"name":"status","sensitive":false}]},
+        ]}))
+        .unwrap();
+        assert_eq!(roster.resolve("C").map(|c| c.name.as_str()), Some("clear"));
+        let token = roster.resolve("token").unwrap();
+        assert!(token.client_dispatch);
+        assert_eq!(token.client_action.as_deref(), Some("token.manage"));
+        assert_eq!(token.sensitive, ["set"]);
+        assert_eq!(token.subcommands, ["set", "status"]);
+        assert!(roster.resolve("nosuch").is_none());
+    }
+
+    #[test]
+    fn command_results_render_as_markdown() {
+        let outcome = |v: serde_json::Value| CommandOutcome::parse(&v);
+        let table = outcome(
+            serde_json::json!({"ok": true, "result": {"type":"CompositeResult",
+            "message":"", "results":[{"type":"TableResult","status":"success","message":"Usage",
+            "columns":["Model","In"],"rows":[["a|b", 3]]}]}}),
+        );
+        assert_eq!(
+            table.markdown,
+            "**Usage**\n\n| Model | In |\n|---|---|\n| a\\|b | 3 |\n"
+        );
+        let pairs = outcome(serde_json::json!({"result": {"type":"KeyValueResult",
+            "status":"success","message":"Status","pairs":{"Tools":"disabled"}}}));
+        assert_eq!(pairs.markdown, "**Status**\n\n- **Tools:** disabled");
+        let tools = outcome(serde_json::json!({"ok": true,
+            "result": {"type":"ConfirmationResult","status":"success","message":"Tools enabled!"},
+            "events": [{"type":"state_sync","data":{"tools_enabled":true}}]}));
+        assert_eq!(tools.tools_enabled, Some(true));
+        assert_eq!(tools.markdown, "**Tools enabled!**");
+        let md = outcome(serde_json::json!({"result": {"type":"MarkdownResult",
+            "status":"error","message":"x","content":"## Help"}}));
+        assert!(md.error);
+        assert_eq!(md.markdown, "## Help");
+        let tree = outcome(serde_json::json!({"result": {"type":"DirectoryTreeResult",
+            "message":"1 file","root":{"label":"d/","children":[{"label":"f","children":[]}]}}}));
+        assert_eq!(tree.markdown, "```text\nd/\n  f\n```\n\n**1 file**");
+    }
+
+    #[test]
     fn encoding_keeps_only_unreserved_characters() {
         assert_eq!(encode("session_2026-11.02~x"), "session_2026-11.02~x");
         assert_eq!(encode("a/b?c"), "a%2Fb%3Fc");
@@ -731,6 +1390,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(chosen.provider, provider.id);
+
+        // The conversation, on a slot of its own: `/clear` there can't
+        // touch the run checks' conversation below.
+        let c = Client::new(&link).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut events = Vec::new();
+        c.chat(
+            "Remember the word kiwi. Reply with the single word: ok",
+            None,
+            None,
+            &stop,
+            |e| events.push(e),
+        )
+        .unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, ChatEvent::Start { .. }))
+                && events.iter().any(|e| matches!(e, ChatEvent::End { .. })),
+            "a chat stream without start and end: {events:?}"
+        );
+        let mut recalled = String::new();
+        c.chat(
+            "Which word did I ask you to remember? Reply with that word only.",
+            None,
+            None,
+            &stop,
+            |e| {
+                if let ChatEvent::End { text, .. } = e {
+                    recalled = text;
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            recalled.to_lowercase().contains("kiwi"),
+            "the slot kept no history: {recalled:?}"
+        );
+        assert!(!c.tools().unwrap(), "a new slot starts with tools on");
+        assert!(c.set_tools(true).unwrap());
+        assert!(!c.set_tools(false).unwrap());
+        c.interrupt().unwrap();
+        let unasked = Consent::File {
+            path: "/no/such/request".into(),
+        };
+        assert!(c.consent(&unasked, "n").is_err_and(|e| e.contains("404")));
+
+        // The command roster and the routes tai-gui's dispatch relies on.
+        let roster = c.commands().unwrap();
+        let run = roster.resolve("run").expect("no /run in the roster");
+        assert!(run.client_dispatch);
+        assert_eq!(run.client_action.as_deref(), Some("run.controller"));
+        let clear = roster
+            .resolve("c")
+            .expect("no /clear alias c in the roster");
+        assert_eq!(clear.name, "clear");
+        assert!(!clear.client_dispatch);
+        assert!(
+            roster
+                .commands
+                .iter()
+                .any(|c| c.client_action.as_deref() == Some("coding.stream")),
+            "no coding.stream commands in the roster"
+        );
+        assert!(c.command("clear", "").unwrap().ok);
+        let enabled = c.command("tools", "enable").unwrap();
+        assert_eq!(enabled.tools_enabled, Some(true));
+        assert!(c.tools().unwrap());
+        c.set_tools(false).unwrap();
+        assert!(!c.command("status", "").unwrap().markdown.is_empty());
+        assert!(
+            c.command("nosuch", "")
+                .is_err_and(|e| e.contains("Unknown command"))
+        );
 
         let id = a.start_run("Reply with the single word: pong").unwrap();
         let run = loop {

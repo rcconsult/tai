@@ -178,3 +178,18 @@ their contract test pins a commit and expects churn.
   `--version` first: it took 7.2 s on its own on the Windows host, and
   dev builds report 1.19.5 before and after the flag landed. Decision 5 is done on ppxai's side; this record's
   accepted risks close for servers that have the flag.
+
+- **2026-11-21, the conversation.** tai-gui's chat pane talks to the
+  slot's conversation over `/chat` (SSE), with `/interrupt` (Escape or
+  Stop) and `/consent` / `/shell-consent` (a dialog: Deny, Never for this,
+  Always allow, Allow), following ppxai's web app. Tools start off, as
+  ppxai starts a slot; "Tools: on/off" is `POST /tools`. Slash commands
+  come from ppxai's roster (`GET /commands`, ppxai ADR 0007) and are
+  routed as it says: `coding.stream` commands to `/chat`, client-dispatched
+  ones to tai-gui's own actions (only `run.controller` so far), the rest to
+  `POST /command/<name>`. `/run <prompt>` stays on `/v1/oneshot`, which
+  returns the sources `/v1/agent/run` drops, until ppxai's citation rework
+  lands. tai-gui speaks as client `web`, since ppxai rejects ids it
+  doesn't know. With tools on, ppxai sends the answer whole in
+  `stream_end` rather than streaming it (`engine/chat.py`
+  `chat_with_tools`). The contract test covers these routes.
