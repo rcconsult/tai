@@ -1,13 +1,16 @@
 # Bundled fonts
 
-All four fonts are compiled into the binary (`src/fonts.rs`). Fonts the
-OS supplies for anything else are read in place, not bundled.
+The four terminal fonts are compiled into both binaries (`src/fonts.rs`).
+Inter is compiled into tai-gui only, as its UI font for chat prose, menus
+and tabs (`src/bin/tai-gui/main.rs`). Fonts the OS supplies for anything
+else are read in place, not bundled.
 
 | File | Source | Licence |
 |---|---|---|
 | `JetBrainsMono-Medium.ttf` | uzaaft/libghostty-rs `example/ghostling_rs/`, tag v0.2.2 (a3a9676, "release: 0.2.2") | SIL OFL 1.1 (`OFL.txt`) |
 | `SymbolsNerdFontMono-Regular.ttf` | ryanoasis/nerd-fonts release v3.5.1, asset `NerdFontsSymbolsOnly.tar.xz` | Font: MIT (`SymbolsNerdFont-LICENSE`). Icons: per set, see below |
 | `NotoEmoji-Regular.ttf` | ghostty-org/ghostty `src/font/res/`, at a887df42 ("terminal: bound page map probe lengths without tombstones (#13294)"); upstream googlefonts/noto-emoji | SIL OFL 1.1 (`NotoEmoji-LICENSE`) |
+| `Inter-Regular.ttf` | rsms/inter release v4.1 (e3a3d4c, tag v4.1), asset `Inter-4.1.zip`, file `extras/ttf/Inter-Regular.ttf` | SIL OFL 1.1 (`Inter-LICENSE.txt`, the archive's `LICENSE.txt`) |
 | `IosevkaFixedSS01-Medium.ttf` | be5invis/Iosevka release v34.9.0 (2487637, "Release 34.9.0"), asset `PkgTTF-Unhinted-IosevkaFixedSS01-34.9.0.zip` | SIL OFL 1.1 (`Iosevka-LICENSE.md`, the repo's `LICENSE.md` at that tag) |
 
 sha256:
@@ -19,6 +22,8 @@ fe471e538392f51910faab985fa8e192a39dd3426125edd15b71b3680df0e749  SymbolsNerdFon
 999c3254e382082f1d37eb6e390a60feeff47f204b0366afdac06f977315c1a4  IosevkaFixedSS01-Medium.ttf
 0e4b5fb8b5346272b9751340dae8ca61eddf9f1b390d6d429834987f552871e1  PkgTTF-Unhinted-IosevkaFixedSS01-34.9.0.zip (the release asset)
 84a38f2f02374efb72cac2b7eb5589102e06fffc33f7b531ed708f4a08236c91  NotoEmoji-Regular.ttf
+40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82  Inter-Regular.ttf
+9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e  Inter-4.1.zip (the release asset)
 ```
 
 `SymbolsNerdFont-README.md` is the README from the same archive. Its

@@ -55,6 +55,9 @@ mod terminal;
 // The pty modules size the pseudo terminal from `crate::Dimensions`.
 use terminal::{Dimensions, TerminalPane};
 
+/// The UI's proportional font (fonts/README.md). Only tai-gui uses it.
+const INTER_BYTES: &[u8] = include_bytes!("../../../fonts/Inter-Regular.ttf");
+
 /// What a tab shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
@@ -409,13 +412,23 @@ fn main() -> eframe::Result {
                 .all_styles_mut(|style| style.url_in_tooltip = true);
             // Code in chat answers (Markdown code blocks and inline code)
             // uses egui's monospace family. Put the terminal's font first in
-            // it, so code reads the same in both panes; prose stays in
-            // egui's proportional font.
+            // it, so code reads the same in both panes.
             cc.egui_ctx.add_font(egui::epaint::text::FontInsert::new(
                 "JetBrainsMono-Medium",
                 egui::FontData::from_static(fonts::PRIMARY_BYTES),
                 vec![egui::epaint::text::InsertFontFamily {
                     family: egui::FontFamily::Monospace,
+                    priority: egui::epaint::text::FontPriority::Highest,
+                }],
+            ));
+            // Prose (chat, menus, tabs) in Inter Regular. egui's own
+            // proportional font is Ubuntu Light, thin to read at length.
+            // Bundled like the terminal fonts (fonts/README.md).
+            cc.egui_ctx.add_font(egui::epaint::text::FontInsert::new(
+                "Inter-Regular",
+                egui::FontData::from_static(INTER_BYTES),
+                vec![egui::epaint::text::InsertFontFamily {
+                    family: egui::FontFamily::Proportional,
                     priority: egui::epaint::text::FontPriority::Highest,
                 }],
             ));
