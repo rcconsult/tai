@@ -34,7 +34,12 @@ use crate::{
 
 enum Entry {
     Prompt(String),
-    Answer { text: String, meta: String },
+    Answer {
+        text: String,
+        /// The answer split into its tables and the Markdown between them.
+        blocks: Vec<Block>,
+        meta: String,
+    },
     Error(String),
 }
 
@@ -352,15 +357,34 @@ impl ChatPane {
                     if self.entries.is_empty() {
                         ui.weak("One-shot chat: each prompt stands alone, with no history.");
                     }
-                    for entry in &self.entries {
+                    for (n, entry) in self.entries.iter().enumerate() {
                         match entry {
                             Entry::Prompt(text) => {
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new(text).strong());
                             }
-                            Entry::Answer { text, meta } => {
+                            Entry::Answer { blocks, meta, .. } => {
                                 ui.add_space(4.0);
-                                CommonMarkViewer::new().show(ui, &mut self.markdown, text);
+                                for (b, block) in blocks.iter().enumerate() {
+                                    ui.push_id((n, b), |ui| {
+                                        let mut show = |ui: &mut egui::Ui| {
+                                            CommonMarkViewer::new().show(
+                                                ui,
+                                                &mut self.markdown,
+                                                &block.text,
+                                            );
+                                        };
+                                        if block.table {
+                                            // Only as wide as the pane; a
+                                            // wider table scrolls sideways.
+                                            egui::ScrollArea::horizontal()
+                                                .auto_shrink([false, true])
+                                                .show(ui, show);
+                                        } else {
+                                            show(ui);
+                                        }
+                                    });
+                                }
                                 ui.weak(meta);
                             }
                             Entry::Error(why) => {
@@ -456,6 +480,58 @@ impl ChatPane {
     }
 }
 
+/// A run of an answer's Markdown: a table, or everything between tables.
+#[derive(Debug, PartialEq)]
+struct Block {
+    table: bool,
+    text: String,
+}
+
+/// Split Markdown into its top-level tables and the text between them.
+/// egui_commonmark lays a table out as a grid that never wraps a cell, so
+/// a wide one is wider than the pane. Drawn in the same scroll area as the
+/// prose, it also widened the area the following paragraphs wrap in, and
+/// they ran off the pane. Each table gets its own sideways scroll instead.
+/// Parsed with egui_commonmark's options (`parser_options` in
+/// egui_commonmark_backend 0.25), so the split agrees with what it draws.
+/// Link reference definitions only reach links in the same block.
+fn blocks(markdown: &str) -> Vec<Block> {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_DEFINITION_LIST;
+    let mut blocks = Vec::new();
+    let mut push = |table: bool, text: &str| {
+        if !text.trim().is_empty() {
+            blocks.push(Block {
+                table,
+                text: text.to_string(),
+            });
+        }
+    };
+    let mut prose = 0;
+    let mut depth = 0usize;
+    for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                // A table nested in a list or a quote stays in its block.
+                if depth == 0 && matches!(tag, Tag::Table(_)) {
+                    push(false, &markdown[prose..range.start]);
+                    push(true, &markdown[range.clone()]);
+                    prose = range.end;
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    push(false, &markdown[prose..]);
+    blocks
+}
+
 /// An answer, with a line naming the model and the tokens used.
 fn entry(answer: ppxai::Answer) -> Entry {
     let mut meta = format!("{} · {}", answer.provider, answer.model);
@@ -466,6 +542,7 @@ fn entry(answer: ppxai::Answer) -> Entry {
         meta.push_str(&format!(" · finished: {reason}"));
     }
     Entry::Answer {
+        blocks: blocks(&answer.content),
         text: answer.content,
         meta,
     }
@@ -488,8 +565,36 @@ fn is_web_link(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, entry, is_web_link};
+    use super::{Block, Entry, blocks, entry, is_web_link};
     use crate::ppxai::Answer;
+
+    fn block(table: bool, text: &str) -> Block {
+        Block {
+            table,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn tables_are_split_from_the_text_around_them() {
+        let md = "Intro.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nAfter.\n";
+        assert_eq!(
+            blocks(md),
+            [
+                block(false, "Intro.\n\n"),
+                block(true, "| a | b |\n|---|---|\n| 1 | 2 |\n"),
+                block(false, "\nAfter.\n"),
+            ]
+        );
+        // Without a table, the answer is one block.
+        assert_eq!(blocks("# H\n\ntext"), [block(false, "# H\n\ntext")]);
+        // A pipe in a code block is not a table.
+        let code = "```\n| a | b |\n|---|---|\n```\n";
+        assert_eq!(blocks(code), [block(false, code)]);
+        // A table in a list item stays with its list.
+        let nested = "- item\n\n  | a |\n  |---|\n  | 1 |\n";
+        assert_eq!(blocks(nested), [block(false, nested)]);
+    }
 
     #[test]
     fn only_web_links_open() {
@@ -513,7 +618,7 @@ mod tests {
 
     #[test]
     fn an_answer_names_provider_model_and_tokens() {
-        let Entry::Answer { text, meta } = entry(answer(Some(3), "stop")) else {
+        let Entry::Answer { text, meta, .. } = entry(answer(Some(3), "stop")) else {
             panic!("not an answer");
         };
         assert_eq!(text, "**hi**");
