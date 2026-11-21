@@ -38,6 +38,8 @@ enum Entry {
         text: String,
         /// The answer split into its tables and the Markdown between them.
         blocks: Vec<Block>,
+        /// The web sources ppxai grounded it on; its `[n]` is the nth.
+        sources: Vec<ppxai::Source>,
         meta: String,
     },
     Error(String),
@@ -363,7 +365,12 @@ impl ChatPane {
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new(text).strong());
                             }
-                            Entry::Answer { blocks, meta, .. } => {
+                            Entry::Answer {
+                                blocks,
+                                sources,
+                                meta,
+                                ..
+                            } => {
                                 ui.add_space(4.0);
                                 for (b, block) in blocks.iter().enumerate() {
                                     ui.push_id((n, b), |ui| {
@@ -384,6 +391,16 @@ impl ChatPane {
                                             show(ui);
                                         }
                                     });
+                                }
+                                if !sources.is_empty() {
+                                    // Numbered as the answer's `[n]` markers. The
+                                    // hover shows the URL; only web links open.
+                                    ui.add_space(2.0);
+                                    ui.weak("Sources");
+                                    for (i, source) in sources.iter().enumerate() {
+                                        let name = source.title.as_deref().unwrap_or(&source.url);
+                                        ui.hyperlink_to(format!("[{}] {name}", i + 1), &source.url);
+                                    }
                                 }
                                 ui.weak(meta);
                             }
@@ -471,9 +488,13 @@ impl ChatPane {
         if let Some(entry) = done {
             self.pending = None;
             match &entry {
-                Entry::Answer { text, .. } | Entry::Prompt(text) | Entry::Error(text) => {
+                Entry::Answer { text, sources, .. } => {
                     self.fonts.cover(ctx, text);
+                    for title in sources.iter().filter_map(|s| s.title.as_deref()) {
+                        self.fonts.cover(ctx, title);
+                    }
                 }
+                Entry::Prompt(text) | Entry::Error(text) => self.fonts.cover(ctx, text),
             }
             self.entries.push(entry);
         }
@@ -543,6 +564,7 @@ fn entry(answer: ppxai::Answer) -> Entry {
     }
     Entry::Answer {
         blocks: blocks(&answer.content),
+        sources: answer.sources,
         text: answer.content,
         meta,
     }
@@ -613,6 +635,7 @@ mod tests {
             model: "m1".into(),
             total_tokens: tokens,
             finish_reason: Some(finish.into()),
+            sources: Vec::new(),
         }
     }
 
