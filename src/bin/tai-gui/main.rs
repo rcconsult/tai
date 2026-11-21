@@ -402,6 +402,18 @@ fn main() -> eframe::Result {
             // Windows host), so the chat input's cursor holds still.
             cc.egui_ctx
                 .all_styles_mut(|style| style.visuals.text_cursor.blink = false);
+            // Code in chat answers (Markdown code blocks and inline code)
+            // uses egui's monospace family. Put the terminal's font first in
+            // it, so code reads the same in both panes; prose stays in
+            // egui's proportional font.
+            cc.egui_ctx.add_font(egui::epaint::text::FontInsert::new(
+                "JetBrainsMono-Medium",
+                egui::FontData::from_static(fonts::PRIMARY_BYTES),
+                vec![egui::epaint::text::InsertFontFamily {
+                    family: egui::FontFamily::Monospace,
+                    priority: egui::epaint::text::FontPriority::Highest,
+                }],
+            ));
             let terminal = fonts::Coverage::new()
                 .map_err(Into::into)
                 .and_then(|coverage| TerminalPane::new(coverage, cc.egui_ctx.clone()))
