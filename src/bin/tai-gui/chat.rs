@@ -199,8 +199,11 @@ const RESETS_TRANSCRIPT: &[&str] = &["clear"];
 /// `engine/chat.py`).
 const INTERRUPTED: &str = "Interrupted by user";
 
-/// Which provider and model a prompt goes to. Until the user picks one,
-/// ppxai's defaults answer.
+/// The slot's provider and model, as the web app's header pickers: a
+/// change switches the slot at once (`POST /providers`, `POST /models`), and
+/// `/chat` carries only the message. Naming them in every `/chat` would
+/// make ppxai switch on every turn, which it refuses while an interrupted
+/// answer is still running. `/run` names them in its one-shot request.
 #[derive(Default)]
 struct Picker {
     asked: bool,
@@ -212,7 +215,21 @@ struct Picker {
     /// A list in flight, filled by its thread. Replacing it drops the
     /// answer of a list asked for earlier.
     loading: Option<Arc<Mutex<Option<Loaded>>>>,
+    /// A model switch in flight, and the model to go back to if it fails.
+    switching: Option<Switch>,
     error: Option<String>,
+    /// Lines for the transcript, such as "Switched to model: …".
+    notes: Vec<String>,
+}
+
+/// Where a thread's result lands; the UI takes it from there.
+type Slot<T> = Arc<Mutex<Option<T>>>;
+
+/// A model switch in flight: ppxai's answer, how many messages it cleared.
+struct Switch {
+    done: Slot<Result<Option<u64>, String>>,
+    /// The model picked before, to go back to if ppxai refuses.
+    previous: Option<String>,
 }
 
 enum Loaded {
@@ -221,7 +238,9 @@ enum Loaded {
 }
 
 impl Picker {
-    fn ui(&mut self, ui: &mut egui::Ui, client: Option<&Client>) {
+    /// The pickers; while `busy`, they can't be changed, since ppxai
+    /// refuses a switch while an answer is in flight.
+    fn ui(&mut self, ui: &mut egui::Ui, client: Option<&Client>, busy: bool) {
         let Some(client) = client else {
             return;
         };
@@ -237,41 +256,46 @@ impl Picker {
             }
             return;
         }
+        self.collect_switch();
         let before = self.provider.clone();
-        ui.horizontal(|ui| {
-            let current = self.current();
-            egui::ComboBox::from_id_salt("chat-provider")
-                .selected_text(current.map_or("default provider", |p| p.name.as_str()))
-                .show_ui(ui, |ui| {
-                    for p in &self.providers {
-                        let label = if p.has_api_key {
-                            p.name.clone()
-                        } else {
-                            format!("{} (no API key)", p.name)
-                        };
-                        ui.add_enabled_ui(p.has_api_key, |ui| {
-                            ui.selectable_value(&mut self.provider, Some(p.id.clone()), label);
-                        });
-                    }
-                });
-            let default = self
-                .current()
-                .and_then(|p| p.default_model.clone())
-                .unwrap_or_else(|| "default model".into());
-            egui::ComboBox::from_id_salt("chat-model")
-                .selected_text(self.model.clone().unwrap_or(default.clone()))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.model, None, format!("{default} (default)"));
-                    for m in &self.models {
-                        ui.selectable_value(&mut self.model, Some(m.id.clone()), &m.name);
-                    }
-                });
-            if self.loading.is_some() {
-                ui.spinner();
-            }
-            if let Some(why) = &self.error {
-                ui.colored_label(ui.visuals().error_fg_color, why);
-            }
+        let before_model = self.model.clone();
+        let busy = busy || self.switching.is_some();
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.horizontal(|ui| {
+                let current = self.current();
+                egui::ComboBox::from_id_salt("chat-provider")
+                    .selected_text(current.map_or("default provider", |p| p.name.as_str()))
+                    .show_ui(ui, |ui| {
+                        for p in &self.providers {
+                            let label = if p.has_api_key {
+                                p.name.clone()
+                            } else {
+                                format!("{} (no API key)", p.name)
+                            };
+                            ui.add_enabled_ui(p.has_api_key, |ui| {
+                                ui.selectable_value(&mut self.provider, Some(p.id.clone()), label);
+                            });
+                        }
+                    });
+                let default = self
+                    .current()
+                    .and_then(|p| p.default_model.clone())
+                    .unwrap_or_else(|| "default model".into());
+                egui::ComboBox::from_id_salt("chat-model")
+                    .selected_text(self.model.clone().unwrap_or(default.clone()))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.model, None, format!("{default} (default)"));
+                        for m in &self.models {
+                            ui.selectable_value(&mut self.model, Some(m.id.clone()), &m.name);
+                        }
+                    });
+                if self.loading.is_some() {
+                    ui.spinner();
+                }
+                if let Some(why) = &self.error {
+                    ui.colored_label(ui.visuals().error_fg_color, why);
+                }
+            })
         });
         if self.provider != before
             && let Some(id) = self.provider.clone()
@@ -279,6 +303,55 @@ impl Picker {
             self.model = None;
             self.models.clear();
             self.load_models(client, ui.ctx(), id);
+        } else if self.model != before_model {
+            // "Default" switches to the provider's default model by name.
+            let target = self
+                .model
+                .clone()
+                .or_else(|| self.current().and_then(|p| p.default_model.clone()));
+            if let Some(target) = target {
+                let client = client.clone();
+                self.error = None;
+                self.switching = spawn(ui.ctx(), "chat-model", move || {
+                    client
+                        .set_model(&target)
+                        .map_err(|why| format!("{target}: {why}"))
+                })
+                .map(|done| Switch {
+                    done,
+                    previous: before_model,
+                });
+            }
+        }
+    }
+
+    /// Note a finished model switch, or undo the pick when ppxai refused.
+    fn collect_switch(&mut self) {
+        let done = self
+            .switching
+            .as_ref()
+            .and_then(|switch| switch.done.lock().ok()?.take());
+        let Some(done) = done else {
+            return;
+        };
+        let Some(Switch { previous, .. }) = self.switching.take() else {
+            return;
+        };
+        let name = self
+            .model
+            .clone()
+            .or_else(|| self.current().and_then(|p| p.default_model.clone()))
+            .unwrap_or_default();
+        match done {
+            Ok(Some(cleared)) => self.notes.push(format!(
+                "Switched to model: {name} ({cleared} messages cleared from context)"
+            )),
+            Ok(None) => self.notes.push(format!("Switched to model: {name}")),
+            Err(why) => {
+                tracing::warn!("chat picker: {why}");
+                self.error = Some(why);
+                self.model = previous;
+            }
         }
     }
 
@@ -318,8 +391,8 @@ impl Picker {
         }
     }
 
-    /// The provider and model to name in a prompt, None for ppxai's
-    /// defaults.
+    /// The provider and model to name in a one-shot request, None for
+    /// ppxai's defaults.
     fn choice(&self) -> (Option<String>, Option<String>) {
         (self.provider.clone(), self.model.clone())
     }
@@ -485,7 +558,10 @@ impl ChatPane {
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 self.status_line(ui, engine);
-                self.picker.ui(ui, client.as_ref());
+                self.picker.ui(ui, client.as_ref(), busy);
+                for note in self.picker.notes.drain(..) {
+                    self.entries.push(Entry::Note(note));
+                }
                 if let Some(client) = &client {
                     self.controls(ui, client, busy);
                 }
@@ -802,23 +878,16 @@ impl ChatPane {
         self.entries.push(Entry::Prompt(message.clone()));
         let live = Arc::new(Mutex::new(Live::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (provider, model) = self.picker.choice();
         let (filled, stopped, repaint) = (Arc::clone(&live), Arc::clone(&stop), ctx.clone());
         let spawned = std::thread::Builder::new()
             .name("chat".into())
             .spawn(move || {
-                let result = client.chat(
-                    &message,
-                    provider.as_deref(),
-                    model.as_deref(),
-                    &stopped,
-                    |event| {
-                        if let Ok(mut live) = filled.lock() {
-                            live.apply(event);
-                        }
-                        repaint.request_repaint();
-                    },
-                );
+                let result = client.chat(&message, &stopped, |event| {
+                    if let Ok(mut live) = filled.lock() {
+                        live.apply(event);
+                    }
+                    repaint.request_repaint();
+                });
                 if let Ok(mut live) = filled.lock() {
                     if let Err(why) = result {
                         live.error.get_or_insert(why);

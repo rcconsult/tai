@@ -192,25 +192,20 @@ impl Client {
 
 impl Client {
     /// Send `message` to the slot's conversation, `POST /chat`, and hand
-    /// each event tai shows to `on` as it arrives. With a provider or a
-    /// model, ppxai switches the conversation to it first and keeps the
-    /// history. Returns once the stream ends, or soon after `stop` is set:
-    /// ppxai sends a keepalive at least every 5 s, so the reader wakes.
+    /// each event tai shows to `on` as it arrives. The body is only the
+    /// message, as the web app sends it: naming a provider or model makes
+    /// ppxai switch first, which it refuses (500) while an earlier answer is
+    /// still running, even an interrupted one. Without them, the request
+    /// waits on the slot's chat lock instead. Returns once the stream ends,
+    /// or soon after `stop` is set: ppxai sends a keepalive at least every
+    /// 5 s, so the reader wakes.
     pub fn chat(
         &self,
         message: &str,
-        provider: Option<&str>,
-        model: Option<&str>,
         stop: &AtomicBool,
         mut on: impl FnMut(ChatEvent),
     ) -> Result<(), String> {
-        let mut body = serde_json::json!({ "message": message });
-        if let Some(provider) = provider {
-            body["provider"] = provider.into();
-        }
-        if let Some(model) = model {
-            body["model"] = model.into();
-        }
+        let body = serde_json::json!({ "message": message });
         let reader = match self.link.post_stream("/chat", &body)? {
             Ok(reader) => reader,
             Err((status, text)) => return Err(format!("{status}: {}", detail(&text))),
@@ -231,6 +226,17 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// Switch the slot to `model`, `POST /models`, as the web app's model
+    /// picker does: how many messages ppxai cleared from the context, if
+    /// any (its default `reset_context`). 409 while an answer is in flight.
+    pub fn set_model(&self, model: &str) -> Result<Option<u64>, String> {
+        let body = serde_json::json!({ "model": model });
+        match self.link.post_json("/models", &body, CALL_TIMEOUT)? {
+            (200, text) => Ok(json(&text)?["context_reset"].as_u64()),
+            (status, text) => Err(format!("{status}: {}", detail(&text))),
+        }
     }
 
     /// Stop the slot's answer in flight, `POST /interrupt`. Its stream then
@@ -1416,8 +1422,6 @@ mod tests {
         let mut events = Vec::new();
         c.chat(
             "Remember the word kiwi. Reply with the single word: ok",
-            None,
-            None,
             &stop,
             |e| events.push(e),
         )
@@ -1430,8 +1434,6 @@ mod tests {
         let mut recalled = String::new();
         c.chat(
             "Which word did I ask you to remember? Reply with that word only.",
-            None,
-            None,
             &stop,
             |e| {
                 if let ChatEvent::End { text, .. } = e {
@@ -1444,6 +1446,50 @@ mod tests {
             recalled.to_lowercase().contains("kiwi"),
             "the slot kept no history: {recalled:?}"
         );
+        // A prompt right after an interrupted answer waits for it instead
+        // of failing. /chat used to name the provider, and ppxai refused
+        // that switch with a 500 while the first answer still ran.
+        let early = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                c.chat(
+                    "Write a 1500-word essay on the history of terminal emulators.",
+                    &stop,
+                    |_| {},
+                )
+            });
+            std::thread::sleep(Duration::from_secs(2));
+            c.interrupt().unwrap();
+            let mut next = Vec::new();
+            let second = c.chat(
+                "Reply with the single word: ok",
+                &AtomicBool::new(false),
+                |e| next.push(e),
+            );
+            (first.join().unwrap(), second, next)
+        });
+        assert!(early.0.is_ok(), "the interrupted chat: {:?}", early.0);
+        assert!(
+            early.1.is_ok(),
+            "the chat after an interrupt: {:?}",
+            early.1
+        );
+        assert!(
+            early.2.iter().any(|e| matches!(e, ChatEvent::End { .. })),
+            "the chat after an interrupt didn't end: {:?}",
+            early.2
+        );
+        let current = c.providers().unwrap().current.unwrap();
+        let provider = c
+            .providers()
+            .unwrap()
+            .list
+            .into_iter()
+            .find(|p| p.id == current)
+            .unwrap();
+        if let Some(model) = provider.default_model {
+            c.set_model(&model).unwrap();
+        }
+
         assert!(!c.tools().unwrap(), "a new slot starts with tools on");
         assert!(c.set_tools(true).unwrap());
         assert!(!c.set_tools(false).unwrap());

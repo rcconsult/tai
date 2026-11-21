@@ -151,8 +151,10 @@ impl Link {
 }
 
 /// How long a streaming response may take to start. ppxai sends its
-/// headers once the slot's chat lock is free and the stream begins.
-const STREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+/// headers once the slot's chat lock is free, so a prompt sent right after
+/// an interrupted answer waits until ppxai has finished that answer: over a
+/// minute when the interrupt came before its first chunk.
+const STREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The engine as the UI holds it. Dropping it stops the server.
 pub struct Engine {
