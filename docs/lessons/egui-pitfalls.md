@@ -27,3 +27,16 @@ window that otherwise draws nothing while idle. tai-gui turns blinking
 off (`style.visuals.text_cursor.blink = false`, in `src/bin/tai-gui/main.rs`).
 `TAI_FRAME_STATS=1` logs egui's repaint causes, which is how it showed
 up: `egui/src/text_selection/visuals.rs`.
+
+## Escape drops the focus before any widget sees the key
+
+egui 0.36.2 (`src/memory/mod.rs`, in the focus handling of
+`begin_pass`) sets `focused_widget = None` when Escape is pressed without
+modifiers, before the frame's widgets run. So a widget can't ask "do I
+have the focus?" in the frame Escape arrives: the answer is always no.
+
+tai-gui's chat pane stops an answer on Escape in its input. It remembers
+whether the input had the focus on the previous frame
+(`input_focused`, `src/bin/tai-gui/chat.rs`), checks that instead, and
+gives the focus back after stopping. Any other "Escape in this widget"
+binding needs the same.
