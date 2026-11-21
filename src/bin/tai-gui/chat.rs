@@ -6,6 +6,10 @@
 //! comes after the prototype. Keys follow the mainstream harnesses (Claude
 //! Code, Codex, pi): Enter sends, Shift+Enter starts a new line.
 //!
+//! A picker above the input names the provider and model each prompt goes
+//! to. It starts on ppxai's defaults; providers without an API key are
+//! listed but can't be picked.
+//!
 //! egui's bundled fonts have no CJK. Text they can't draw gets the font the
 //! OS picks for it, added to egui as a fallback (ADR 0012, decision 6).
 
@@ -42,8 +46,162 @@ pub struct ChatPane {
     input: String,
     /// The answer to the prompt in flight, filled by its thread.
     pending: Option<(Instant, Arc<Mutex<Option<Entry>>>)>,
+    picker: Picker,
     markdown: CommonMarkCache,
     fonts: ChatFonts,
+}
+
+/// Which provider and model a prompt goes to. Until the user picks one,
+/// ppxai's defaults answer.
+#[derive(Default)]
+struct Picker {
+    asked: bool,
+    providers: Vec<ppxai::Provider>,
+    provider: Option<String>,
+    models: Vec<ppxai::Model>,
+    /// None is the provider's `default_model`.
+    model: Option<String>,
+    /// A list in flight, filled by its thread. Replacing it drops the
+    /// answer of a list asked for earlier.
+    loading: Option<Arc<Mutex<Option<Loaded>>>>,
+    error: Option<String>,
+}
+
+enum Loaded {
+    Providers(Result<ppxai::Providers, String>),
+    Models(Result<Vec<ppxai::Model>, String>),
+}
+
+impl Picker {
+    fn ui(&mut self, ui: &mut egui::Ui, client: Option<&Client>) {
+        let Some(client) = client else {
+            return;
+        };
+        if !self.asked {
+            self.asked = true;
+            let client = client.clone();
+            self.loading = load(ui.ctx(), move || Loaded::Providers(client.providers()));
+        }
+        self.collect(client, ui.ctx());
+        if self.providers.is_empty() {
+            if let Some(why) = &self.error {
+                ui.colored_label(ui.visuals().error_fg_color, why);
+            }
+            return;
+        }
+        let before = self.provider.clone();
+        ui.horizontal(|ui| {
+            let current = self.current();
+            egui::ComboBox::from_id_salt("chat-provider")
+                .selected_text(current.map_or("default provider", |p| p.name.as_str()))
+                .show_ui(ui, |ui| {
+                    for p in &self.providers {
+                        let label = if p.has_api_key {
+                            p.name.clone()
+                        } else {
+                            format!("{} (no API key)", p.name)
+                        };
+                        ui.add_enabled_ui(p.has_api_key, |ui| {
+                            ui.selectable_value(&mut self.provider, Some(p.id.clone()), label);
+                        });
+                    }
+                });
+            let default = self
+                .current()
+                .and_then(|p| p.default_model.clone())
+                .unwrap_or_else(|| "default model".into());
+            egui::ComboBox::from_id_salt("chat-model")
+                .selected_text(self.model.clone().unwrap_or(default.clone()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.model, None, format!("{default} (default)"));
+                    for m in &self.models {
+                        ui.selectable_value(&mut self.model, Some(m.id.clone()), &m.name);
+                    }
+                });
+            if self.loading.is_some() {
+                ui.spinner();
+            }
+            if let Some(why) = &self.error {
+                ui.colored_label(ui.visuals().error_fg_color, why);
+            }
+        });
+        if self.provider != before
+            && let Some(id) = self.provider.clone()
+        {
+            self.model = None;
+            self.models.clear();
+            self.load_models(client, ui.ctx(), id);
+        }
+    }
+
+    fn current(&self) -> Option<&ppxai::Provider> {
+        let id = self.provider.as_ref()?;
+        self.providers.iter().find(|p| &p.id == id)
+    }
+
+    fn load_models(&mut self, client: &Client, ctx: &egui::Context, provider: String) {
+        self.error = None;
+        let client = client.clone();
+        self.loading = load(ctx, move || Loaded::Models(client.models(&provider)));
+    }
+
+    fn collect(&mut self, client: &Client, ctx: &egui::Context) {
+        let done = self
+            .loading
+            .as_ref()
+            .and_then(|slot| slot.lock().ok()?.take());
+        let Some(done) = done else {
+            return;
+        };
+        self.loading = None;
+        match done {
+            Loaded::Providers(Ok(providers)) => {
+                self.providers = providers.list;
+                self.provider = providers.current;
+                if let Some(id) = self.provider.clone() {
+                    self.load_models(client, ctx, id);
+                }
+            }
+            Loaded::Models(Ok(models)) => self.models = models,
+            Loaded::Providers(Err(why)) | Loaded::Models(Err(why)) => {
+                tracing::warn!("chat picker: {why}");
+                self.error = Some(why);
+            }
+        }
+    }
+
+    /// The provider and model to name in a prompt, None for ppxai's
+    /// defaults.
+    fn choice(&self) -> (Option<String>, Option<String>) {
+        (self.provider.clone(), self.model.clone())
+    }
+}
+
+/// Run `f` on a thread of its own and repaint when it's done: the slot
+/// its result lands in.
+fn load(
+    ctx: &egui::Context,
+    f: impl FnOnce() -> Loaded + Send + 'static,
+) -> Option<Arc<Mutex<Option<Loaded>>>> {
+    let slot = Arc::new(Mutex::new(None));
+    let filled = Arc::clone(&slot);
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("chat-picker".into())
+        .spawn(move || {
+            let loaded = f();
+            if let Ok(mut slot) = filled.lock() {
+                *slot = Some(loaded);
+            }
+            ctx.request_repaint();
+        });
+    match spawned {
+        Ok(_) => Some(slot),
+        Err(e) => {
+            tracing::warn!("chat picker: couldn't start a thread: {e}");
+            None
+        }
+    }
 }
 
 /// System fonts added to egui for codepoints its own fonts lack.
@@ -130,6 +288,7 @@ impl ChatPane {
             entries: Vec::new(),
             input: String::new(),
             pending: None,
+            picker: Picker::default(),
             markdown: CommonMarkCache::default(),
             fonts: ChatFonts::default(),
         }
@@ -153,6 +312,7 @@ impl ChatPane {
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 self.status_line(ui, engine);
+                self.picker.ui(ui, client.as_ref());
                 let input_id = egui::Id::new("chat-input-text");
                 // Enter sends; Shift+Enter falls through to the text box as
                 // a new line. Taken before the text box sees the key.
@@ -259,10 +419,11 @@ impl ChatPane {
         self.entries.push(Entry::Prompt(prompt.clone()));
         let slot = Arc::new(Mutex::new(None));
         self.pending = Some((Instant::now(), Arc::clone(&slot)));
+        let (provider, model) = self.picker.choice();
         let spawned = std::thread::Builder::new()
             .name("oneshot".into())
             .spawn(move || {
-                let entry = match client.oneshot(&prompt) {
+                let entry = match client.oneshot(&prompt, provider.as_deref(), model.as_deref()) {
                     Ok(answer) => entry(answer),
                     Err(e) => Entry::Error(e),
                 };

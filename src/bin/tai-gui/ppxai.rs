@@ -16,6 +16,10 @@
 //!   `merged_at`, `?session=`, `?status=`, the two structured 409s of
 //!   `/sessions/merge-run-result`, and `GET /status`'s `session_name`, the
 //!   slot's conversation. The other fields are read when present.
+//! - `GET /providers`, `POST /providers` and `GET /models` are internal
+//!   (`docs/api-gateway.md`, "What's not in the gateway tier"), read for
+//!   the chat pane's provider and model picker. The contract test covers
+//!   them.
 //! - A conversation name is opaque: `session_` and more, unique per
 //!   conversation since ppxai `bac85e6e`. `GET /status`'s `session_id` is
 //!   the slot, not the conversation.
@@ -55,12 +59,49 @@ impl Client {
         })
     }
 
-    /// One prompt, no history: `POST /v1/oneshot`.
-    pub fn oneshot(&self, prompt: &str) -> Result<Answer, String> {
-        let body = serde_json::json!({ "prompt": prompt });
+    /// One prompt, no history: `POST /v1/oneshot`. With no provider or
+    /// model, ppxai uses its `default_provider` and that provider's
+    /// `default_model`.
+    pub fn oneshot(
+        &self,
+        prompt: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Answer, String> {
+        let mut body = serde_json::json!({ "prompt": prompt });
+        if let Some(provider) = provider {
+            body["provider"] = provider.into();
+        }
+        if let Some(model) = model {
+            body["model"] = model.into();
+        }
         match self.link.post_json("/v1/oneshot", &body, ONESHOT_TIMEOUT)? {
             (200, text) => Answer::parse(&text),
             (status, text) => Err(format!("{status}: {}", detail(&text))),
+        }
+    }
+
+    /// The providers ppxai has configured, and the slot's current one:
+    /// `GET /providers`.
+    pub fn providers(&self) -> Result<Providers, String> {
+        match self.link.get("/providers")? {
+            (200, text) => Providers::parse(&json(&text)?),
+            (status, text) => Err(format!("/providers: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// The models of `provider`. ppxai lists only the slot's current
+    /// provider's models, so this makes `provider` the slot's provider
+    /// first (`POST /providers`, then `GET /models`).
+    pub fn models(&self, provider: &str) -> Result<Vec<Model>, String> {
+        let body = serde_json::json!({ "provider": provider });
+        match self.link.post_json("/providers", &body, CALL_TIMEOUT)? {
+            (200, _) => {}
+            (status, text) => return Err(format!("{provider}: {status}: {}", detail(&text))),
+        }
+        match self.link.get("/models")? {
+            (200, text) => Model::parse_list(&json(&text)?),
+            (status, text) => Err(format!("/models: {status}: {}", detail(&text))),
         }
     }
 
@@ -153,6 +194,74 @@ impl Answer {
             total_tokens: v["usage"]["total_tokens"].as_u64(),
             finish_reason: v["finish_reason"].as_str().map(str::to_string),
         })
+    }
+}
+
+/// A 200 from `GET /providers`.
+#[derive(Debug, PartialEq)]
+pub struct Providers {
+    pub list: Vec<Provider>,
+    /// The slot's current provider.
+    pub current: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Provider {
+    pub id: String,
+    pub name: String,
+    /// Whether ppxai has a key for it. Without one, calls to it fail.
+    pub has_api_key: bool,
+    pub default_model: Option<String>,
+}
+
+impl Providers {
+    fn parse(v: &Value) -> Result<Self, String> {
+        let list = v["providers"]
+            .as_array()
+            .ok_or_else(|| format!("no providers list in {v}"))?
+            .iter()
+            .map(|p| {
+                let id = p["id"]
+                    .as_str()
+                    .ok_or_else(|| format!("a provider without an id: {p}"))?;
+                Ok(Provider {
+                    id: id.to_string(),
+                    name: p["name"].as_str().unwrap_or(id).to_string(),
+                    has_api_key: p["has_api_key"].as_bool().unwrap_or(true),
+                    default_model: p["default_model"].as_str().map(str::to_string),
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Self {
+            list,
+            current: v["current"].as_str().map(str::to_string),
+        })
+    }
+}
+
+/// One of a provider's models, from `GET /models`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Model {
+    pub id: String,
+    pub name: String,
+}
+
+impl Model {
+    fn parse_list(v: &Value) -> Result<Vec<Self>, String> {
+        v["models"]
+            .as_array()
+            .ok_or_else(|| format!("no models list in {v}"))?
+            .iter()
+            .map(|m| {
+                let id = m["id"]
+                    .as_str()
+                    .ok_or_else(|| format!("a model without an id: {m}"))?;
+                Ok(Self {
+                    id: id.to_string(),
+                    name: m["name"].as_str().unwrap_or(id).to_string(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -323,7 +432,10 @@ fn encode(text: &str) -> String {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{Answer, Client, MergeError, Run, RunFilter, detail, encode, json};
+    use super::{
+        Answer, Client, MergeError, Model, Provider, Providers, Run, RunFilter, detail, encode,
+        json,
+    };
 
     // The shapes below are the ones ppxai's fence pins
     // (tests/test_run_session_contract.py at bac85e6e).
@@ -462,6 +574,42 @@ mod tests {
     }
 
     #[test]
+    fn providers_and_models_read_ids_names_and_keys() {
+        let v = json(
+            r#"{"providers": [
+                {"id": "gemini", "name": "Gemini", "has_api_key": true,
+                 "default_model": "gemini-3.8-flash", "capabilities": {"web_search": true}},
+                {"id": "local", "has_api_key": false, "default_model": null}],
+              "current": "gemini"}"#,
+        )
+        .unwrap();
+        let providers = Providers::parse(&v).unwrap();
+        assert_eq!(providers.current.as_deref(), Some("gemini"));
+        assert_eq!(
+            providers.list[1],
+            Provider {
+                id: "local".into(),
+                name: "local".into(),
+                has_api_key: false,
+                default_model: None,
+            }
+        );
+        let models = json(
+            r#"{"models": [{"id": "m1", "name": "Model 1", "description": ""}, {"id": "m2"}],
+              "current": "m1", "provider": "gemini"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Model::parse_list(&models).unwrap()[1],
+            Model {
+                id: "m2".into(),
+                name: "m2".into()
+            }
+        );
+        assert!(Providers::parse(&json(r#"{"providers": [{"name": "x"}]}"#).unwrap()).is_err());
+    }
+
+    #[test]
     fn errors_show_fastapis_detail() {
         assert_eq!(
             detail(r#"{"detail": "Provider call failed: boom"}"#),
@@ -511,11 +659,36 @@ mod tests {
         let conv_b = b.conversation().unwrap();
         assert_ne!(conv_a, conv_b, "two slots share a conversation");
 
-        let answer = a.oneshot("Reply with the single word: pong").unwrap();
+        let answer = a
+            .oneshot("Reply with the single word: pong", None, None)
+            .unwrap();
         assert!(
             !answer.content.is_empty(),
             "an empty one-shot answer: {answer:?}"
         );
+
+        // The picker's calls: the provider that just answered is listed,
+        // its models list, and a one-shot naming both is answered by them.
+        let providers = b.providers().unwrap();
+        let provider = providers
+            .list
+            .iter()
+            .find(|p| p.id == answer.provider)
+            .unwrap_or_else(|| panic!("{} isn't in {providers:?}", answer.provider));
+        let models = b.models(&provider.id).unwrap();
+        assert!(!models.is_empty(), "{} lists no models", provider.id);
+        let model = provider
+            .default_model
+            .clone()
+            .unwrap_or_else(|| models[0].id.clone());
+        let chosen = b
+            .oneshot(
+                "Reply with the single word: pong",
+                Some(&provider.id),
+                Some(&model),
+            )
+            .unwrap();
+        assert_eq!(chosen.provider, provider.id);
 
         let id = a.start_run("Reply with the single word: pong").unwrap();
         let run = loop {
