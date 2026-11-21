@@ -141,7 +141,7 @@ in one frame. Both binaries now reserve 64 bytes before every encode
 `src/bin/tai-gui/terminal.rs`). The test in `src/main.rs`
 `a_key_queued_after_other_bytes_isnt_lost` reproduces the drop with seven
 bytes queued in an 8-byte buffer, and fails once the crate is fixed; drop
-the workaround then. Still present upstream (libghostty-rs) at 575ed6b8ce.
+the workaround then. Still present upstream (libghostty-rs) at 483ea3d5.
 `docs/upstream/libghostty-rs-encode-to-vec.md` is the issue to file,
 with the two-line fix. The owner has put filing it on hold, since the
 workaround holds; it's kept for reference.

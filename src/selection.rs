@@ -1,7 +1,10 @@
 //! The selection as Copy takes it, and the badge's summary of it. Shared by
 //! tai and tai-gui.
 
-use libghostty_vt::{Terminal, fmt::Format, selection::FormatOptions};
+use libghostty_vt::{
+    Terminal,
+    fmt::{Format, Formatter},
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -9,12 +12,14 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// plain text, soft-wrapped lines joined, trailing blanks trimmed. `None`
 /// without a selection.
 pub fn text(terminal: &Terminal<'_, '_>) -> Result<Option<String>> {
-    let options = FormatOptions::new()
-        .with_emit_format(Format::Plain)
-        .with_unwrap(true)
-        .with_trim(true);
-    Ok(terminal
-        .format_selection_alloc(None, options)?
+    let Some(mut formatter) = Formatter::new_selection(terminal)? else {
+        return Ok(None);
+    };
+    formatter
+        .set_format(Format::Plain)?
+        .set_unwrap(true)?
+        .set_trim(true)?;
+    Ok(Some(formatter.format_alloc(None)?)
         .filter(|text| !text.is_empty())
         .map(|text| String::from_utf8_lossy(&text).into_owned()))
 }
@@ -33,7 +38,22 @@ pub fn summary(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::summary;
+    use super::{summary, text};
+    use libghostty_vt::Terminal;
+
+    #[test]
+    fn selection_text_is_plain_unwrapped_and_trimmed() {
+        let mut terminal = Terminal::new(10, 3).unwrap();
+        assert_eq!(text(&terminal).unwrap(), None);
+        // Soft-wrapped at 10 columns: one logical line on the clipboard.
+        terminal.vt_write(b"\x1b[31mhello world\x1b[0m\r\nend   ");
+        let all = terminal.select_all().unwrap().expect("content");
+        terminal.set_selection(Some(&all)).unwrap();
+        assert_eq!(
+            text(&terminal).unwrap().as_deref(),
+            Some("hello world\nend")
+        );
+    }
 
     #[test]
     fn selection_summary_counts_lines_and_graphemes() {

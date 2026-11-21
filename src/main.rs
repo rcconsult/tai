@@ -36,18 +36,22 @@ use libghostty_vt::{
     Terminal,
     alloc::Bytes,
     build_info,
+    color::Rgb,
+    effect::{
+        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+        PrimaryDeviceAttributes, SecondaryDeviceAttributes,
+    },
     key::{self, Key},
     kitty::graphics::{self, DecodePng, DecodedImage, Graphics, Layer, PlacementIterator},
+    mode::Mode,
     mouse,
+    point::{Coordinate, Point},
     render::{CellIteration, CellIterator, Colors, Dirty, RenderState, RowIterator},
+    report::SizeReportSize,
     screen::CellWide,
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
-    style::{RgbColor, StyleColor},
-    terminal::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
-        PointCoordinate, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes,
-        SizeReportSize,
-    },
+    style::StyleColor,
+    terminal::ScrollViewport,
 };
 
 use crate::fonts::{Coverage, Face, SymbolSpan, Typeface};
@@ -688,7 +692,7 @@ impl<'alloc> Renderer<'alloc> {
             }
             return Ok(());
         }
-        let graphics = terminal.kitty_graphics();
+        let graphics = terminal.kitty_graphics().ok().flatten();
 
         // Mouse input can change the selection or the viewport without
         // marking rows, so it rebuilds every row, as do new dimensions.
@@ -804,12 +808,12 @@ impl<'alloc> Renderer<'alloc> {
         rows.truncate(row_index);
 
         clear_background(color(colors.background));
-        if let Ok(graphics) = graphics.as_ref() {
+        if let Some(graphics) = graphics.as_ref() {
             Self::render_kitty_images(
                 terminal,
                 &mut self.placement_it,
                 graphics,
-                Layer::BelowBg,
+                Layer::BELOW_BACKGROUND,
                 dims,
             )?
         }
@@ -863,12 +867,12 @@ impl<'alloc> Renderer<'alloc> {
             Some(frame.target.render_pass.raw_miniquad_id()),
         );
 
-        if let Ok(graphics) = graphics.as_ref() {
+        if let Some(graphics) = graphics.as_ref() {
             Self::render_kitty_images(
                 terminal,
                 &mut self.placement_it,
                 graphics,
-                Layer::BelowText,
+                Layer::BELOW_TEXT,
                 dims,
             )?;
             let virtual_runs: Vec<(u16, placeholders::Placement)> = rows
@@ -897,12 +901,12 @@ impl<'alloc> Renderer<'alloc> {
             );
         }
 
-        if let Ok(graphics) = graphics.as_ref() {
+        if let Some(graphics) = graphics.as_ref() {
             Self::render_kitty_images(
                 terminal,
                 &mut self.placement_it,
                 graphics,
-                Layer::AboveText,
+                Layer::ABOVE_TEXT,
                 dims,
             )?
         }
@@ -984,7 +988,7 @@ impl<'alloc> Renderer<'alloc> {
         let mut by_id = std::collections::HashMap::new();
         let mut first = std::collections::HashMap::new();
         let mut placements = placement_it.update(graphics)?;
-        placements.set_layer(Layer::All)?;
+        placements.set_layer(Layer::all())?;
         while let Some(placement) = placements.next() {
             if !placement.is_virtual()? {
                 continue;
@@ -1302,7 +1306,7 @@ struct GridRow<'a> {
 impl GridRow<'_> {
     /// The next cell's background; `None` where the terminal's own
     /// background shows.
-    fn background(&mut self, _x: f32, bg: Option<RgbColor>) {
+    fn background(&mut self, _x: f32, bg: Option<Rgb>) {
         // One texel per cell; transparent shows the terminal's background.
         self.row
             .bg
@@ -1310,7 +1314,7 @@ impl GridRow<'_> {
     }
 
     /// A cell's text in the primary font, at `x`.
-    fn text(&mut self, text: &str, x: f32, fg: RgbColor, bold: bool) {
+    fn text(&mut self, text: &str, x: f32, fg: Rgb, bold: bool) {
         self.atlas.push_text(
             &mut self.row.text,
             self.font,
@@ -1359,8 +1363,8 @@ fn measure_text(font: &Typeface, text: &str, font_size: u16, dpi_scale: f32) -> 
 }
 
 /// Convert Ghostty colors to macroquad colors
-fn color(rgb: RgbColor) -> Color {
-    let RgbColor { r, g, b } = rgb;
+fn color(rgb: Rgb) -> Color {
+    let Rgb { r, g, b } = rgb;
     color_u8!(r, g, b, 255)
 }
 
@@ -1370,7 +1374,7 @@ fn id_color(c: StyleColor) -> placeholders::IdColor {
     match c {
         StyleColor::None => placeholders::IdColor::None,
         StyleColor::Palette(index) => placeholders::IdColor::Palette(index.0),
-        StyleColor::Rgb(RgbColor { r, g, b }) => placeholders::IdColor::Rgb(r, g, b),
+        StyleColor::Rgb(Rgb { r, g, b }) => placeholders::IdColor::Rgb(r, g, b),
     }
 }
 
@@ -1996,7 +2000,7 @@ impl<'alloc> Input<'alloc> {
                 padding_bottom: padding,
                 padding_left: padding,
                 padding_right: padding,
-            })
+            })?
             .set_any_button_pressed(any_pressed)
             // Enable motion deduplication so the encoder suppresses redundant
             // motion events within the same cell.
@@ -2151,7 +2155,7 @@ impl<'alloc> Input<'alloc> {
             0
         };
 
-        Ok(Point::Viewport(PointCoordinate { x, y }))
+        Ok(Point::Viewport(Coordinate { x, y }))
     }
 
     // Decide whether the mouse is over an area where a selection drag can begin.
@@ -2441,7 +2445,7 @@ impl DecodePng for PngDecoder {
         // `macroquad` decodes the PNG image for us and converts it
         // to the correct RGBA8 pixel format automatically.
         let img = Image::from_file_with_format(data, Some(ImageFormat::Png)).ok()?;
-        let mut data = Bytes::new_with_alloc(alloc, img.bytes.len()).ok()?;
+        let mut data = Bytes::new_zeroed_with_alloc(alloc, img.bytes.len()).ok()?;
         data.copy_from_slice(&img.bytes);
 
         Some(DecodedImage {
@@ -2501,10 +2505,11 @@ mod tests {
             term.vt_write(b"\x1b_Ga=T,f=32,q=2,C=1,s=1,v=1;/wAA/w==\x1b\\");
         }
 
-        let graphics = term.kitty_graphics().unwrap();
+        let graphics = term.kitty_graphics().unwrap().unwrap();
         let mut it = PlacementIterator::new().unwrap();
         let d = dims((800.0, 600.0), (10.0, 20.0), 1.0);
-        let draws = Renderer::kitty_image_draws(&term, &mut it, &graphics, Layer::All, d).unwrap();
+        let draws =
+            Renderer::kitty_image_draws(&term, &mut it, &graphics, Layer::all(), d).unwrap();
         let ids: Vec<u32> = draws.iter().map(|d| d.image_id).collect();
         assert_eq!(ids.len(), 8);
         // The newest image draws last, so it ends up on top.
@@ -2557,8 +2562,8 @@ mod tests {
     ) -> Vec<(String, libghostty_vt::screen::CellWide)> {
         use libghostty_vt::{
             Terminal,
+            mode::Mode,
             render::{CellIterator, RenderState, RowIterator},
-            terminal::Mode,
         };
         let mut terminal = Terminal::new(40, 2).unwrap();
         terminal.set_scrollback_max_lines(Some(0)).unwrap();

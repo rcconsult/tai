@@ -53,7 +53,7 @@ not recorded):
 `GHOSTTY_SOURCE_DIR` makes it use a local checkout instead. Its Ghostty pin
 is `GHOSTTY_COMMIT` in `crates/libghostty-vt-sys/build.rs:7`. Release
 v0.2.2 (2026-09-28, the latest) pins `a887df42`; the default branch has
-since moved to `521cf2c5`. Its repo has a `ghostling_rs` example, a minimal terminal
+since moved to `108cacb1`, the vt-1.0.1 tag. Its repo has a `ghostling_rs` example, a minimal terminal
 rendered with macroquad.
 
 **ppxai** (`../ppxai`, branch `feature/v1.19.5` at `f75d751f`, "docs:

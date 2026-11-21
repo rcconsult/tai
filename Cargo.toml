@@ -9,8 +9,9 @@ publish = false
 # Exact pin: the crate's bindings are generated against one Ghostty commit,
 # which scripts/fetch-ghostty.sh must match (ADR 0001). A git rev, not a
 # crates.io release: 0.2.2 lacks Terminal::set_resize_pull_scrollback.
-# Uzaaft/libghostty-rs 575ed6b8 "ci: test wasm32 and wasm64".
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "575ed6b8ceb79ffaf247ecf7e34333876b0d5be4", features = ["tracing"] }
+# Uzaaft/libghostty-rs 483ea3d5 "flake: update rust-overlay, pin rustc at 1.100.0",
+# which builds Ghostty vt-1.0.1.
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "483ea3d5247b214060da58ef6037a95f30ae89fb", features = ["tracing"] }
 # Keep the `audio` feature off: it needs libasound2-dev on Linux and tai has no sound.
 macroquad = { version = "0.4.14", default-features = false }
 # Fonts read in place and glyph outlines filled on first use (ADR 0012).
