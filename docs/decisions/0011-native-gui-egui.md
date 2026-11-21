@@ -111,6 +111,13 @@ PowerPoint slide) and converts Word to PDF (`ppxai/server/routes/files.py`,
      it's needed.
    - **When device creation fails,** tai's error names that variable,
      so an affected user isn't left with only the 30 s hang.
+   - **Amended 2026-11-21 (the owner's call):** on Intel Macs
+     (`target_os = "macos"`, `target_arch = "x86_64"`) tai-gui turns the
+     validation off itself when the variable isn't set, so the Iris Pro
+     host starts without it. `WGPU_VALIDATION_INDIRECT_CALL=1` keeps it
+     on. Everywhere else it stays on, as above. An x86_64 build under
+     Rosetta also gets it off; the check is a safety net tai doesn't rely
+     on.
 4. **Code editing goes to a real editor in a terminal pane.** The editor
    comes from a config setting or an environment variable (for example
    `$VISUAL`/`$EDITOR`, or Helix or Neovim). tai's own view is read-only
