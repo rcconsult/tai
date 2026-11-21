@@ -140,11 +140,22 @@ impl Client {
 
     /// Start a tool-free run of `task` (`POST /v1/agent/run`), stamped with
     /// the slot's conversation: its id.
-    pub fn start_run(&self, task: &str) -> Result<String, String> {
+    pub fn start_run(
+        &self,
+        task: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<String, String> {
         // ppxai stamps only from a slot that exists, and never creates one
         // for this; an expired slot would leave the run unstamped.
         self.conversation()?;
-        let body = serde_json::json!({ "task": task });
+        let mut body = serde_json::json!({ "task": task });
+        if let Some(provider) = provider {
+            body["provider"] = provider.into();
+        }
+        if let Some(model) = model {
+            body["model"] = model.into();
+        }
         match self.link.post_json("/v1/agent/run", &body, CALL_TIMEOUT)? {
             (200..=202, text) => json(&text)?["run_id"]
                 .as_str()
@@ -172,6 +183,62 @@ impl Client {
                 .map(Run::parse)
                 .collect(),
             (status, text) => Err(format!("listing runs: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// Run `id`'s events after `since`, oldest first: `GET
+    /// /v1/agent/runs/{id}/events`, the replay without `live`.
+    pub fn run_events(&self, id: &str, since: u64) -> Result<Vec<RunEvent>, String> {
+        let path = format!("/v1/agent/runs/{}/events?since={since}", encode(id));
+        match self.link.get(&path)? {
+            (200, text) => Ok(json(&text)?["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(RunEvent::parse)
+                .collect()),
+            (status, text) => Err(format!("events: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// Ask run `id` to stop, `POST /v1/agent/runs/{id}/cancel`.
+    pub fn cancel_run(&self, id: &str) -> Result<(), String> {
+        let path = format!("/v1/agent/runs/{}/cancel", encode(id));
+        match self
+            .link
+            .post_json(&path, &serde_json::json!({}), CALL_TIMEOUT)?
+        {
+            (200..=202, _) => Ok(()),
+            (status, text) => Err(format!("cancel: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// Take a held result, `POST /v1/agent/runs/{id}/ack`:
+    /// `completed_pending_ack` becomes `finalized`, and a finalized run
+    /// stays so (200). 409 when the run holds nothing, which the web app's
+    /// Collect ignores.
+    pub fn ack_run(&self, id: &str) -> Result<(), String> {
+        let path = format!("/v1/agent/runs/{}/ack", encode(id));
+        match self
+            .link
+            .post_json(&path, &serde_json::json!({}), CALL_TIMEOUT)?
+        {
+            (200, _) => Ok(()),
+            (status, text) => Err(format!("ack: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// How run results reach the conversation, `GET /config/execution`'s
+    /// `collect`: `auto` (merged when done), `yes` (a Collect button) or
+    /// `no`. The web app's default is `yes`.
+    pub fn collect_mode(&self) -> Result<String, String> {
+        match self.link.get("/config/execution")? {
+            (200, text) => Ok(json(&text)?["collect"]
+                .as_str()
+                .filter(|m| matches!(*m, "auto" | "yes" | "no"))
+                .unwrap_or("yes")
+                .to_string()),
+            (status, text) => Err(format!("/config/execution: {status}: {}", detail(&text))),
         }
     }
 
@@ -610,10 +677,12 @@ pub enum ChatEvent {
     Chunk(String),
     Reasoning(String),
     /// The answer is complete. `text` is the whole of it, empty when ppxai
-    /// had none to give; tokens are this turn's.
+    /// had none to give; tokens are this turn's, and so are the sources its
+    /// `[n]` markers cite (ppxai ADR 0019; none when it cited nothing).
     End {
         text: String,
         tokens: Option<u64>,
+        sources: Vec<Source>,
     },
     Tool(ToolStep),
     /// `agent_intermediate_prose`: what the model said between tool steps.
@@ -697,6 +766,7 @@ impl ChatEvent {
                 Some(Self::End {
                     text: data.as_str().unwrap_or_default().to_string(),
                     tokens: tokens.filter(|&n| n > 0),
+                    sources: Source::parse_list(&v["metadata"]["sources"]),
                 })
             }
             "tool_call" => tool(ToolKind::Call, "arguments"),
@@ -744,12 +814,36 @@ pub struct Answer {
     pub sources: Vec<Source>,
 }
 
-/// One of a grounded answer's web sources. Gemini's URLs are opaque
-/// redirects and its titles are the domain.
+/// One of an answer's sources: its `[n]` is the one with that `n`. ppxai
+/// resolves Gemini's redirect links to real ones when it can, but a `url`
+/// can still be a redirect, and a title can be a bare domain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
+    pub n: usize,
     pub url: String,
     pub title: Option<String>,
+}
+
+impl Source {
+    /// A turn's or a run's sources, `[{n, url, title, backend, query}]`
+    /// (ppxai ADR 0019, `engine/sources.py`), in order of `n`. Rows without
+    /// a URL or a positive `n` are dropped, other fields ignored.
+    fn parse_list(v: &Value) -> Vec<Self> {
+        let mut list: Vec<Self> = v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                Some(Self {
+                    n: usize::try_from(s["n"].as_u64()?).ok().filter(|&n| n > 0)?,
+                    url: s["url"].as_str()?.to_string(),
+                    title: s["title"].as_str().map(str::to_string),
+                })
+            })
+            .collect();
+        list.sort_by_key(|s| s.n);
+        list
+    }
 }
 
 impl Answer {
@@ -762,15 +856,17 @@ impl Answer {
             model: text("model"),
             total_tokens: v["usage"]["total_tokens"].as_u64(),
             finish_reason: v["finish_reason"].as_str().map(str::to_string),
+            // `/v1/oneshot`'s list has no `n`: its `[n]` is `sources[n-1]`.
             sources: v["grounding"]["sources"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|s| {
-                    Some(Source {
-                        url: s["url"].as_str()?.to_string(),
-                        title: s["title"].as_str().map(str::to_string),
-                    })
+                .filter_map(|s| Some((s["url"].as_str()?, s["title"].as_str())))
+                .enumerate()
+                .map(|(i, (url, title))| Source {
+                    n: i + 1,
+                    url: url.to_string(),
+                    title: title.map(str::to_string),
                 })
                 .collect(),
         })
@@ -847,7 +943,7 @@ impl Model {
 
 /// A run, from `RunMetaResponse`. `session_id` and `merged_at` are pinned
 /// by ppxai's fence; the rest isn't promised.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Run {
     pub run_id: String,
     pub status: String,
@@ -862,9 +958,36 @@ pub struct Run {
     pub merged_at: Option<f64>,
     pub result: Option<String>,
     pub error: Option<String>,
+    /// The sources its result cites (ppxai ADR 0019), filled as the run
+    /// goes.
+    pub sources: Vec<Source>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 impl Run {
+    /// Whether the run has ended, one way or another (ppxai
+    /// `engine/agent_runs.py`; the web app's terminal statuses).
+    pub fn ended(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "completed"
+                | "completed_pending_ack"
+                | "finalized"
+                | "failed"
+                | "cancelled"
+                | "interrupted"
+        )
+    }
+
+    /// Whether it ended with a result.
+    pub fn succeeded(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "completed" | "completed_pending_ack" | "finalized"
+        )
+    }
+
     fn parse(v: &Value) -> Result<Self, String> {
         let required = |key: &str| {
             v[key]
@@ -883,6 +1006,28 @@ impl Run {
             merged_at: v["merged_at"].as_f64(),
             result: optional("result"),
             error: optional("error"),
+            sources: Source::parse_list(&v["sources"]),
+            provider: optional("provider"),
+            model: optional("model"),
+        })
+    }
+}
+
+/// One of a run's events (`{seq, ts, type, level, category, data}`, ppxai
+/// ADR 0003 §11a).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunEvent {
+    pub seq: u64,
+    pub kind: String,
+    pub data: Value,
+}
+
+impl RunEvent {
+    fn parse(v: &Value) -> Option<Self> {
+        Some(Self {
+            seq: v["seq"].as_u64()?,
+            kind: v["type"].as_str()?.to_string(),
+            data: v["data"].clone(),
         })
     }
 }
@@ -1158,10 +1303,12 @@ mod tests {
             Answer::parse(grounded).unwrap().sources,
             [
                 Source {
+                    n: 1,
                     url: "https://a.example/x".into(),
                     title: Some("a.example".into()),
                 },
                 Source {
+                    n: 2,
                     url: "https://b.example/y".into(),
                     title: None,
                 },
@@ -1252,7 +1399,8 @@ mod tests {
                 "metadata":{"usage":{"prompt_tokens":3,"completion_tokens":4}}})),
             Some(ChatEvent::End {
                 text: "all".into(),
-                tokens: Some(7)
+                tokens: Some(7),
+                sources: vec![],
             })
         );
         assert_eq!(
@@ -1527,7 +1675,9 @@ mod tests {
                 .is_err_and(|e| e.contains("Unknown command"))
         );
 
-        let id = a.start_run("Reply with the single word: pong").unwrap();
+        let id = a
+            .start_run("Reply with the single word: pong", None, None)
+            .unwrap();
         let run = loop {
             let run = a.run(&id).unwrap();
             if !matches!(run.status.as_str(), "pending" | "running" | "waiting") {
@@ -1544,6 +1694,37 @@ mod tests {
         );
         assert_eq!(run.session_id.as_deref(), Some(conv_a.as_str()));
         assert_eq!(run.merged_at, None);
+        assert!(
+            run.ended() && run.succeeded(),
+            "run {id} ended {}",
+            run.status
+        );
+        // ADR 0019: an ungrounded run cites nothing, and says so with [].
+        assert!(run.sources.is_empty(), "{:?}", run.sources);
+
+        // Its events, in order; `since` replays only the later ones.
+        let events = a.run_events(&id, 0).unwrap();
+        assert!(!events.is_empty(), "run {id} has no events");
+        assert!(events.windows(2).all(|w| w[0].seq < w[1].seq));
+        let first = events[0].seq;
+        assert!(
+            a.run_events(&id, first)
+                .unwrap()
+                .iter()
+                .all(|e| e.seq > first)
+        );
+        let collect = a.collect_mode().unwrap();
+        assert!(
+            ["auto", "yes", "no"].contains(&collect.as_str()),
+            "{collect}"
+        );
+        // Acking a held result finalizes it, and acking it again is fine
+        // (idempotent, `routes/agent_v1.py` `ack_agent_run`).
+        if run.status == "completed_pending_ack" {
+            a.ack_run(&id).unwrap();
+            assert_eq!(a.run(&id).unwrap().status, "finalized");
+            a.ack_run(&id).unwrap();
+        }
 
         let ids = |filter: RunFilter| -> Vec<String> {
             a.runs(&filter)
@@ -1595,5 +1776,9 @@ mod tests {
                 ..
             })
         ));
+        // The run pane's Collect: a result merged before counts as done.
+        if collect != "no" {
+            crate::runs::collect_run(&a, &id).unwrap();
+        }
     }
 }

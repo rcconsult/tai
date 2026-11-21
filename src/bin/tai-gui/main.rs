@@ -2,8 +2,8 @@
 //!
 //! One eframe window on wgpu with two tab stacks (egui_dock): chat beside a
 //! terminal and preview stack. The terminal is a libghostty-vt pane on
-//! tai's pty (step 2); chat sends one-shot prompts to the engine (steps 3-4);
-//! preview is a placeholder. Build and run with
+//! tai's pty (step 2); chat holds a conversation with the engine; preview
+//! shows the runs `/run` starts (`runs.rs`). Build and run with
 //! `scripts/cargo.sh run --features gui --bin tai-gui`.
 //!
 //! wgpu's validation: egui-wgpu creates the instance with
@@ -51,6 +51,7 @@ mod chat;
 mod engine;
 mod gpu;
 mod ppxai;
+mod runs;
 mod terminal;
 
 // The pty modules size the pseudo terminal from `crate::Dimensions`.
@@ -98,6 +99,7 @@ fn initial_layout() -> DockState<Tab> {
 struct Panes<'a> {
     terminal: Option<&'a mut TerminalPane>,
     chat: &'a mut chat::ChatPane,
+    runs: &'a mut runs::RunsPane,
     engine: &'a engine::Engine,
     /// Tabs closed this frame; the app keeps them to show again.
     closed: Vec<Tab>,
@@ -121,9 +123,7 @@ impl TabViewer for Panes<'_> {
                 ui.label("The terminal didn't start; see the log.");
             }
             (Tab::Chat, _) => self.chat.ui(ui, self.engine),
-            (tab, _) => {
-                ui.label(format!("{} pane: not built yet.", tab.title()));
-            }
+            (Tab::Preview, _) => self.runs.ui(ui),
         }
     }
 
@@ -132,13 +132,9 @@ impl TabViewer for Panes<'_> {
         *tab != Tab::Terminal
     }
 
-    // The terminal and the chat pane scroll themselves.
-    fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
-        if matches!(tab, Tab::Terminal | Tab::Chat) {
-            [false, false]
-        } else {
-            [true, true]
-        }
+    // Every pane scrolls itself.
+    fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
+        [false, false]
     }
 
     // Closing a tab hides it: its pane lives on in the app (a terminal's
@@ -228,6 +224,7 @@ struct App {
     zoomed: Option<Tab>,
     terminal: Option<TerminalPane>,
     chat: chat::ChatPane,
+    runs: runs::RunsPane,
     engine: engine::Engine,
 }
 
@@ -260,6 +257,24 @@ impl App {
                 surface: path.surface,
                 node: path.node,
             });
+        }
+    }
+
+    /// Bring a tab to the front, hidden or not, without taking the focus
+    /// from the pane that has it.
+    fn reveal(&mut self, tab: Tab) {
+        if let Some(i) = self.hidden.iter().position(|t| *t == tab) {
+            self.hidden.remove(i);
+            let focused = self.dock.focused_leaf();
+            self.show(tab);
+            if let Some(path) = focused {
+                self.dock.set_focused_node_and_surface(path);
+            }
+        } else if let Some(path) = self.dock.find_tab(&tab) {
+            _ = self.dock.set_active_tab(path);
+        }
+        if self.zoomed.is_some_and(|z| z != tab) {
+            self.zoomed = None;
         }
     }
 
@@ -336,6 +351,7 @@ impl eframe::App for App {
         let mut panes = Panes {
             terminal: self.terminal.as_mut(),
             chat: &mut self.chat,
+            runs: &mut self.runs,
             engine: &self.engine,
             closed: Vec::new(),
         };
@@ -353,12 +369,25 @@ impl eframe::App for App {
         }
         let closed = std::mem::take(&mut panes.closed);
         self.hidden.extend(closed);
+        // Runs started in chat open in the preview, and what the run pane
+        // did goes into the transcript.
+        let opened = self.chat.take_opened();
+        if !opened.is_empty() {
+            for open in opened {
+                self.runs.open(open, ui.ctx());
+            }
+            self.reveal(Tab::Preview);
+        }
+        for note in self.runs.take_notes() {
+            self.chat.note(note);
+        }
         if let Some(stats) = &mut self.stats {
             stats.record(ui.ctx(), started.elapsed());
         }
     }
 
     fn on_exit(&mut self) {
+        self.runs.stop();
         tracing::info!("exit: stopping the engine");
         self.engine.stop();
         tracing::info!("exit: closing the terminal");
@@ -461,6 +490,7 @@ fn main() -> eframe::Result {
                 dock: initial_layout(),
                 terminal,
                 chat: chat::ChatPane::new(),
+                runs: runs::RunsPane::default(),
                 hidden: Vec::new(),
                 last_place: Default::default(),
                 zoomed: None,
