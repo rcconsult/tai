@@ -11,9 +11,9 @@
 set -eu
 
 GHOSTTY_REPO="https://github.com/ghostty-org/ghostty.git"
-# ghostty-org/ghostty 521cf2c5 "Update VOUCHED list (#14798)", pinned by
-# libghostty-rs 575ed6b8.
-GHOSTTY_COMMIT="521cf2c5d30bd48028ca61546c64e7913764073d"
+# ghostty-org/ghostty 108cacb1 "libghostty-vt: set version to 1.0.1-dev", the
+# vt-1.0.1 tag, pinned by libghostty-rs 483ea3d5.
+GHOSTTY_COMMIT="108cacb17ed8990840cd14abfce43d8ed8503ca1"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 dest="$root/.local/ghostty"

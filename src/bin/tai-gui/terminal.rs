@@ -18,12 +18,15 @@ use std::{
 use eframe::egui;
 use libghostty_vt::{
     Terminal,
+    color::Rgb,
     key::{self, Key},
+    mode::Mode,
+    point::{Coordinate, Point},
     render::{CellIterator, Dirty, RenderState, RowIterator},
+    report::SizeReportSize,
     screen::CellWide,
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
-    style::RgbColor,
-    terminal::{Mode, Point, PointCoordinate, ScrollViewport, SizeReportSize},
+    terminal::ScrollViewport,
 };
 use macroquad::color::Color;
 
@@ -486,7 +489,7 @@ impl TerminalPane {
                 0
             }
         };
-        Ok(Point::Viewport(PointCoordinate {
+        Ok(Point::Viewport(Coordinate {
             x: cell(local.x, self.dims.cell_width, u32::from(cols)) as u16,
             y: cell(local.y, self.dims.cell_height, u32::from(rows)),
         }))
@@ -826,7 +829,7 @@ impl Glyph {
     }
 }
 
-fn rgba(c: RgbColor) -> [u8; 4] {
+fn rgba(c: Rgb) -> [u8; 4] {
     [c.r, c.g, c.b, 255]
 }
 

@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(term.cursor_x().unwrap(), 0);
         assert_eq!(term.cursor_y().unwrap(), 2);
         // No id was sent, so libghostty-vt numbered it from 2147483647.
-        let graphics = term.kitty_graphics().unwrap();
+        let graphics = term.kitty_graphics().unwrap().unwrap();
         let image = graphics.image(2_147_483_647).expect("image stored");
         assert_eq!(image.width().unwrap(), 3);
         assert_eq!(image.height().unwrap(), 36);
