@@ -34,7 +34,14 @@ use crate::{
 
 enum Entry {
     Prompt(String),
-    Answer { text: String, meta: String },
+    Answer {
+        text: String,
+        /// The answer split into its tables and the Markdown between them.
+        blocks: Vec<Block>,
+        /// The web sources ppxai grounded it on; its `[n]` is the nth.
+        sources: Vec<ppxai::Source>,
+        meta: String,
+    },
     Error(String),
 }
 
@@ -352,15 +359,49 @@ impl ChatPane {
                     if self.entries.is_empty() {
                         ui.weak("One-shot chat: each prompt stands alone, with no history.");
                     }
-                    for entry in &self.entries {
+                    for (n, entry) in self.entries.iter().enumerate() {
                         match entry {
                             Entry::Prompt(text) => {
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new(text).strong());
                             }
-                            Entry::Answer { text, meta } => {
+                            Entry::Answer {
+                                blocks,
+                                sources,
+                                meta,
+                                ..
+                            } => {
                                 ui.add_space(4.0);
-                                CommonMarkViewer::new().show(ui, &mut self.markdown, text);
+                                for (b, block) in blocks.iter().enumerate() {
+                                    ui.push_id((n, b), |ui| {
+                                        let mut show = |ui: &mut egui::Ui| {
+                                            CommonMarkViewer::new().show(
+                                                ui,
+                                                &mut self.markdown,
+                                                &block.text,
+                                            );
+                                        };
+                                        if block.table {
+                                            // Only as wide as the pane; a
+                                            // wider table scrolls sideways.
+                                            egui::ScrollArea::horizontal()
+                                                .auto_shrink([false, true])
+                                                .show(ui, show);
+                                        } else {
+                                            show(ui);
+                                        }
+                                    });
+                                }
+                                if !sources.is_empty() {
+                                    // Numbered as the answer's `[n]` markers. The
+                                    // hover shows the URL; only web links open.
+                                    ui.add_space(2.0);
+                                    ui.weak("Sources");
+                                    for (i, source) in sources.iter().enumerate() {
+                                        let name = source.title.as_deref().unwrap_or(&source.url);
+                                        ui.hyperlink_to(format!("[{}] {name}", i + 1), &source.url);
+                                    }
+                                }
                                 ui.weak(meta);
                             }
                             Entry::Error(why) => {
@@ -447,13 +488,136 @@ impl ChatPane {
         if let Some(entry) = done {
             self.pending = None;
             match &entry {
-                Entry::Answer { text, .. } | Entry::Prompt(text) | Entry::Error(text) => {
+                Entry::Answer { text, sources, .. } => {
                     self.fonts.cover(ctx, text);
+                    for title in sources.iter().filter_map(|s| s.title.as_deref()) {
+                        self.fonts.cover(ctx, title);
+                    }
                 }
+                Entry::Prompt(text) | Entry::Error(text) => self.fonts.cover(ctx, text),
             }
             self.entries.push(entry);
         }
     }
+}
+
+/// A run of an answer's Markdown: a table, or everything between tables.
+#[derive(Debug, PartialEq)]
+struct Block {
+    table: bool,
+    text: String,
+}
+
+/// Split Markdown into its top-level tables and the text between them.
+/// egui_commonmark lays a table out as a grid that never wraps a cell, so
+/// a wide one is wider than the pane. Drawn in the same scroll area as the
+/// prose, it also widened the area the following paragraphs wrap in, and
+/// they ran off the pane. Each table gets its own sideways scroll instead.
+/// Link reference definitions only reach links in the same block.
+fn blocks(markdown: &str) -> Vec<Block> {
+    use pulldown_cmark::{Event, Parser, Tag};
+    let options = markdown_options();
+    let mut blocks = Vec::new();
+    let mut push = |table: bool, text: &str| {
+        if !text.trim().is_empty() {
+            blocks.push(Block {
+                table,
+                text: text.to_string(),
+            });
+        }
+    };
+    let mut prose = 0;
+    let mut depth = 0usize;
+    for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                // A table nested in a list or a quote stays in its block.
+                if depth == 0 && matches!(tag, Tag::Table(_)) {
+                    push(false, &markdown[prose..range.start]);
+                    push(true, &markdown[range.clone()]);
+                    prose = range.end;
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    push(false, &markdown[prose..]);
+    blocks
+}
+
+/// egui_commonmark's parser options (`parser_options` in
+/// egui_commonmark_backend 0.25), so tai reads answers as it draws them.
+fn markdown_options() -> pulldown_cmark::Options {
+    use pulldown_cmark::Options;
+    Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_DEFINITION_LIST
+}
+
+/// Turn a grounded answer's bare `[n]` markers into links to the nth
+/// source, so a click opens what it cites. Markers in code, inside a link
+/// or HTML, escaped, or followed by `(` or `:` (already a link, or a
+/// reference definition) stay as written, and so does a number with no
+/// web source.
+fn link_citations(markdown: &str, sources: &[ppxai::Source]) -> String {
+    use pulldown_cmark::{Event, Parser, Tag};
+    if sources.is_empty() {
+        return markdown.to_string();
+    }
+    let skip: Vec<std::ops::Range<usize>> = Parser::new_ext(markdown, markdown_options())
+        .into_offset_iter()
+        .filter(|(event, _)| {
+            matches!(
+                event,
+                Event::Code(_)
+                    | Event::Html(_)
+                    | Event::InlineHtml(_)
+                    | Event::Start(
+                        Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Link { .. } | Tag::Image { .. }
+                    )
+            )
+        })
+        .map(|(_, range)| range)
+        .collect();
+    let bytes = markdown.as_bytes();
+    let mut out = String::with_capacity(markdown.len());
+    let (mut last, mut i) = (0, 0);
+    while i < bytes.len() {
+        if bytes[i] == b'['
+            && (i == 0 || bytes[i - 1] != b'\\')
+            && !skip.iter().any(|range| range.contains(&i))
+        {
+            let digits = bytes[i + 1..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            let close = i + 1 + digits;
+            let url = (1..=3)
+                .contains(&digits)
+                .then_some(())
+                .filter(|()| bytes.get(close) == Some(&b']'))
+                .filter(|()| !matches!(bytes.get(close + 1), Some(b'(' | b':')))
+                .and_then(|()| markdown[i + 1..close].parse::<usize>().ok())
+                .and_then(|n| sources.get(n.checked_sub(1)?))
+                .map(|source| source.url.as_str())
+                .filter(|url| is_web_link(url) && !url.contains(['<', '>', ' ', '\n']));
+            if let Some(url) = url {
+                let n = &markdown[i + 1..close];
+                out.push_str(&markdown[last..i]);
+                out.push_str(&format!("[\\[{n}\\]](<{url}>)"));
+                i = close + 1;
+                last = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&markdown[last..]);
+    out
 }
 
 /// An answer, with a line naming the model and the tokens used.
@@ -465,8 +629,11 @@ fn entry(answer: ppxai::Answer) -> Entry {
     if let Some(reason) = answer.finish_reason.as_deref().and_then(finish_reason) {
         meta.push_str(&format!(" · finished: {reason}"));
     }
+    let text = link_citations(&answer.content, &answer.sources);
     Entry::Answer {
-        text: answer.content,
+        blocks: blocks(&text),
+        sources: answer.sources,
+        text,
         meta,
     }
 }
@@ -488,8 +655,74 @@ fn is_web_link(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, entry, is_web_link};
+    use super::{Block, Entry, blocks, entry, is_web_link, link_citations};
     use crate::ppxai::Answer;
+    use crate::ppxai::Source;
+
+    fn block(table: bool, text: &str) -> Block {
+        Block {
+            table,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn citation_markers_link_to_their_sources() {
+        let sources = [
+            Source {
+                url: "https://a.example/x".into(),
+                title: Some("a.example".into()),
+            },
+            Source {
+                url: "file:///etc/passwd".into(),
+                title: None,
+            },
+        ];
+        let link = |md: &str| link_citations(md, &sources);
+        // Bare markers, back to back, become links.
+        assert_eq!(
+            link("Rust 1.100 [1][1]."),
+            "Rust 1.100 [\\[1\\]](<https://a.example/x>)[\\[1\\]](<https://a.example/x>)."
+        );
+        // No such source, not a web link, or not a marker: as written.
+        for md in [
+            "see [3]",
+            "see [2]",
+            "see [0]",
+            "a [x] b",
+            "see `[1]`",
+            "```\n[1]\n```\n",
+            "[1](https://other.example)",
+            "[see [1]](https://other.example)",
+            "escaped \\[1]",
+            "[1]: https://def.example",
+        ] {
+            assert_eq!(link(md), md, "{md}");
+        }
+        // Without sources nothing changes.
+        assert_eq!(link_citations("x [1]", &[]), "x [1]");
+    }
+
+    #[test]
+    fn tables_are_split_from_the_text_around_them() {
+        let md = "Intro.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nAfter.\n";
+        assert_eq!(
+            blocks(md),
+            [
+                block(false, "Intro.\n\n"),
+                block(true, "| a | b |\n|---|---|\n| 1 | 2 |\n"),
+                block(false, "\nAfter.\n"),
+            ]
+        );
+        // Without a table, the answer is one block.
+        assert_eq!(blocks("# H\n\ntext"), [block(false, "# H\n\ntext")]);
+        // A pipe in a code block is not a table.
+        let code = "```\n| a | b |\n|---|---|\n```\n";
+        assert_eq!(blocks(code), [block(false, code)]);
+        // A table in a list item stays with its list.
+        let nested = "- item\n\n  | a |\n  |---|\n  | 1 |\n";
+        assert_eq!(blocks(nested), [block(false, nested)]);
+    }
 
     #[test]
     fn only_web_links_open() {
@@ -508,12 +741,13 @@ mod tests {
             model: "m1".into(),
             total_tokens: tokens,
             finish_reason: Some(finish.into()),
+            sources: Vec::new(),
         }
     }
 
     #[test]
     fn an_answer_names_provider_model_and_tokens() {
-        let Entry::Answer { text, meta } = entry(answer(Some(3), "stop")) else {
+        let Entry::Answer { text, meta, .. } = entry(answer(Some(3), "stop")) else {
             panic!("not an answer");
         };
         assert_eq!(text, "**hi**");

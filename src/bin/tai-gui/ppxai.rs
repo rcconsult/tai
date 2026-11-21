@@ -181,6 +181,18 @@ pub struct Answer {
     pub model: String,
     pub total_tokens: Option<u64>,
     pub finish_reason: Option<String>,
+    /// The web sources a retrieval-grounded answer was given, in order:
+    /// the answer's `[n]` is `sources[n - 1]` (`grounding.sources`, ppxai
+    /// ADR 0014, from v1.19.3). Empty when ppxai didn't search.
+    pub sources: Vec<Source>,
+}
+
+/// One of a grounded answer's web sources. Gemini's URLs are opaque
+/// redirects and its titles are the domain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Source {
+    pub url: String,
+    pub title: Option<String>,
 }
 
 impl Answer {
@@ -193,6 +205,17 @@ impl Answer {
             model: text("model"),
             total_tokens: v["usage"]["total_tokens"].as_u64(),
             finish_reason: v["finish_reason"].as_str().map(str::to_string),
+            sources: v["grounding"]["sources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| {
+                    Some(Source {
+                        url: s["url"].as_str()?.to_string(),
+                        title: s["title"].as_str().map(str::to_string),
+                    })
+                })
+                .collect(),
         })
     }
 }
@@ -433,8 +456,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Answer, Client, MergeError, Model, Provider, Providers, Run, RunFilter, detail, encode,
-        json,
+        Answer, Client, MergeError, Model, Provider, Providers, Run, RunFilter, Source, detail,
+        encode, json,
     };
 
     // The shapes below are the ones ppxai's fence pins
@@ -563,7 +586,26 @@ mod tests {
                 model: "m1".into(),
                 total_tokens: Some(3),
                 finish_reason: Some("stop".into()),
+                sources: Vec::new(),
             }
+        );
+        // Retrieval-grounded: the sources come in order, a title may be null.
+        let grounded = r#"{"content": "1.100 [1][2]", "model": "m", "provider": "p",
+            "grounding": {"searched": true, "backend": "gemini", "sources": [
+                {"url": "https://a.example/x", "title": "a.example"},
+                {"url": "https://b.example/y", "title": null}]}}"#;
+        assert_eq!(
+            Answer::parse(grounded).unwrap().sources,
+            [
+                Source {
+                    url: "https://a.example/x".into(),
+                    title: Some("a.example".into()),
+                },
+                Source {
+                    url: "https://b.example/y".into(),
+                    title: None,
+                },
+            ]
         );
         let cut = r#"{"content": "", "finish_reason": "length", "model": "m", "provider": "p", "usage": null}"#;
         let answer = Answer::parse(cut).unwrap();

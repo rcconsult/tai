@@ -2980,6 +2980,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-text",
  "portable-pty",
+ "pulldown-cmark",
  "serde_json",
  "skrifa",
  "tracing",
