@@ -374,10 +374,19 @@ async fn main() -> Result<()> {
 
         // Typing or output can move or clear the selection.
         let mut content_changed = false;
+        // The render state's dirty flags track cells, not the selection.
+        let mut selection_cleared = false;
         match child {
             Child::Active(_) => {
                 // Forward keyboard/mouse input only while the child is alive.
                 input.handle_keyboard_input(&terminal)?;
+                // A key that sends input clears the selection, as Ghostty's
+                // default selection-clear-on-typing does (src/Surface.zig at
+                // 108cacb1, keyCallback). Paste and mouse reports don't.
+                if !input.response.is_empty() && terminal.selection()?.is_some() {
+                    terminal.set_selection(None)?;
+                    selection_cleared = true;
+                }
                 input.handle_mouse_input(&mut terminal, dims)?;
 
                 // Run the app shortcuts the keyboard handler picked out.
@@ -472,11 +481,16 @@ async fn main() -> Result<()> {
             || [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
                 .into_iter()
                 .any(|b| is_mouse_button_down(b) || is_mouse_button_released(b));
-        if mouse_active || content_changed {
+        if mouse_active || content_changed || selection_cleared {
             selection_badge = selection::text(&terminal)?.map(|text| selection::summary(&text));
         }
         let render_start = Instant::now();
-        renderer.render_terminal(&terminal, dims, &coverage, mouse_active)?;
+        renderer.render_terminal(
+            &terminal,
+            dims,
+            &coverage,
+            mouse_active || selection_cleared,
+        )?;
         if let Some(badge) = &selection_badge {
             renderer.draw_selection_badge(badge, dims, &coverage);
         }

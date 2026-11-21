@@ -164,6 +164,8 @@ pub struct TerminalPane {
     badge: Option<String>,
     /// Copy was asked for; done in `ui`, which has the egui context.
     copy_requested: bool,
+    /// A key or typed text queued input this frame (paste doesn't count).
+    typed: bool,
 }
 
 impl TerminalPane {
@@ -248,6 +250,7 @@ impl TerminalPane {
             selection_changed: false,
             badge: None,
             copy_requested: false,
+            typed: false,
         })
     }
 
@@ -328,6 +331,18 @@ impl TerminalPane {
                 if let Err(e) = self.handle_event(event, held) {
                     tracing::warn!("input: {e}");
                 }
+            }
+            // A key that sends input clears the selection, as Ghostty's
+            // default selection-clear-on-typing does (src/Surface.zig at
+            // 108cacb1, keyCallback). Paste doesn't.
+            if std::mem::take(&mut self.typed)
+                && !self.response.is_empty()
+                && self.terminal.selection().is_ok_and(|s| s.is_some())
+            {
+                if let Err(e) = self.terminal.set_selection(None) {
+                    tracing::warn!("selection: {e}");
+                }
+                self.selection_changed = true;
             }
             if !self.response.is_empty() {
                 // Typing returns to the live screen, as in most terminals.
@@ -671,7 +686,10 @@ impl TerminalPane {
             // Alt+key also arrives as its plain text; the key event sends
             // the chord (ESC + key).
             egui::Event::Text(_) if held.alt && !held.ctrl => {}
-            egui::Event::Text(text) => self.response.extend_from_slice(text.as_bytes()),
+            egui::Event::Text(text) => {
+                self.response.extend_from_slice(text.as_bytes());
+                self.typed = true;
+            }
             egui::Event::Paste(text) => {
                 let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
                 self.response
@@ -719,6 +737,7 @@ impl TerminalPane {
     }
 
     fn encode_key(&mut self, k: Key, ucp: char, mods: key::Mods, text: Option<&str>) -> Result<()> {
+        self.typed = true;
         let mut consumed = key::Mods::empty();
         if ucp != '\0' && mods.contains(key::Mods::SHIFT) {
             consumed |= key::Mods::SHIFT;
