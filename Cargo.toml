@@ -29,7 +29,7 @@ unicode-segmentation = "1.12.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # The egui prototype (ADR 0011), behind the `gui` feature so the macroquad
 # build stays as it is. egui_dock 0.21 needs egui 0.36.
-eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"], optional = true }
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts", "links", "x11", "wayland"], optional = true }
 egui_dock = { version = "0.21.1", optional = true }
 # The engine client (ADR 0010): plain HTTP to ppxai-server on loopback, so
 # no TLS. =3.4.2 because 3.4.3 and 3.5.0 are under two weeks old.
@@ -41,6 +41,9 @@ egui_commonmark = { version = "0.25.0", default-features = false, features = ["p
 # Splits a chat answer into its tables and the text between them, so a wide
 # table scrolls sideways on its own. The version egui_commonmark 0.25 uses.
 pulldown-cmark = { version = "0.13.6", default-features = false, optional = true }
+# Opens chat links in the browser, through eframe's `links` feature. =1.2.6
+# because 1.2.7 is under two weeks old.
+webbrowser = { version = "=1.2.6", optional = true }
 
 [features]
 gui = [
@@ -51,6 +54,7 @@ gui = [
     "dep:getrandom",
     "dep:egui_commonmark",
     "dep:pulldown-cmark",
+    "dep:webbrowser",
     # The engine's job object (src/bin/tai-gui/engine.rs).
     "windows-sys/Win32_Foundation",
     "windows-sys/Win32_Security",
