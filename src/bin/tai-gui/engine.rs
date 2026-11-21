@@ -110,7 +110,51 @@ impl Link {
             .map_err(|e| e.to_string())?;
         Ok((status, body))
     }
+
+    /// POST `body` as JSON to `path` for a response that streams: on a 200,
+    /// the body to read as it arrives; otherwise the status and the body.
+    /// Only connecting and the response headers are timed. The body has no
+    /// limit, since a stream can sit idle while the user decides on a
+    /// consent; the caller stops it (`/interrupt`) instead.
+    pub fn post_stream(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<Result<impl std::io::BufRead + Send + use<>, (u16, String)>, String> {
+        let mut request = self
+            .agent
+            .post(format!("{}{path}", self.base))
+            .config()
+            .timeout_global(None)
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(STREAM_HEADERS_TIMEOUT))
+            .build()
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+        if let Some(slot) = &self.slot {
+            request = request.header("X-Session-Id", slot);
+        }
+        let mut response = request.send(body.to_string()).map_err(|e| e.to_string())?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            let text = response
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| e.to_string())?;
+            return Ok(Err((status, text)));
+        }
+        Ok(Ok(std::io::BufReader::new(
+            response.into_body().into_reader(),
+        )))
+    }
 }
+
+/// How long a streaming response may take to start. ppxai sends its
+/// headers once the slot's chat lock is free, so a prompt sent right after
+/// an interrupted answer waits until ppxai has finished that answer: over a
+/// minute when the interrupt came before its first chunk.
+const STREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The engine as the UI holds it. Dropping it stops the server.
 pub struct Engine {
