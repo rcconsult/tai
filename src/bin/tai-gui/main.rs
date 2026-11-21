@@ -8,9 +8,10 @@
 //!
 //! wgpu's validation: egui-wgpu creates the instance with
 //! `InstanceFlags::from_build_config().with_env()` (egui-wgpu 0.36.2,
-//! `src/setup.rs`), so `VALIDATION_INDIRECT_CALL` stays on and
-//! `WGPU_VALIDATION_INDIRECT_CALL=0` turns it off, as ADR 0011 decision 3
-//! asks. Debug builds also turn on full validation, so measure in release.
+//! `src/setup.rs`), so `VALIDATION_INDIRECT_CALL` is on and
+//! `WGPU_VALIDATION_INDIRECT_CALL=0` turns it off. On Intel Macs tai turns
+//! it off unless that variable is set (ADR 0011 decision 3). Debug builds
+//! also turn on full validation, so measure in release.
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer, tab_viewer::OnCloseResponse};
@@ -54,6 +55,15 @@ mod terminal;
 
 // The pty modules size the pseudo terminal from `crate::Dimensions`.
 use terminal::{Dimensions, TerminalPane};
+
+/// Whether wgpu's indirect-call validation starts off: on Intel Macs, when
+/// WGPU_VALIDATION_INDIRECT_CALL isn't set (ADR 0011 decision 3). An x86_64
+/// build under Rosetta also counts; the check it skips is a safety net, not
+/// something tai relies on.
+fn indirect_validation_off_by_default() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "x86_64"))
+        && std::env::var_os("WGPU_VALIDATION_INDIRECT_CALL").is_none()
+}
 
 /// What a tab shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -380,6 +390,16 @@ fn main() -> eframe::Result {
         if cfg!(windows) && eframe::wgpu::Backends::from_env().is_none() {
             setup.instance_descriptor.backends = eframe::wgpu::Backends::GL;
         }
+        // ADR 0011 decision 3: indirect-call validation's compute pipeline
+        // crashes the Metal shader compiler on the Intel Iris Pro Mac, and
+        // the device is lost. Off on Intel Macs unless
+        // WGPU_VALIDATION_INDIRECT_CALL says otherwise (=1 keeps it on).
+        if indirect_validation_off_by_default() {
+            setup
+                .instance_descriptor
+                .flags
+                .remove(eframe::wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+        }
     }
     let result = eframe::run_native(
         "tai",
@@ -441,6 +461,7 @@ fn main() -> eframe::Result {
     // on some Intel Macs (Iris Pro, macOS 12), and the device is lost.
     if let Err(eframe::Error::Wgpu(e)) = &result
         && std::env::var("WGPU_VALIDATION_INDIRECT_CALL").as_deref() != Ok("0")
+        && !indirect_validation_off_by_default()
     {
         tracing::error!(
             "the GPU device didn't start ({e}). If the log above shows a shader \
