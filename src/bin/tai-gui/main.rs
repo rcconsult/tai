@@ -402,6 +402,11 @@ fn main() -> eframe::Result {
             // Windows host), so the chat input's cursor holds still.
             cc.egui_ctx
                 .all_styles_mut(|style| style.visuals.text_cursor.blink = false);
+            // Chat links come from model output: show where one goes before
+            // it's clicked. egui shows a link's URL on hover only with this
+            // set (egui 0.36.2 `widgets/hyperlink.rs`); it's off by default.
+            cc.egui_ctx
+                .all_styles_mut(|style| style.url_in_tooltip = true);
             // Code in chat answers (Markdown code blocks and inline code)
             // uses egui's monospace family. Put the terminal's font first in
             // it, so code reads the same in both panes; prose stays in
