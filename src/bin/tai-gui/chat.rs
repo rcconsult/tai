@@ -70,6 +70,8 @@ enum Entry {
 struct Reply {
     reasoning: String,
     tools: Vec<ToolStep>,
+    /// What the model said between tool steps, before its answer.
+    prose: Vec<String>,
     text: String,
     /// The answer split into its tables and the Markdown between them.
     blocks: Vec<Block>,
@@ -153,6 +155,10 @@ impl Live {
                 self.ended = true;
             }
             ChatEvent::Tool(step) => self.reply.tools.push(step),
+            ChatEvent::Prose(text) => {
+                self.activity = None;
+                self.reply.prose.push(text);
+            }
             ChatEvent::Consent(request) => self.consents.push_back(request),
             ChatEvent::Status(text) => self.reply.notes.push(text),
             ChatEvent::Info(text) => {
@@ -1106,6 +1112,9 @@ impl Turn {
             self.shown = reply.text.clone();
         }
         fonts.cover(ctx, &reply.reasoning);
+        for line in &reply.prose {
+            fonts.cover(ctx, line);
+        }
         reply.blocks = self.blocks.clone();
         (reply, activity, self.stop.load(Ordering::Relaxed))
     }
@@ -1126,7 +1135,10 @@ fn finish(live: Live, stopped: bool, provider: Option<&str>) -> Vec<(Entry, Opti
     let mut out = Vec::new();
     let mut reply = live.reply;
     let interrupted = stopped || live.error.as_deref() == Some(INTERRUPTED);
-    let brought = !(reply.text.is_empty() && reply.reasoning.is_empty() && reply.tools.is_empty());
+    let brought = !(reply.text.is_empty()
+        && reply.reasoning.is_empty()
+        && reply.tools.is_empty()
+        && reply.prose.is_empty());
     if live.ended && reply.text.is_empty() && !reply.tools.is_empty() {
         // The web app's words for a turn that only ran tools.
         reply.text = "Task completed. (No additional response from AI)".into();
@@ -1139,7 +1151,7 @@ fn finish(live: Live, stopped: bool, provider: Option<&str>) -> Vec<(Entry, Opti
         }
         reply.meta = meta.join(" · ");
         reply.blocks = blocks(&reply.text);
-        let text = format!("{}{}", reply.reasoning, reply.text);
+        let text = format!("{}{}{}", reply.reasoning, reply.prose.concat(), reply.text);
         out.push((Entry::Answer(reply), Some(text)));
     }
     if interrupted {
@@ -1244,6 +1256,9 @@ fn show_reply(
                             });
                     }
                 });
+        }
+        for line in &reply.prose {
+            ui.add(egui::Label::new(egui::RichText::new(line).weak().italics()).wrap());
         }
         for (b, block) in reply.blocks.iter().enumerate() {
             ui.push_id(b, |ui| {
@@ -1559,6 +1574,16 @@ mod tests {
         assert!(
             matches!(&tools_only[0].0, Entry::Answer(r) if r.text.starts_with("Task completed"))
         );
+
+        let narrated = finish(
+            live(vec![
+                ChatEvent::Prose("Looking at the file.".into()),
+                ChatEvent::Error("Interrupted by user".into()),
+            ]),
+            false,
+            None,
+        );
+        assert!(matches!(&narrated[0].0, Entry::Answer(r) if r.prose == ["Looking at the file."]));
     }
 
     #[test]

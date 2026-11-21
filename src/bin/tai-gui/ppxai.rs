@@ -610,6 +610,11 @@ pub enum ChatEvent {
         tokens: Option<u64>,
     },
     Tool(ToolStep),
+    /// `agent_intermediate_prose`: what the model said between tool steps.
+    /// With tools on, ppxai calls the model without streaming
+    /// (`engine/chat.py` `chat_with_tools`), so this is all that shows
+    /// until the answer arrives whole in `End`.
+    Prose(String),
     Consent(Consent),
     /// `status`: a line for the transcript.
     Status(String),
@@ -691,6 +696,10 @@ impl ChatEvent {
             "tool_call" => tool(ToolKind::Call, "arguments"),
             "tool_result" => tool(ToolKind::Result, "result"),
             "tool_error" => tool(ToolKind::Error, "error"),
+            "agent_intermediate_prose" => data["text"]
+                .as_str()
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| Self::Prose(t.to_string())),
             "consent_request" => {
                 if data["type"] == "shell" || data["command"].is_string() {
                     Some(Self::Consent(Consent::Shell {
@@ -1267,6 +1276,15 @@ mod tests {
         assert_eq!(
             parse(serde_json::json!({"type":"warning","data":{"message":"careful"}})),
             Some(ChatEvent::Warning("careful".into()))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"agent_intermediate_prose",
+                "data":{"text":"Checking the config next.","iteration":1}})),
+            Some(ChatEvent::Prose("Checking the config next.".into()))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"agent_intermediate_prose","data":{"text":" "}})),
+            None
         );
         assert_eq!(
             parse(serde_json::json!({"type":"state_sync","data":{}})),
