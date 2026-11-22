@@ -197,8 +197,9 @@ enum Done {
     RunStarted(String, Result<String, String>),
     /// `/run ls`, as Markdown.
     Listed(Result<String, String>),
-    /// `/run collect`, `/run cancel`: what to say about it.
-    RunAction(Result<String, String>),
+    /// `/run collect`, `/run cancel`: the run's id and what to say about
+    /// it.
+    RunAction(String, Result<String, String>),
     Tools(Result<bool, String>),
     Roster(Result<ppxai::Roster, String>),
     /// A slash command, by its roster name.
@@ -859,17 +860,15 @@ impl ChatPane {
                         self.opened.push(crate::runs::Open { id, client });
                     }
                     ("cancel", Some(id)) => self.job(ctx, "chat-run-cancel", move || {
-                        Done::RunAction(
-                            client
-                                .cancel_run(&id)
-                                .map(|()| format!("Asked run {id} to stop")),
-                        )
+                        let said = client
+                            .cancel_run(&id)
+                            .map(|()| format!("Asked run {id} to stop"));
+                        Done::RunAction(id, said)
                     }),
                     ("collect", Some(id)) => self.job(ctx, "chat-run-collect", move || {
-                        Done::RunAction(
-                            crate::runs::collect_run(&client, &id)
-                                .map(|()| format!("Run {id}'s result is now in the conversation")),
-                        )
+                        let said = crate::runs::collect_run(&client, &id)
+                            .map(|()| format!("Run {id}'s result is now in the conversation"));
+                        Done::RunAction(id, said)
                     }),
                     (verb, None) if is_verb => self.entries.push(Entry::Error(format!(
                         "/{} {verb} needs a run id. Usage: {}",
@@ -1121,7 +1120,7 @@ impl ChatPane {
                         short.push('…');
                     }
                     self.entries.push(Entry::Note(format!(
-                        "Run {id} started: {short} It shows in the Preview pane."
+                        "Run {id} started, shown in the Preview pane: {short}"
                     )));
                     if let Some(client) = self.client.clone() {
                         self.opened.push(crate::runs::Open { id, client });
@@ -1135,10 +1134,17 @@ impl ChatPane {
                     Vec::new(),
                     String::new(),
                 ))),
-                Done::Listed(Err(why)) | Done::RunAction(Err(why)) => {
+                Done::Listed(Err(why)) | Done::RunAction(_, Err(why)) => {
                     self.entries.push(Entry::Error(why))
                 }
-                Done::RunAction(Ok(text)) => self.entries.push(Entry::Note(text)),
+                Done::RunAction(id, Ok(text)) => {
+                    self.entries.push(Entry::Note(text));
+                    // Show the run as it is now: opening it in the run pane
+                    // looks at it again.
+                    if let Some(client) = self.client.clone() {
+                        self.opened.push(crate::runs::Open { id, client });
+                    }
+                }
                 Done::Roster(Ok(roster)) => self.roster = Some(roster),
                 Done::Roster(Err(why)) => {
                     tracing::warn!("chat: commands: {why}");
