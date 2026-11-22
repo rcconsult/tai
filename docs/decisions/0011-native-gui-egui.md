@@ -9,7 +9,19 @@
   `/chat` with interrupt and consent, agent runs, previews, workspace
   tabs and the plain-mode fallback. The design of runs started from a
   session was settled with ppxai and shipped there as its ADR 0018;
-  see the last section.)
+  see the last section.) (2026-11-22: streaming `/chat` with interrupt,
+  consent and ppxai's slash commands is built (`a4216bc`), with sources
+  and links in answers. So are agent runs and their preview: `/run` and
+  `/task` open in the Preview tab's run pane (`src/bin/tai-gui/runs.rs`),
+  one run at a time with a picker, with cancel, collect, consent and
+  resume (`b4d3eed`, `5a87cc0`). The owner kept the picker for now in
+  place of a tab per run. `/task ls` and `/run ls` list this
+  conversation's runs (`be860b5`), and the conversation starts in the
+  folder tai-gui was launched from (`cf5844e`). The terminal pane reports
+  the mouse to programs that track it, with the wheel as Ghostty sends
+  it (branch `gui-mouse`). Still to build: images in the terminal pane,
+  workspace tabs (there is one layout per window), and ADR 0010's
+  plain-mode fallback.)
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host.
 - **Amends:** decision 3 of [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
