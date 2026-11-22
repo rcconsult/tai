@@ -90,6 +90,15 @@ impl Pty {
             // Child process -- replace ourselves with the shell.
             // TERM tells programs what escape sequences we understand.
             ForkptyResult::Child => {
+                // Close every descriptor the shell would otherwise inherit
+                // from tai beyond stdin, stdout and stderr: other terminals'
+                // pty masters, which would keep their ptys from hanging up
+                // when tai closes them (so their shells never get SIGHUP and
+                // a wait for them never ends; popos-tai), and the GPU
+                // driver's. forkpty's masters aren't close-on-exec, and
+                // setting that in the parent would race a fork on another
+                // thread.
+                close_inherited_fds();
                 // Give the shell default signal handling. Ignored signals
                 // survive exec, so if whatever launched tai ignored SIGINT
                 // (a background job does), Ctrl+C would never interrupt
@@ -414,19 +423,49 @@ impl Child {
     }
 }
 
+/// Close descriptors 3 and up, in a forked child before exec. Only
+/// async-signal-safe calls: no allocation.
+fn close_inherited_fds() {
+    // SAFETY: sysconf and close are async-signal-safe and touch no memory
+    // of ours.
+    let max = unsafe { nix::libc::sysconf(nix::libc::_SC_OPEN_MAX) };
+    let max = if max <= 0 { 1024 } else { max.min(65536) } as i32;
+    for fd in 3..max {
+        unsafe { nix::libc::close(fd) };
+    }
+}
+
+/// How long dropping a child waits for it to exit after SIGHUP, before
+/// SIGKILL.
+const EXIT_WAIT: Duration = Duration::from_secs(1);
+
 impl Drop for Child {
     fn drop(&mut self) {
-        // If the child is still running, ask it to exit. Then do a
-        // blocking waitpid to reap it and avoid leaving a zombie.
-        match *self {
+        // Ask a running child to exit, then reap it so it isn't left a
+        // zombie. Never wait without end: a shell that ignores SIGHUP, or
+        // whose pty another process holds open, gets SIGKILL.
+        let pid = match *self {
             Child::Active(pid) => {
                 let _ = signal::kill(pid, signal::SIGHUP);
-                let _ = wait::waitpid(pid, None);
+                pid
             }
-            Child::Exited(pid) => {
-                let _ = wait::waitpid(pid, None);
+            Child::Exited(pid) => pid,
+            Child::Reaped(_) => return,
+        };
+        let deadline = Instant::now() + EXIT_WAIT;
+        loop {
+            match wait::waitpid(pid, Some(wait::WaitPidFlag::WNOHANG)) {
+                Ok(wait::WaitStatus::StillAlive) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(wait::WaitStatus::StillAlive) => {
+                    let _ = signal::kill(pid, signal::SIGKILL);
+                    let _ = wait::waitpid(pid, None);
+                    return;
+                }
+                // Reaped, or not ours to wait for any more.
+                _ => return,
             }
-            Child::Reaped(_) => {}
         }
     }
 }
