@@ -296,6 +296,23 @@ fn uri_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(rest))
 }
 
+/// The URI without the frame egui adds to a GIF or WebP one: its Image
+/// asks for `{uri}#{frame}` (egui 0.36.2, widgets/image.rs,
+/// `encode_animated_image_uri`), as egui_extras' loaders expect. These
+/// loaders draw the first frame, and egui asks only for frame 0 without
+/// the frame timings they don't store.
+fn source_uri(uri: &str) -> &str {
+    match egui::decode_animated_image_uri(uri) {
+        Ok((base, _)) if is_animated(base) => base,
+        _ => uri,
+    }
+}
+
+fn is_animated(uri: &str) -> bool {
+    let lower = uri.to_ascii_lowercase();
+    lower.ends_with(".gif") || lower.ends_with(".webp")
+}
+
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -491,6 +508,7 @@ impl EguiBytesLoader for BytesLoader {
     }
 
     fn load(&self, ctx: &Context, uri: &str) -> BytesLoadResult {
+        let uri = source_uri(uri);
         let web = uri.starts_with("https://") || uri.starts_with("http://");
         let path = uri_path(uri);
         if !web && path.is_none() {
@@ -580,6 +598,7 @@ impl EguiImageLoader for ImageLoader {
     }
 
     fn load(&self, ctx: &Context, uri: &str, _size_hint: SizeHint) -> ImageLoadResult {
+        let uri = source_uri(uri);
         if !(uri.starts_with("file://")
             || uri.starts_with("https://")
             || uri.starts_with("http://"))
@@ -668,9 +687,9 @@ fn decode(bytes: &[u8]) -> Result<ColorImage, String> {
 
 /// An image in the Preview stack: the file, fitted to the pane.
 pub fn show_file(ui: &mut egui::Ui, path: &Path) {
-    ui.horizontal(|ui| {
-        ui.weak(path.to_string_lossy());
-    });
+    let shown = path.to_string_lossy();
+    ui.add(egui::Label::new(egui::RichText::new(shown.as_ref()).weak()).truncate())
+        .on_hover_text(shown.as_ref());
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -775,6 +794,33 @@ mod tests {
         }
         for ip in ["93.184.215.14", "2606:4700::6810:84e5"] {
             assert!(public(ip.parse().unwrap()).is_ok(), "{ip}");
+        }
+    }
+
+    /// egui asks for a GIF or WebP as `{uri}#{frame}` (popos-tai's test).
+    #[test]
+    fn a_frame_suffix_is_dropped_for_gif_and_webp() {
+        assert_eq!(source_uri("file:///a/pic.webp#0"), "file:///a/pic.webp");
+        assert_eq!(
+            source_uri("https://e.example/anim.GIF#3"),
+            "https://e.example/anim.GIF"
+        );
+        assert_eq!(source_uri("file:///a/plot.png"), "file:///a/plot.png");
+        assert_eq!(
+            source_uri("https://e.example/a.png#0"),
+            "https://e.example/a.png#0"
+        );
+    }
+
+    #[test]
+    fn gif_and_webp_decode() {
+        let pixel = image::RgbaImage::from_pixel(2, 1, image::Rgba([9, 8, 7, 255]));
+        for format in [image::ImageFormat::Gif, image::ImageFormat::WebP] {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(pixel.clone())
+                .write_to(&mut Cursor::new(&mut bytes), format)
+                .unwrap();
+            assert_eq!(decode(&bytes).unwrap().size, [2, 1], "{format:?}");
         }
     }
 
