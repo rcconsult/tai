@@ -7,7 +7,11 @@
   `src/bin/tai-gui/ppxai.rs`: one-shot, and the run routes of ppxai ADR
   0018. `/chat`, `/interrupt` and `/consent` aren't in it yet. Decision
   6's contract test is `contract_against_a_live_server` there, run by
-  hand with `--ignored` against a pinned ppxai build.)
+  hand with `--ignored` against a pinned ppxai build.) (2026-11-22:
+  the client now also covers `/chat`, `/interrupt` and `/consent` (in
+  `a4216bc`), `/task` runs through `POST /v1/agent/task` with consent and
+  resume (`5a87cc0`), the run listing (`be860b5`) and the working dir
+  (`cf5844e`).)
 - **Deciders:** owner. Two Claude sessions, one on each dev host (Linux x86_64, macOS 12 Intel), wrote the options and reviewed each other's work.
 - **Superseded in part by:** [ADR 0010](0010-engine-link-loopback-tcp.md) (decision 4: loopback TCP replaces `--uds --announce`).
 - **Related:** ppxai `docs/api-gateway.md` (API stability tiers), ppxai ADR 0003 (agent platform, `/v1/agent/*`), ppxai ADR 0016 (cheap engine import).
