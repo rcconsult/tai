@@ -1100,7 +1100,7 @@ impl Run {
         )
     }
 
-    fn parse(v: &Value) -> Result<Self, String> {
+    pub(crate) fn parse(v: &Value) -> Result<Self, String> {
         let required = |key: &str| {
             v[key]
                 .as_str()

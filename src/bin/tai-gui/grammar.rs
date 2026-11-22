@@ -6,6 +6,11 @@
 //! 4f13cc12), itself a port of the web app's
 //! `ppxai/web/shared/task-controller.js`, which stays the reference (ppxai
 //! pins the two together in `tests/test_task_grammar_parity.py`).
+//!
+//! `ls`'s flags (`is_listing_flags`, `ListFlags::parse`, `RUN_STATUSES`) are
+//! from ppxai commit "feat(task): /task ls and /run ls list the current
+//! conversation's runs" (fafebaf3), with `RUN_STATUSES` from
+//! `ppxai/engine/agent_runs.py` at the same commit.
 
 use serde_json::{Map, Value, json};
 
@@ -13,6 +18,20 @@ use serde_json::{Map, Value, json};
 const VERBS: &[&str] = &[
     "help", "ls", "list", "get", "show", "open", "watch", "cancel", "respond", "collect", "ack",
     "resume",
+];
+
+/// The run states `ls --status` takes (ppxai `engine/agent_runs.py`).
+pub const RUN_STATUSES: &[&str] = &[
+    "pending",
+    "running",
+    "waiting",
+    "cancelling",
+    "completed",
+    "completed_pending_ack",
+    "finalized",
+    "failed",
+    "cancelled",
+    "interrupted",
 ];
 
 /// What a command line asks for.
@@ -24,7 +43,7 @@ pub enum Dispatch {
     Lifecycle {
         verb: &'static str,
         id: Option<String>,
-        /// The line after the verb, for `respond`'s answer.
+        /// The line after the verb: `respond`'s answer, `ls`'s flags.
         rest: String,
     },
     /// A verb followed by something that looks like a run id but isn't one:
@@ -43,7 +62,8 @@ pub fn is_run_id(text: &str) -> bool {
 }
 
 /// A line is a lifecycle op only when its first word is a verb and the rest
-/// is empty or starts with a run id. So `get run_ab12…` gets a run, and
+/// is empty or starts with a run id, or the verb is `ls` and the rest is only
+/// its flags (`--all`, `--status <s>`). So `get run_ab12…` gets a run, and
 /// `get the weather --tools web_search` launches. Run ids hold no spaces, so
 /// only the first word after the verb counts as the id.
 pub fn classify(line: &str) -> Dispatch {
@@ -60,6 +80,13 @@ pub fn classify(line: &str) -> Dispatch {
     let Some(verb) = VERBS.iter().find(|v| **v == verb) else {
         return Dispatch::Launch(trimmed.to_string());
     };
+    if canonical(verb) == "ls" && !rest.is_empty() && is_listing_flags(rest) {
+        return Dispatch::Lifecycle {
+            verb: "ls",
+            id: None,
+            rest: rest.to_string(),
+        };
+    }
     if rest.is_empty() || is_run_id(first_word) {
         let id = (!first_word.is_empty()).then(|| first_word.to_string());
         return Dispatch::Lifecycle {
@@ -74,6 +101,61 @@ pub fn classify(line: &str) -> Dispatch {
         };
     }
     Dispatch::Launch(trimmed.to_string())
+}
+
+/// Whether `rest` is only `ls`'s flags: `--all`, and `--status` with or
+/// without a value. A bad or missing status still counts, so `ls` refuses it
+/// rather than launching it as a task.
+fn is_listing_flags(rest: &str) -> bool {
+    let mut words = rest.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        match word {
+            "--all" => {}
+            "--status" => {
+                words.next_if(|value| !value.starts_with("--"));
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// `ls`'s flags: `--all` lists every conversation's runs, not only the
+/// active one's; `--status` keeps the runs in one state.
+#[derive(Debug, Default, PartialEq)]
+pub struct ListFlags {
+    pub all: bool,
+    pub status: Option<String>,
+}
+
+impl ListFlags {
+    /// Parse the words after `ls`; an error names each bad flag.
+    pub fn parse(rest: &str) -> Result<ListFlags, String> {
+        let mut flags = ListFlags::default();
+        let mut errors = Vec::new();
+        let statuses = RUN_STATUSES.join(", ");
+        let mut words = rest.split_whitespace().peekable();
+        while let Some(word) = words.next() {
+            match word {
+                "--all" => flags.all = true,
+                "--status" => match words.next_if(|value| !value.starts_with("--")) {
+                    Some(value) if RUN_STATUSES.contains(&value) => {
+                        flags.status = Some(value.to_string())
+                    }
+                    Some(value) => errors.push(format!(
+                        "unknown status '{value}', expected one of {statuses}"
+                    )),
+                    None => errors.push(format!("--status needs a value: one of {statuses}")),
+                },
+                other => errors.push(format!("unknown flag: {other}")),
+            }
+        }
+        if errors.is_empty() {
+            Ok(flags)
+        } else {
+            Err(errors.join("; "))
+        }
+    }
 }
 
 /// A verb's canonical name: the web app's aliases (`list`, `show`, `open`,
@@ -377,6 +459,57 @@ mod tests {
             Dispatch::Launch("\"ls\"".into()),
             "quoting forces a launch"
         );
+    }
+
+    // ppxai `tests/test_run_ls_scope.py`'s grammar cases.
+    #[test]
+    fn ls_takes_only_its_own_flags() {
+        let ls = |rest: &str| Dispatch::Lifecycle {
+            verb: "ls",
+            id: None,
+            rest: rest.into(),
+        };
+        assert_eq!(classify("ls --all"), ls("--all"));
+        assert_eq!(classify("list --status running"), ls("--status running"));
+        assert_eq!(
+            classify("ls --all --status failed"),
+            ls("--all --status failed")
+        );
+        // A bad status is still ls, which then refuses it.
+        assert_eq!(classify("ls --status"), ls("--status"));
+        assert_eq!(classify("ls --status bogus"), ls("--status bogus"));
+        assert_eq!(
+            classify("ls --tools x"),
+            Dispatch::Launch("ls --tools x".into())
+        );
+        assert_eq!(classify("ls foo"), Dispatch::Launch("ls foo".into()));
+        assert_eq!(
+            classify("ls --all foo"),
+            Dispatch::Launch("ls --all foo".into())
+        );
+        assert_eq!(
+            classify("ls run_abc"),
+            Dispatch::NearMiss {
+                id: "run_abc".into()
+            }
+        );
+        assert_eq!(
+            classify("help --all"),
+            Dispatch::Launch("help --all".into())
+        );
+
+        assert_eq!(ListFlags::parse(""), Ok(ListFlags::default()));
+        assert_eq!(
+            ListFlags::parse("--status waiting --all"),
+            Ok(ListFlags {
+                all: true,
+                status: Some("waiting".into())
+            })
+        );
+        let bad = ListFlags::parse("--status bogus").unwrap_err();
+        assert!(bad.starts_with("unknown status 'bogus', expected one of pending,"));
+        let missing = ListFlags::parse("--status --all").unwrap_err();
+        assert!(missing.starts_with("--status needs a value"));
     }
 
     #[test]
