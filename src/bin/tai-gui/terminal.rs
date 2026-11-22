@@ -2,8 +2,9 @@
 //! wgpu cell pass (`gpu.rs`), typed into through egui's events.
 //!
 //! Text, colours, the cursor, typing, paste, scrollback with the wheel,
-//! resizing with the pane, and mouse selection with copy and the corner
-//! badge. Images and mouse reporting stay in the macroquad build for now.
+//! resizing with the pane, mouse selection with copy and the corner badge,
+//! and mouse reporting to programs that ask for it. Images stay in the
+//! macroquad build for now.
 
 use std::{
     cell::Cell,
@@ -21,10 +22,11 @@ use libghostty_vt::{
     color::Rgb,
     key::{self, Key},
     mode::Mode,
+    mouse,
     point::{Coordinate, Point},
     render::{CellIterator, Dirty, RenderState, RowIterator},
     report::SizeReportSize,
-    screen::CellWide,
+    screen::{CellWide, Screen},
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     terminal::ScrollViewport,
 };
@@ -166,6 +168,16 @@ pub struct TerminalPane {
     copy_requested: bool,
     /// A key or typed text queued input this frame (paste doesn't count).
     typed: bool,
+    /// Mouse reporting to the program, as the macroquad build's
+    /// `handle_mouse_input` does.
+    mouse_encoder: mouse::Encoder<'static>,
+    mouse_event: mouse::Event<'static>,
+    /// The buttons (left, right, middle) whose press went to the program,
+    /// so their release goes there too, wherever the pointer is then.
+    reported: [bool; 3],
+    /// Wheel travel not yet a whole row, in points, as Ghostty's
+    /// `pending_scroll_y` (src/Surface.zig at 108cacb1, scrollCallback).
+    pending_scroll: f32,
 }
 
 impl TerminalPane {
@@ -251,6 +263,10 @@ impl TerminalPane {
             badge: None,
             copy_requested: false,
             typed: false,
+            mouse_encoder: mouse::Encoder::new()?,
+            mouse_event: mouse::Event::new()?,
+            reported: [false; 3],
+            pending_scroll: 0.0,
         })
     }
 
@@ -318,11 +334,21 @@ impl TerminalPane {
             self.resize(dims);
         }
 
+        if let Err(e) = self.report_pointer(ui, rect) {
+            tracing::warn!("mouse: {e}");
+        }
         if let Err(e) = self.handle_pointer(ui, rect) {
             tracing::warn!("selection: {e}");
         }
         if response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            // An arrow while the program has the mouse, as Ghostty shows.
+            let program = self.terminal.is_mouse_tracking().unwrap_or(false)
+                && !ui.input(|i| i.modifiers.shift);
+            ui.ctx().set_cursor_icon(if program {
+                egui::CursorIcon::Default
+            } else {
+                egui::CursorIcon::Text
+            });
         }
 
         if response.has_focus() && !self.exited() {
@@ -361,10 +387,16 @@ impl TerminalPane {
             }
         }
         if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            let lines = (scroll / self.dims.cell_height).round() as isize;
-            if lines != 0 {
-                self.terminal.scroll_viewport(ScrollViewport::Delta(-lines));
+            match self.wheel_to_program(ui, rect) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    let lines = (scroll / self.dims.cell_height).round() as isize;
+                    if lines != 0 {
+                        self.terminal.scroll_viewport(ScrollViewport::Delta(-lines));
+                    }
+                }
+                Err(e) => tracing::warn!("wheel: {e}"),
             }
         }
 
@@ -429,10 +461,166 @@ impl TerminalPane {
         self.pty.resize(dims);
     }
 
+    /// Send the buttons and motion to the program while it tracks the
+    /// mouse, as the macroquad build's `handle_mouse_input` does. Shift
+    /// keeps a press for selection instead. The encoder follows the
+    /// program's tracking mode and format, and drops motion within a cell.
+    fn report_pointer(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Result<()> {
+        if !self.terminal.is_mouse_tracking()? {
+            self.reported = [false; 3];
+            return Ok(());
+        }
+        let (pos, held, presses, releases, downs, moved) = ui.input(|i| {
+            let each = |f: &dyn Fn(egui::PointerButton) -> bool| BUTTONS.map(|(b, _)| f(b));
+            (
+                i.pointer.latest_pos(),
+                i.modifiers,
+                each(&|b| i.pointer.button_pressed(b)),
+                each(&|b| i.pointer.button_released(b)),
+                each(&|b| i.pointer.button_down(b)),
+                i.pointer.delta() != egui::Vec2::ZERO,
+            )
+        });
+        let Some(pos) = pos else {
+            return Ok(());
+        };
+        let mut out = Vec::new();
+        let at = self.surface_position(pos - rect.min);
+        self.mouse_event.set_mods(mods_from(held)).set_position(at);
+        self.mouse_encoder
+            .set_options_from_terminal(&self.terminal)
+            .set_size(encoder_size(self.dims))?
+            .set_track_last_cell(true);
+        for (i, &(_, button)) in BUTTONS.iter().enumerate() {
+            let action = if releases[i] && self.reported[i] {
+                self.reported[i] = false;
+                mouse::Action::Release
+            } else if presses[i] && rect.contains(pos) && !held.shift && !self.selecting {
+                self.reported[i] = true;
+                mouse::Action::Press
+            } else {
+                continue;
+            };
+            self.mouse_encoder
+                .set_any_button_pressed(self.reported.iter().any(|&r| r));
+            self.mouse_event.set_action(action).set_button(Some(button));
+            self.mouse_encoder
+                .encode_to_vec(&self.mouse_event, &mut out)?;
+        }
+        let dragging = self.reported.iter().any(|&r| r);
+        if moved && !self.selecting && (dragging || rect.contains(pos)) {
+            let button = BUTTONS
+                .iter()
+                .zip(downs)
+                .find(|&(_, down)| down)
+                .map(|(&(_, b), _)| b);
+            self.mouse_encoder.set_any_button_pressed(dragging);
+            self.mouse_event
+                .set_action(mouse::Action::Motion)
+                .set_button(button);
+            self.mouse_encoder
+                .encode_to_vec(&self.mouse_event, &mut out)?;
+        }
+        if !out.is_empty() {
+            self.pty.write(&out);
+        }
+        Ok(())
+    }
+
+    /// Send the wheel to the program, as Ghostty's scrollCallback does
+    /// (src/Surface.zig at 108cacb1): while it tracks the mouse, as button
+    /// 4 and 5 presses, one per row of travel; on the alternate screen with
+    /// alternate scroll (mode 1007) and no tracking, as arrow keys, which
+    /// is how `less` and `man` scroll. Returns false when the wheel isn't
+    /// the program's, so it scrolls the scrollback.
+    fn wheel_to_program(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Result<bool> {
+        let tracking = self.terminal.is_mouse_tracking()?;
+        let alternate = !tracking
+            && self.terminal.active_screen()? == Screen::Alternate
+            && self.terminal.mode(Mode::ALT_SCROLL)?;
+        if !tracking && !alternate {
+            self.pending_scroll = 0.0;
+            return Ok(false);
+        }
+        let cell = self.dims.cell_height;
+        let page = cell * f32::from(self.terminal.rows()?);
+        let (travel, pos, held) = ui.input(|i| {
+            let travel: f32 = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    // Ctrl and Cmd with the wheel zoom in egui.
+                    egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                        ..
+                    } if !modifiers.command && !modifiers.ctrl => {
+                        Some(wheel_points(*unit, delta.y, cell, page))
+                    }
+                    _ => None,
+                })
+                .sum();
+            (travel, i.pointer.latest_pos(), i.modifiers)
+        });
+        let rows = wheel_rows(&mut self.pending_scroll, travel, cell);
+        if rows == 0 {
+            return Ok(true);
+        }
+        let mut out = Vec::new();
+        if tracking {
+            let Some(pos) = pos else {
+                return Ok(true);
+            };
+            // The selection a Shift drag made goes, as in Ghostty.
+            if self.terminal.selection()?.is_some() {
+                self.terminal.set_selection(None)?;
+                self.selection_changed = true;
+            }
+            let at = self.surface_position(pos - rect.min);
+            self.mouse_event
+                .set_mods(mods_from(held))
+                .set_position(at)
+                .set_action(mouse::Action::Press)
+                .set_button(Some(if rows > 0 {
+                    mouse::Button::Four
+                } else {
+                    mouse::Button::Five
+                }));
+            self.mouse_encoder
+                .set_options_from_terminal(&self.terminal)
+                .set_size(encoder_size(self.dims))?
+                .set_any_button_pressed(self.reported.iter().any(|&r| r))
+                // Every row is a report, even within one cell.
+                .set_track_last_cell(false);
+            for _ in 0..rows.unsigned_abs() {
+                self.mouse_encoder
+                    .encode_to_vec(&self.mouse_event, &mut out)?;
+            }
+        } else {
+            let seq = arrow_seq(rows > 0, self.terminal.mode(Mode::DECCKM)?);
+            for _ in 0..rows.unsigned_abs() {
+                out.extend_from_slice(seq);
+            }
+        }
+        self.pty.write(&out);
+        Ok(true)
+    }
+
+    /// A point in the pane as the encoder takes it: surface pixels, which
+    /// are physical pixels (include/ghostty/vt/mouse/encoder.h). The
+    /// macroquad build scales macroquad's points the same way, so SGR-Pixels
+    /// reports (mode 1016) share units with the size tai reports.
+    fn surface_position(&self, local: egui::Vec2) -> mouse::Position {
+        mouse::Position {
+            x: local.x * self.dims.dpi_scale,
+            y: local.y * self.dims.dpi_scale,
+        }
+    }
+
     /// Start, extend and end a selection from the primary button, as the
     /// macroquad build does. While a program tracks the mouse the buttons
-    /// are its, except with Shift held; this pane doesn't report the mouse
-    /// to programs yet, so without Shift nothing happens there.
+    /// are its (`report_pointer`), except with Shift held.
     fn handle_pointer(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Result<()> {
         let (pos, pressed, down, released, moved, held) = ui.input(|i| {
             (
@@ -848,6 +1036,64 @@ impl Glyph {
     }
 }
 
+/// The buttons reported to programs, with egui's names for them.
+const BUTTONS: [(egui::PointerButton, mouse::Button); 3] = [
+    (egui::PointerButton::Primary, mouse::Button::Left),
+    (egui::PointerButton::Secondary, mouse::Button::Right),
+    (egui::PointerButton::Middle, mouse::Button::Middle),
+];
+
+/// The pane's geometry in surface pixels, as the encoder needs it to find
+/// the cell under a point.
+fn encoder_size(dims: Dimensions) -> mouse::EncoderSize {
+    let (cell_width, cell_height) = dims.cell_pixels();
+    let padding = (PADDING * dims.dpi_scale) as u32;
+    mouse::EncoderSize {
+        screen_width: (dims.width * dims.dpi_scale) as u32,
+        screen_height: (dims.height * dims.dpi_scale) as u32,
+        cell_width: cell_width.max(1),
+        cell_height: cell_height.max(1),
+        padding_top: padding,
+        padding_bottom: padding,
+        padding_left: padding,
+        padding_right: padding,
+    }
+}
+
+/// One wheel event's travel in points, up positive. A line is a row; on
+/// macOS a slow wheel click comes as a tenth of a line, so a line event
+/// counts as at least one, as Ghostty does.
+fn wheel_points(unit: egui::MouseWheelUnit, y: f32, cell: f32, page: f32) -> f32 {
+    match unit {
+        egui::MouseWheelUnit::Point => y,
+        egui::MouseWheelUnit::Line if cfg!(target_os = "macos") && y != 0.0 => {
+            y.signum() * y.abs().max(1.0) * cell
+        }
+        egui::MouseWheelUnit::Line => y * cell,
+        egui::MouseWheelUnit::Page => y * page,
+    }
+}
+
+/// Add `travel` to the pending travel and take whole rows from it, toward
+/// zero, keeping the rest for later events (Ghostty's scrollCallback).
+fn wheel_rows(pending: &mut f32, travel: f32, cell: f32) -> i32 {
+    *pending += travel;
+    let rows = (*pending / cell).trunc();
+    *pending -= rows * cell;
+    rows as i32
+}
+
+/// The arrow key the wheel sends under alternate scroll, in the cursor
+/// key mode (DECCKM) the program set.
+fn arrow_seq(up: bool, application: bool) -> &'static [u8] {
+    match (up, application) {
+        (true, true) => b"\x1bOA",
+        (false, true) => b"\x1bOB",
+        (true, false) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+    }
+}
+
 fn rgba(c: Rgb) -> [u8; 4] {
     [c.r, c.g, c.b, 255]
 }
@@ -949,4 +1195,86 @@ fn key_for(k: egui::Key) -> Option<(Key, char)> {
         E::Z => (Key::Z, 'z'),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_travel_becomes_whole_rows() {
+        let mut pending = 0.0;
+        // Touchpad points add up until they make a row.
+        assert_eq!(wheel_rows(&mut pending, 10.0, 24.0), 0);
+        assert_eq!(wheel_rows(&mut pending, 10.0, 24.0), 0);
+        assert_eq!(wheel_rows(&mut pending, 10.0, 24.0), 1);
+        assert!((pending - 6.0).abs() < 1e-4);
+        // Turning back undoes what is pending first.
+        assert_eq!(wheel_rows(&mut pending, -6.0, 24.0), 0);
+        assert_eq!(wheel_rows(&mut pending, -50.0, 24.0), -2);
+        // A line is a row; a page is the screen.
+        assert_eq!(
+            wheel_points(egui::MouseWheelUnit::Line, 3.0, 24.0, 480.0),
+            72.0
+        );
+        assert_eq!(
+            wheel_points(egui::MouseWheelUnit::Page, -1.0, 24.0, 480.0),
+            -480.0
+        );
+        let tenth = wheel_points(egui::MouseWheelUnit::Line, 0.1, 24.0, 480.0);
+        if cfg!(target_os = "macos") {
+            assert_eq!(tenth, 24.0);
+        } else {
+            assert!((tenth - 2.4).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn alternate_scroll_sends_the_arrow_for_the_cursor_key_mode() {
+        assert_eq!(arrow_seq(true, false), b"\x1b[A");
+        assert_eq!(arrow_seq(false, false), b"\x1b[B");
+        assert_eq!(arrow_seq(true, true), b"\x1bOA");
+        assert_eq!(arrow_seq(false, true), b"\x1bOB");
+    }
+
+    /// The encoder finds the cell under a point from `encoder_size`, at 1x
+    /// and on a 2x display, where points are scaled to surface pixels.
+    #[test]
+    fn a_press_reports_the_cell_under_the_pointer() -> Result<()> {
+        for scale in [1.0, 2.0] {
+            let dims = Dimensions {
+                width: 800.0,
+                height: 600.0,
+                cell_width: 10.0,
+                cell_height: 20.0,
+                baseline: 15.0,
+                font_size: 13,
+                dpi_scale: scale,
+            };
+            let (cols, rows) = dims.grid_size();
+            let (cw, ch) = dims.cell_pixels();
+            let mut terminal = Terminal::new(cols, rows)?;
+            terminal.resize(cols, rows, cw, ch)?;
+            // Normal tracking, SGR format.
+            terminal.vt_write(b"\x1b[?1000h\x1b[?1006h");
+            let mut encoder = mouse::Encoder::new()?;
+            encoder
+                .set_options_from_terminal(&terminal)
+                .set_size(encoder_size(dims))?;
+            let mut event = mouse::Event::new()?;
+            // Column 3 and row 1 from zero: past the padding, mid-cell.
+            let local = egui::vec2(PADDING + 3.5 * 10.0, PADDING + 1.5 * 20.0);
+            event
+                .set_action(mouse::Action::Press)
+                .set_button(Some(mouse::Button::Left))
+                .set_position(mouse::Position {
+                    x: local.x * scale,
+                    y: local.y * scale,
+                });
+            let mut out = Vec::new();
+            encoder.encode_to_vec(&event, &mut out)?;
+            assert_eq!(out, b"\x1b[<0;4;2M", "at {scale}x");
+        }
+        Ok(())
+    }
 }
