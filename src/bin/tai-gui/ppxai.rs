@@ -165,6 +165,71 @@ impl Client {
         }
     }
 
+    /// Start a tool-capable run (`POST /v1/agent/task`) from `body`, an
+    /// `AgentTaskRequest` (`grammar::TaskArgs::body`), stamped with the
+    /// slot's conversation: its id. ppxai's refusals, such as the tier being
+    /// off (403) or a missing grant (422), come back as its own words.
+    pub fn start_task(&self, body: &Value) -> Result<String, String> {
+        self.conversation()?;
+        match self.link.post_json("/v1/agent/task", body, CALL_TIMEOUT)? {
+            (200..=202, text) => json(&text)?["run_id"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("no run_id in {text}")),
+            (status, text) => Err(format!("{status}: {}", detail(&text))),
+        }
+    }
+
+    /// The slot's working directory, `GET /context/working_dir`, which a
+    /// `/task` run gets unless its line names one.
+    pub fn working_dir(&self) -> Result<Option<String>, String> {
+        match self.link.get("/context/working_dir")? {
+            (200, text) => Ok(json(&text)?["path"]
+                .as_str()
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)),
+            (status, text) => Err(format!("/context/working_dir: {status}: {}", detail(&text))),
+        }
+    }
+
+    /// Answer run `id`, parked in `waiting` with `token`: `POST
+    /// /v1/agent/runs/{id}/respond`. To a consent park only `approved:
+    /// true` approves; text alone denies, with the text as a note.
+    pub fn respond_run(
+        &self,
+        id: &str,
+        token: &str,
+        approved: Option<bool>,
+        text: Option<&str>,
+    ) -> Result<(), String> {
+        let path = format!("/v1/agent/runs/{}/respond", encode(id));
+        let mut body = serde_json::json!({ "token": token });
+        if let Some(approved) = approved {
+            body["approved"] = approved.into();
+        }
+        if let Some(text) = text {
+            body["text"] = text.into();
+        }
+        match self.link.post_json(&path, &body, CALL_TIMEOUT)? {
+            (200, _) => Ok(()),
+            (status, text) => Err(format!("{status}: {}", detail(&text))),
+        }
+    }
+
+    /// Continue an interrupted or cancelled `/task` run from its checkpoint,
+    /// under the same id: `POST /v1/agent/runs/{id}/resume`. ppxai refuses,
+    /// with its reason, when the checkpoint isn't clean.
+    pub fn resume_run(&self, id: &str) -> Result<(), String> {
+        let path = format!("/v1/agent/runs/{}/resume", encode(id));
+        match self
+            .link
+            .post_json(&path, &serde_json::json!({}), CALL_TIMEOUT)?
+        {
+            (200..=202, _) => Ok(()),
+            (status, text) => Err(format!("{status}: {}", detail(&text))),
+        }
+    }
+
     /// One run: `GET /v1/agent/runs/{id}`.
     pub fn run(&self, id: &str) -> Result<Run, String> {
         match self.link.get(&format!("/v1/agent/runs/{}", encode(id)))? {
@@ -963,6 +1028,34 @@ pub struct Run {
     pub sources: Vec<Source>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// A `/task` run's granted tools.
+    pub tools: Vec<String>,
+    /// The directory its tools work in; none for the server's default.
+    pub workdir: Option<String>,
+    /// It stopped at a clean checkpoint, so `resume` may continue it.
+    pub resumable: bool,
+    /// What it waits for while its status is `waiting`.
+    pub waiting: Option<Waiting>,
+}
+
+/// A run parked for an answer (`RunMetaResponse.waiting`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Waiting {
+    /// "consent", or "input" once ppxai has an ask-user tool.
+    pub kind: String,
+    pub prompt: String,
+    /// What the answer hands back to `respond`.
+    pub token: String,
+}
+
+impl Waiting {
+    fn parse(v: &Value) -> Option<Self> {
+        Some(Self {
+            kind: v["kind"].as_str().unwrap_or("consent").to_string(),
+            prompt: v["prompt"].as_str().unwrap_or_default().to_string(),
+            token: v["token"].as_str().filter(|t| !t.is_empty())?.to_string(),
+        })
+    }
 }
 
 impl Run {
@@ -1009,6 +1102,15 @@ impl Run {
             sources: Source::parse_list(&v["sources"]),
             provider: optional("provider"),
             model: optional("model"),
+            tools: v["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect(),
+            workdir: optional("workdir"),
+            resumable: v["resumable"].as_bool().unwrap_or(false),
+            waiting: Waiting::parse(&v["waiting"]),
         })
     }
 }
@@ -1780,5 +1882,75 @@ mod tests {
         if collect != "no" {
             crate::runs::collect_run(&a, &id).unwrap();
         }
+
+        // `/task`: a run with a tool grant, in a working dir of its own.
+        // ppxai's tier is off by default (`execution.task.enabled`); say so
+        // rather than fail on it.
+        assert!(a.working_dir().is_ok());
+        let dir = std::env::temp_dir().join(format!("tai-contract-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("name.txt"), "tai-contract-marker\n").unwrap();
+        // macOS's temp dir is behind a symlink, which ppxai may resolve.
+        let dir = dir.canonicalize().unwrap();
+        let workdir = dir.to_string_lossy().into_owned();
+        let launch = |line: &str| {
+            let args = crate::grammar::TaskArgs::parse(line);
+            assert!(args.errors.is_empty(), "{:?}", args.errors);
+            a.start_task(&args.body(None, None, Some(&workdir)))
+        };
+        match launch("\"Use read_file to read name.txt and reply with its contents only.\"") {
+            Err(why) => assert!(why.starts_with("4"), "no grant gave {why}"),
+            Ok(id) => panic!("a /task run without a grant started: {id}"),
+        }
+        let started = launch(
+            "\"Use read_file to read name.txt and reply with its contents only.\" \
+             --tools read_file --budget iters=5",
+        );
+        match started {
+            Err(why) if why.starts_with("403") => {
+                eprintln!("skipping /task: the tier is off: {why}");
+            }
+            Err(why) => panic!("/task didn't start: {why}"),
+            Ok(id) => {
+                let run = loop {
+                    let run = a.run(&id).unwrap();
+                    if run.ended() {
+                        break run;
+                    }
+                    assert!(Instant::now() < deadline, "task {id} still {}", run.status);
+                    std::thread::sleep(Duration::from_millis(500));
+                };
+                assert_eq!(run.kind, "task");
+                assert_eq!(run.tools, ["read_file"]);
+                assert_eq!(run.workdir.as_deref(), Some(workdir.as_str()));
+                assert_eq!(run.session_id.as_deref(), Some(conv_a.as_str()));
+                assert!(
+                    run.succeeded(),
+                    "task {id} ended {}: {:?}",
+                    run.status,
+                    run.error
+                );
+                assert!(
+                    run.result
+                        .as_deref()
+                        .is_some_and(|r| r.contains("tai-contract-marker")),
+                    "task {id} answered {:?}",
+                    run.result
+                );
+                let events = a.run_events(&id, 0).unwrap();
+                assert!(events.iter().any(|e| e.kind == "tool_call"), "{events:?}");
+                // A run that isn't parked takes no answer, and a finished one
+                // doesn't resume.
+                assert!(
+                    a.respond_run(&id, "bogus", Some(true), None)
+                        .is_err_and(|e| e.starts_with("409"))
+                );
+                assert!(a.resume_run(&id).is_err_and(|e| e.starts_with("409")));
+                if collect != "no" {
+                    crate::runs::collect_run(&a, &id).unwrap();
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

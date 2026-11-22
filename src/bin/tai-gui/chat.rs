@@ -53,6 +53,7 @@ use crate::{
     discovery::{self, FontFile},
     engine::{Engine, State},
     fonts,
+    grammar::{self, Dispatch, TaskArgs},
     ppxai::{self, ChatEvent, Client, Consent, ToolKind, ToolStep},
 };
 
@@ -193,12 +194,12 @@ impl Live {
 
 /// A finished call the pane shows the outcome of.
 enum Done {
-    /// A run started from `/run`: its task and its id.
+    /// A run started from `/run` or `/task`: its task and its id.
     RunStarted(String, Result<String, String>),
-    /// `/run ls`, as Markdown.
+    /// `/run ls`, `/task ls`, as Markdown.
     Listed(Result<String, String>),
-    /// `/run collect`, `/run cancel`: the run's id and what to say about
-    /// it.
+    /// A lifecycle verb on a run, such as `cancel` or `respond`: the run's
+    /// id and what to say about it.
     RunAction(String, Result<String, String>),
     Tools(Result<bool, String>),
     Roster(Result<ppxai::Roster, String>),
@@ -210,8 +211,27 @@ enum Done {
 
 /// The client actions ppxai's roster binds to a command (ppxai
 /// `commands/factory.py`, `client_action`) that tai-gui implements. The
-/// others, such as `task.controller`, answer that tai-gui lacks them.
-const CLIENT_ACTIONS: &[&str] = &["run.controller"];
+/// others, such as `auto.loop`, answer that tai-gui lacks them.
+const CLIENT_ACTIONS: &[&str] = &["run.controller", "task.controller"];
+
+/// The two run families: `/run` starts tool-free one-shot runs, `/task`
+/// runs with the tools it's granted. They share the lifecycle verbs, as the
+/// web app's `RunController` extends its `TaskController`.
+#[derive(Clone, Copy, PartialEq)]
+enum Family {
+    Run,
+    Task,
+}
+
+impl Family {
+    /// The runs' `kind`, which `ls` lists.
+    fn kind(self) -> &'static str {
+        match self {
+            Family::Run => "oneshot",
+            Family::Task => "task",
+        }
+    }
+}
 
 /// Client actions whose command is a chat message: sent to `/chat` as
 /// typed, its answer streaming in (the web app's `STREAMING_COMMANDS`).
@@ -654,7 +674,8 @@ impl ChatPane {
                     if self.entries.is_empty() && self.turn.is_none() {
                         ui.weak(
                             "A conversation with ppxai. /run <prompt> asks one-shot in \
-                             the background and shows the run in the Preview pane.",
+                             the background, and /task <prompt> --tools <a,b> works with \
+                             tools; the Preview pane shows their runs.",
                         );
                     }
                     for (n, entry) in self.entries.iter().enumerate() {
@@ -829,68 +850,190 @@ impl ChatPane {
         client: Client,
         ctx: &egui::Context,
     ) {
-        match action {
-            // `/run <prompt>` starts a one-shot run in the background, with
-            // the picker's provider and model, as the web app's
-            // RunController does; a lifecycle verb works on a run by id.
-            "run.controller" => {
-                let mut words = args.split_whitespace();
-                let verb = words.next().unwrap_or_default();
-                let id = words.next().map(str::to_string);
-                let is_verb = spec.subcommands.iter().any(|s| s == verb);
-                match (verb, id) {
-                    ("", _) => self
-                        .entries
-                        .push(Entry::Error(format!("Usage: {}", spec.usage))),
-                    ("help", _) => self.entries.push(Entry::Note(format!(
-                        "{}. Usage: {}",
-                        spec.description, spec.usage
-                    ))),
-                    ("ls", _) => self.job(ctx, "chat-runs", move || {
+        // `/run <prompt>` and `/task <prompt> --tools …` start a run in the
+        // background, a lifecycle verb works on a run by id, as the web
+        // app's RunController and TaskController do (ppxai
+        // `web/shared/task-controller.js`, `run-controller.js`).
+        let family = match action {
+            "run.controller" => Family::Run,
+            "task.controller" => Family::Task,
+            other => {
+                tracing::error!("chat: {other} is in CLIENT_ACTIONS but not handled");
+                return;
+            }
+        };
+        let cmd = format!("/{}", spec.name);
+        match grammar::classify(args) {
+            Dispatch::Help => self.entries.push(Entry::Note(format!(
+                "{}. Usage: {}",
+                spec.description, spec.usage
+            ))),
+            Dispatch::NearMiss { id } => self.entries.push(Entry::Error(format!(
+                "{id} looks like a run id but isn't one (run_ and 12 hex digits). \
+                 {cmd} ls lists the runs."
+            ))),
+            Dispatch::Lifecycle { verb, id, rest } => {
+                self.lifecycle(family, &cmd, &spec.usage, verb, id, &rest, client, ctx)
+            }
+            Dispatch::Launch(line) => match family {
+                Family::Run => self.launch_run(&cmd, &line, client, ctx),
+                Family::Task => self.launch_task(&cmd, &spec.usage, &line, client, ctx),
+            },
+        }
+    }
+
+    /// A lifecycle verb of `/run` or `/task`.
+    #[allow(clippy::too_many_arguments)]
+    fn lifecycle(
+        &mut self,
+        family: Family,
+        cmd: &str,
+        usage: &str,
+        verb: &str,
+        id: Option<String>,
+        rest: &str,
+        client: Client,
+        ctx: &egui::Context,
+    ) {
+        let error = |text: String| Entry::Error(text);
+        let Some(id) = id else {
+            match verb {
+                "help" => self.entries.push(Entry::Note(format!("Usage: {usage}"))),
+                "ls" => {
+                    let kind = family.kind();
+                    self.job(ctx, "chat-runs", move || {
                         Done::Listed(
                             client
                                 .runs(&ppxai::RunFilter {
-                                    kind: Some("oneshot"),
+                                    kind: Some(kind),
                                     ..Default::default()
                                 })
-                                .map(|runs| runs_table(&runs)),
+                                .map(|runs| runs_table(&runs, family)),
                         )
-                    }),
-                    ("get" | "watch", Some(id)) => {
-                        self.opened.push(crate::runs::Open { id, client });
-                    }
-                    ("cancel", Some(id)) => self.job(ctx, "chat-run-cancel", move || {
-                        let said = client
-                            .cancel_run(&id)
-                            .map(|()| format!("Asked run {id} to stop"));
-                        Done::RunAction(id, said)
-                    }),
-                    ("collect", Some(id)) => self.job(ctx, "chat-run-collect", move || {
-                        let said = crate::runs::collect_run(&client, &id)
-                            .map(|()| format!("Run {id}'s result is now in the conversation"));
-                        Done::RunAction(id, said)
-                    }),
-                    (verb, None) if is_verb => self.entries.push(Entry::Error(format!(
-                        "/{} {verb} needs a run id. Usage: {}",
-                        spec.name, spec.usage
-                    ))),
-                    (verb, _) if is_verb => self.entries.push(Entry::Error(format!(
-                        "/{} {verb} isn't in tai-gui yet",
-                        spec.name
-                    ))),
-                    _ => {
-                        let task = unquote(args).to_string();
-                        let (provider, model) = self.picker.choice();
-                        let started = task.clone();
-                        self.job(ctx, "chat-run", move || {
-                            let id = client.start_run(&task, provider.as_deref(), model.as_deref());
-                            Done::RunStarted(started, id)
-                        });
-                    }
+                    });
                 }
+                verb => self.entries.push(error(format!(
+                    "{cmd} {verb} needs a run id. Usage: {usage}"
+                ))),
             }
-            other => tracing::error!("chat: {other} is in CLIENT_ACTIONS but not handled"),
+            return;
+        };
+        if family == Family::Run && matches!(verb, "respond" | "resume") {
+            self.entries.push(error(format!(
+                "A {cmd} run never waits for an answer and can't be resumed; a /task run can"
+            )));
+            return;
         }
+        match verb {
+            "help" => self.entries.push(Entry::Note(format!("Usage: {usage}"))),
+            "ls" => self
+                .entries
+                .push(error(format!("{cmd} ls takes no run id"))),
+            "get" | "watch" => self.opened.push(crate::runs::Open { id, client }),
+            "cancel" => self.job(ctx, "chat-run-cancel", move || {
+                let said = client
+                    .cancel_run(&id)
+                    .map(|()| format!("Asked run {id} to stop"));
+                Done::RunAction(id, said)
+            }),
+            "collect" => self.job(ctx, "chat-run-collect", move || {
+                let said = crate::runs::collect_run(&client, &id)
+                    .map(|()| format!("Run {id}'s result is now in the conversation"));
+                Done::RunAction(id, said)
+            }),
+            "resume" => self.job(ctx, "chat-run-resume", move || {
+                let said = client
+                    .resume_run(&id)
+                    .map(|()| format!("Run {id} goes on from where it stopped"));
+                Done::RunAction(id, said)
+            }),
+            "respond" => {
+                // The words after the id.
+                let answer = rest
+                    .trim_start()
+                    .strip_prefix(id.as_str())
+                    .unwrap_or_default()
+                    .trim();
+                if answer.is_empty() {
+                    self.entries.push(error(format!(
+                        "Usage: {cmd} respond <id> approve|deny|\"<text>\""
+                    )));
+                    return;
+                }
+                let answer = unquote(answer).to_string();
+                self.job(ctx, "chat-run-respond", move || {
+                    let said = answer_run(&client, &id, &answer);
+                    Done::RunAction(id, said)
+                });
+            }
+            other => tracing::error!("chat: {cmd} {other} isn't handled"),
+        }
+    }
+
+    /// `/run <prompt>`: a one-shot run with the picker's provider and model.
+    /// It takes no flags; the server's config decides its grant.
+    fn launch_run(&mut self, cmd: &str, line: &str, client: Client, ctx: &egui::Context) {
+        let flag = line.split_whitespace().any(|w| {
+            w.strip_prefix("--")
+                .is_some_and(|f| f.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+        });
+        if flag {
+            self.entries.push(Entry::Error(format!(
+                "{cmd} takes no flags: ppxai's config decides what it may use \
+                 (execution.run.web_search). /task takes a tool grant."
+            )));
+            return;
+        }
+        let task = unquote(line).to_string();
+        let (provider, model) = self.picker.choice();
+        let started = task.clone();
+        self.job(ctx, "chat-run", move || {
+            let id = client.start_run(&task, provider.as_deref(), model.as_deref());
+            Done::RunStarted(started, id)
+        });
+    }
+
+    /// `/task <prompt> --tools a,b …`: a run with tools, in the
+    /// conversation's working directory unless `--work-dir` names one.
+    fn launch_task(
+        &mut self,
+        cmd: &str,
+        usage: &str,
+        line: &str,
+        client: Client,
+        ctx: &egui::Context,
+    ) {
+        let args = TaskArgs::parse(line);
+        if !args.errors.is_empty() {
+            self.entries
+                .push(Entry::Error(format!("{cmd}: {}", args.errors.join("; "))));
+            return;
+        }
+        if args.task.is_empty() {
+            self.entries.push(Entry::Error(format!("Usage: {usage}")));
+            return;
+        }
+        // ppxai refuses a run without a grant (422); say what to add instead.
+        if args.tools.is_empty() && !args.has_source() {
+            self.entries.push(Entry::Error(format!(
+                "{cmd} needs a tool grant: add --tools web_search (or --tools a,b,c), \
+                 or name a --spec, --skill or --profile. /run answers without tools."
+            )));
+            return;
+        }
+        let (provider, model) = self.picker.choice();
+        let started = args.task.clone();
+        self.job(ctx, "chat-task", move || {
+            let workdir = match args.workdir {
+                Some(_) => None,
+                None => client.working_dir().unwrap_or_else(|why| {
+                    tracing::warn!("chat: the working dir: {why}");
+                    None
+                }),
+            };
+            let body = args.body(provider.as_deref(), model.as_deref(), workdir.as_deref());
+            Done::RunStarted(started, client.start_task(&body))
+        });
     }
 
     /// The roster's commands that match what's typed, under the input,
@@ -1595,10 +1738,41 @@ fn unquote(text: &str) -> &str {
     text
 }
 
-/// `/run ls` as a Markdown table, newest first as ppxai lists them.
-fn runs_table(runs: &[ppxai::Run]) -> String {
+/// `/task respond <id> <answer>`: answer run `id`'s park, as the web app's
+/// `respondCmd` does. `approve`, `yes`, `y` approve; `deny`, `no`, `n`
+/// deny; any other text goes as text, which a consent park takes as a
+/// denial with a note.
+fn answer_run(client: &Client, id: &str, answer: &str) -> Result<String, String> {
+    let run = client.run(id)?;
+    let Some(waiting) = run.waiting else {
+        return Err(format!(
+            "Run {id} isn't waiting for an answer (it's {})",
+            run.status
+        ));
+    };
+    let approved = match answer.to_lowercase().as_str() {
+        "approve" | "yes" | "y" => Some(true),
+        "deny" | "no" | "n" => Some(false),
+        _ => None,
+    };
+    let text = approved.is_none().then_some(answer);
+    client.respond_run(id, &waiting.token, approved, text)?;
+    Ok(match approved {
+        Some(true) => format!("Approved; run {id} goes on"),
+        Some(false) => format!("Denied; run {id} goes on without it"),
+        None => format!("Answered run {id}; it goes on"),
+    })
+}
+
+/// `/run ls`, `/task ls` as a Markdown table, newest first as ppxai lists
+/// them.
+fn runs_table(runs: &[ppxai::Run], family: Family) -> String {
     if runs.is_empty() {
-        return "No one-shot runs.".into();
+        return match family {
+            Family::Run => "No one-shot runs.",
+            Family::Task => "No /task runs.",
+        }
+        .into();
     }
     let cell = |text: &str| {
         let short: String = text.chars().take(60).collect();
