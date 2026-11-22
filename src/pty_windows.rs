@@ -65,7 +65,9 @@ impl Pty {
     ///   1. pwsh.exe on PATH
     ///   2. %COMSPEC%
     ///   3. cmd.exe
-    pub fn new(dims: Dimensions) -> std::io::Result<(Self, Child)> {
+    ///
+    /// It starts in `cwd` when that's a directory, else in tai's own.
+    pub fn new(dims: Dimensions, cwd: Option<&std::path::Path>) -> std::io::Result<(Self, Child)> {
         restrict_dll_search();
         let pair = native_pty_system()
             .openpty(pty_size(dims))
@@ -75,8 +77,13 @@ impl Pty {
         let mut cmd = CommandBuilder::new(default_shell());
         // portable-pty starts in %USERPROFILE% unless told otherwise; inherit
         // tai's directory as forkpty does on Unix.
-        if let Ok(dir) = std::env::current_dir() {
-            cmd.cwd(dir);
+        match cwd.filter(|dir| dir.is_dir()) {
+            Some(dir) => cmd.cwd(dir),
+            None => {
+                if let Ok(dir) = std::env::current_dir() {
+                    cmd.cwd(dir);
+                }
+            }
         }
         cmd.env("COLORTERM", "truecolor");
         // Identify tai, not the terminal that started it (ADR 0005). A

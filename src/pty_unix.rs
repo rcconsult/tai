@@ -73,7 +73,11 @@ impl Pty {
     ///   1. $SHELL environment variable
     ///   2. The pw_shell field from the passwd database
     ///   3. /bin/sh as a last resort
-    pub fn new(dims: Dimensions) -> std::io::Result<(Self, Child)> {
+    ///
+    /// It starts in `cwd` when that's a directory, else in tai's own.
+    pub fn new(dims: Dimensions, cwd: Option<&std::path::Path>) -> std::io::Result<(Self, Child)> {
+        // Checked before forking: a bad directory would make exec fail.
+        let cwd = cwd.filter(|dir| dir.is_dir());
         // Work out the shell's locale before forking: it may run
         // `defaults` on macOS, and it logs (ADR 0003).
         let locale = crate::locale::child_env();
@@ -131,6 +135,9 @@ impl Pty {
 
                 // Replace the child process with the user's shell via `exec`.
                 let mut command = Command::new(&shell);
+                if let Some(dir) = cwd {
+                    command.current_dir(dir);
+                }
                 for name in &foreign {
                     command.env_remove(name);
                 }

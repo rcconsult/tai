@@ -55,7 +55,7 @@ use crate::{
     engine::{Engine, State},
     fonts,
     grammar::{self, Dispatch, TaskArgs},
-    ppxai::{self, ChatEvent, Client, Consent, ToolKind, ToolStep},
+    ppxai::{self, ChatEvent, Client, Consent, SideEffect, ToolKind, ToolStep},
 };
 
 enum Entry {
@@ -125,6 +125,8 @@ pub struct ChatPane {
     running: bool,
     /// Runs to open in the run pane; the app hands them over.
     opened: Vec<crate::runs::Open>,
+    /// Terminals commands asked for; the app hands them over.
+    terminals: Vec<TerminalRequest>,
     /// Whether the input had the focus last frame. egui drops the focus on
     /// Escape before any widget sees the key (egui 0.36
     /// `memory/mod.rs`), so Escape can't ask whether it has it now.
@@ -164,6 +166,8 @@ struct Live {
     /// the answer: `stream_end` brings the answer's text without them, as
     /// the web app's `_streamInlineImages` works around.
     displayed: String,
+    /// State changes the pane hasn't taken yet.
+    state: ppxai::StateSync,
 }
 
 impl Live {
@@ -206,6 +210,10 @@ impl Live {
             // An image goes into the answer, as the web app shows it; the
             // other kinds the web app opens in its right-hand panel, which
             // tai-gui doesn't have for them yet.
+            ChatEvent::State(state) => self.state.merge(state),
+            ChatEvent::Throttled(why) => self.error = Some(why),
+            ChatEvent::Degraded(reasons) => self.reply.notes.push(degraded(&reasons)),
+            ChatEvent::Stopped(why) => self.reply.notes.push(format!("Stopped early: {why}")),
             ChatEvent::Display(path) => match crate::images::shown_markdown(&path) {
                 Some(markdown) => {
                     self.activity = None;
@@ -218,6 +226,33 @@ impl Live {
             },
         }
     }
+}
+
+/// How a turn whose tools were cut short says so, from ppxai's
+/// `ToolGuardReason` values (`engine/types.py`).
+fn degraded(reasons: &[String]) -> String {
+    let said: Vec<&str> = reasons
+        .iter()
+        .map(|r| match r.as_str() {
+            "iteration_cap" => {
+                "it used every tool step it had, so it answered from what it had found"
+            }
+            "tool_budget_exhausted" => "a tool reached its call limit for the turn",
+            "tools_withdrawn" => "its tools were taken away after it asked for a refused one again",
+            "tool_repeat_loop" => "it repeated the same tool call",
+            other => other,
+        })
+        .collect();
+    format!("The tools were cut short: {}.", said.join("; "))
+}
+
+/// A terminal that a command asked for: `/terminal`, or a command to type
+/// into one (ppxai's `open_terminal` and `run_shell` side effects).
+pub struct TerminalRequest {
+    /// Where a new terminal starts; one that's running stays where it is.
+    pub cwd: Option<String>,
+    /// Typed at the prompt, not run: the user presses Enter.
+    pub command: Option<String>,
 }
 
 /// A finished call the pane shows the outcome of.
@@ -431,6 +466,32 @@ impl Picker {
         }
     }
 
+    /// Show the provider and model ppxai says it's on, when they changed
+    /// outside the pickers (`/model`, `/provider`). It switches nothing.
+    fn sync(
+        &mut self,
+        client: &Client,
+        ctx: &egui::Context,
+        provider: Option<String>,
+        model: Option<String>,
+    ) {
+        if self.switching.is_some() {
+            return;
+        }
+        if let Some(id) = provider
+            && self.provider.as_ref() != Some(&id)
+        {
+            self.provider = Some(id.clone());
+            self.model = None;
+            self.models.clear();
+            self.load_models(client, ctx, id);
+        }
+        if let Some(id) = model {
+            let default = self.current().and_then(|p| p.default_model.as_ref());
+            self.model = (default != Some(&id)).then_some(id);
+        }
+    }
+
     fn current(&self) -> Option<&ppxai::Provider> {
         let id = self.provider.as_ref()?;
         self.providers.iter().find(|p| &p.id == id)
@@ -593,6 +654,10 @@ impl ChatPane {
     }
 
     /// A line in the transcript, such as a run pane's "collected".
+    pub fn take_terminals(&mut self) -> Vec<TerminalRequest> {
+        std::mem::take(&mut self.terminals)
+    }
+
     pub fn note(&mut self, text: String) {
         self.entries.push(Entry::Note(text));
     }
@@ -605,6 +670,7 @@ impl ChatPane {
             turn: None,
             tools: None,
             folder: None,
+            terminals: Vec::new(),
             folder_edit: None,
             folder_focus: false,
             folder_stale: false,
@@ -621,7 +687,7 @@ impl ChatPane {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, engine: &Engine) {
         self.collect_turn(ui.ctx());
-        self.collect_jobs();
+        self.collect_jobs(ui.ctx());
         if self.client.is_none()
             && let Ok(state) = engine.state.lock()
             && let State::Ready(link) = &*state
@@ -1363,7 +1429,33 @@ impl ChatPane {
         }
     }
 
-    fn collect_jobs(&mut self) {
+    /// Follow what ppxai says changed: the folder, the tools, the provider
+    /// and the model. A tool can move the folder, and a command such as
+    /// `/model` can switch the model.
+    fn apply_state(&mut self, state: ppxai::StateSync, ctx: &egui::Context) {
+        if let Some(path) = state.working_dir
+            && self.folder.as_ref() != Some(&path)
+        {
+            if self.folder.is_some() {
+                self.entries
+                    .push(Entry::Note(format!("Working directory changed to {path}")));
+            }
+            crate::images::set_workdir(Some(&path));
+            self.folder = Some(path);
+        }
+        if let Some(on) = state.tools_enabled {
+            if self.tools.is_some_and(|was| was != on) {
+                let state = if on { "on" } else { "off" };
+                self.entries.push(Entry::Note(format!("Tools {state}")));
+            }
+            self.tools = Some(on);
+        }
+        if let Some(client) = &self.client {
+            self.picker.sync(client, ctx, state.provider, state.model);
+        }
+    }
+
+    fn collect_jobs(&mut self, ctx: &egui::Context) {
         let mut done = Vec::new();
         self.jobs
             .retain(|slot| match slot.lock().ok().and_then(|mut s| s.take()) {
@@ -1443,18 +1535,38 @@ impl ChatPane {
                     self.folder_stale = true;
                     match outcome {
                         Ok(outcome) => {
-                            if let Some(on) = outcome.tools_enabled {
-                                self.tools = Some(on);
-                            }
                             if outcome.ok && RESETS_TRANSCRIPT.contains(&name.as_str()) {
                                 self.entries.clear();
                                 self.markdown = CommonMarkCache::default();
                                 crate::images::new_conversation();
                             }
-                            // /show <image>: the web app opens it in its
-                            // right-hand panel; here, in the Preview stack.
-                            for path in &outcome.show_images {
-                                crate::images::request_open(path);
+                            self.apply_state(outcome.state, ctx);
+                            let mut notes = Vec::new();
+                            for effect in outcome.effects {
+                                match effect {
+                                    // /show <image>: the web app opens it in
+                                    // its right-hand panel; here, in the
+                                    // Preview stack.
+                                    SideEffect::ShowImage(path) => {
+                                        crate::images::request_open(&path)
+                                    }
+                                    SideEffect::Terminal { cwd, command } => {
+                                        self.terminals.push(TerminalRequest { cwd, command })
+                                    }
+                                    SideEffect::RefreshRoster => {
+                                        if let Some(asked) = self.client.clone() {
+                                            self.job(ctx, "chat-commands", move || {
+                                                Done::Roster(asked.commands())
+                                            });
+                                        }
+                                    }
+                                    SideEffect::Copy(text) => ctx.copy_text(text),
+                                    SideEffect::Notify { message, error } => notes.push(if error {
+                                        Entry::Error(message)
+                                    } else {
+                                        Entry::Note(message)
+                                    }),
+                                }
                             }
                             if outcome.error {
                                 self.entries.push(Entry::Error(outcome.markdown));
@@ -1465,6 +1577,7 @@ impl ChatPane {
                                     ..Reply::default()
                                 }));
                             }
+                            self.entries.extend(notes);
                         }
                         Err(why) => self.entries.push(Entry::Error(why)),
                     }
@@ -1481,6 +1594,18 @@ impl ChatPane {
     /// Once the stream is over, its answer becomes an entry, followed by
     /// how it ended when it didn't end normally.
     fn collect_turn(&mut self, ctx: &egui::Context) {
+        let Some(turn) = &self.turn else {
+            return;
+        };
+        // State changes show while the answer is still coming.
+        let state = turn
+            .live
+            .lock()
+            .map(|mut live| std::mem::take(&mut live.state))
+            .unwrap_or_default();
+        if !state.is_empty() {
+            self.apply_state(state, ctx);
+        }
         let Some(turn) = &self.turn else {
             return;
         };
@@ -2266,6 +2391,41 @@ mod tests {
             None,
         );
         assert!(matches!(&narrated[0].0, Entry::Answer(r) if r.prose == ["Looking at the file."]));
+    }
+
+    /// A rate limit, a cut-short tool loop and a tripped breaker each say
+    /// so; state changes wait for the pane.
+    #[test]
+    fn a_turn_says_why_it_stopped_short() {
+        let throttled = finish(
+            live(vec![ChatEvent::Throttled("p refused the request".into())]),
+            false,
+            None,
+        );
+        assert!(matches!(&throttled[..], [(Entry::Error(e), _)] if e == "p refused the request"));
+
+        let capped = live(vec![
+            ChatEvent::State(crate::ppxai::StateSync {
+                working_dir: Some("/w".into()),
+                ..Default::default()
+            }),
+            ChatEvent::Degraded(vec!["iteration_cap".into()]),
+            ChatEvent::Stopped("Circuit breaker tripped.".into()),
+            ChatEvent::End {
+                text: "best effort".into(),
+                tokens: None,
+                sources: Vec::new(),
+            },
+        ]);
+        assert_eq!(capped.state.working_dir.as_deref(), Some("/w"));
+        assert_eq!(
+            capped.reply.notes,
+            [
+                "The tools were cut short: it used every tool step it had, so it answered \
+                 from what it had found.",
+                "Stopped early: Circuit breaker tripped."
+            ]
+        );
     }
 
     #[test]
