@@ -982,6 +982,42 @@ impl ChatPane {
         }
     }
 
+    /// `ls` with its flags: the active conversation's runs, or with `--all`
+    /// every conversation's (ppxai fafebaf3).
+    fn list_runs(
+        &mut self,
+        family: Family,
+        cmd: &str,
+        rest: &str,
+        client: Client,
+        ctx: &egui::Context,
+    ) {
+        let flags = match grammar::ListFlags::parse(rest) {
+            Ok(flags) => flags,
+            Err(why) => {
+                self.entries.push(Entry::Error(format!("{cmd} ls: {why}")));
+                return;
+            }
+        };
+        let cmd = cmd.to_string();
+        self.job(ctx, "chat-runs", move || {
+            let listed = (|| {
+                let conversation = if flags.all {
+                    None
+                } else {
+                    Some(client.conversation()?)
+                };
+                let runs = client.runs(&ppxai::RunFilter {
+                    kind: Some(family.kind()),
+                    session: conversation.as_deref(),
+                    status: flags.status.as_deref(),
+                })?;
+                Ok(runs_table(runs, &cmd, family, &flags))
+            })();
+            Done::Listed(listed)
+        });
+    }
+
     /// A lifecycle verb of `/run` or `/task`.
     #[allow(clippy::too_many_arguments)]
     fn lifecycle(
@@ -999,19 +1035,7 @@ impl ChatPane {
         let Some(id) = id else {
             match verb {
                 "help" => self.entries.push(Entry::Note(format!("Usage: {usage}"))),
-                "ls" => {
-                    let kind = family.kind();
-                    self.job(ctx, "chat-runs", move || {
-                        Done::Listed(
-                            client
-                                .runs(&ppxai::RunFilter {
-                                    kind: Some(kind),
-                                    ..Default::default()
-                                })
-                                .map(|runs| runs_table(&runs, family)),
-                        )
-                    });
-                }
+                "ls" => self.list_runs(family, cmd, rest, client, ctx),
                 verb => self.entries.push(error(format!(
                     "{cmd} {verb} needs a run id. Usage: {usage}"
                 ))),
@@ -1026,9 +1050,8 @@ impl ChatPane {
         }
         match verb {
             "help" => self.entries.push(Entry::Note(format!("Usage: {usage}"))),
-            "ls" => self
-                .entries
-                .push(error(format!("{cmd} ls takes no run id"))),
+            // As in ppxai, `ls <run id>` is the plain listing.
+            "ls" => self.list_runs(family, cmd, "", client, ctx),
             "get" | "watch" => self.opened.push(crate::runs::Open { id, client }),
             "cancel" => self.job(ctx, "chat-run-cancel", move || {
                 let said = client
@@ -1886,30 +1909,104 @@ fn answer_run(client: &Client, id: &str, answer: &str) -> Result<String, String>
     })
 }
 
-/// `/run ls`, `/task ls` as a Markdown table, newest first as ppxai lists
-/// them.
-fn runs_table(runs: &[ppxai::Run], family: Family) -> String {
-    if runs.is_empty() {
-        return match family {
-            Family::Run => "No one-shot runs.",
-            Family::Task => "No /task runs.",
+/// How many top-level runs `ls` shows, as ppxai's `_LIST_CAP`.
+const LIST_CAP: usize = 20;
+
+/// Order runs for `ls`: each top-level run, newest first as ppxai lists
+/// them, followed by its sub-agents at depth 1. A sub-agent whose parent
+/// isn't in the list stays at top level (ppxai `engine/run_scope.py`,
+/// fafebaf3).
+fn nest(runs: Vec<ppxai::Run>) -> Vec<(ppxai::Run, usize)> {
+    let ids: HashSet<String> = runs.iter().map(|r| r.run_id.clone()).collect();
+    let parent_of = |run: &ppxai::Run| {
+        run.parent_run_id
+            .clone()
+            .filter(|p| ids.contains(p) && *p != run.run_id)
+    };
+    let (children, roots): (Vec<_>, Vec<_>) =
+        runs.into_iter().partition(|r| parent_of(r).is_some());
+    let mut children: Vec<_> = children
+        .into_iter()
+        .map(|c| (parent_of(&c).unwrap_or_default(), c))
+        .collect();
+    let mut rows = Vec::new();
+    for root in roots {
+        let id = root.run_id.clone();
+        rows.push((root, 0));
+        let mut i = 0;
+        while i < children.len() {
+            if children[i].0 == id {
+                rows.push((children.remove(i).1, 1));
+            } else {
+                i += 1;
+            }
         }
-        .into();
+    }
+    rows
+}
+
+/// `/run ls`, `/task ls` as a Markdown table, after ppxai's
+/// `commands/task.py` (fafebaf3): sub-agents marked under their parent, the
+/// first `LIST_CAP` top-level runs, and with `--all` each run's conversation.
+fn runs_table(
+    runs: Vec<ppxai::Run>,
+    cmd: &str,
+    family: Family,
+    flags: &grammar::ListFlags,
+) -> String {
+    let kind = family.kind();
+    let mut scope = String::from(if flags.all {
+        "all conversations"
+    } else {
+        "this conversation"
+    });
+    if let Some(status) = &flags.status {
+        scope.push_str(&format!(", status {status}"));
+    }
+    let rows = nest(runs);
+    if rows.is_empty() {
+        let hint = if flags.all {
+            String::new()
+        } else {
+            format!(". `{cmd} ls --all` shows every conversation")
+        };
+        return format!("No {kind} runs ({scope}){hint}.");
     }
     let cell = |text: &str| {
         let short: String = text.chars().take(60).collect();
         short.replace('|', "\\|").replace('\n', " ")
     };
-    let mut table = String::from("| Run | Status | Task |\n|---|---|---|\n");
-    for run in runs {
-        table.push_str(&format!(
-            "| `{}` | {} | {} |\n",
-            run.run_id,
-            run.status,
-            cell(&run.task)
-        ));
+    let tops = rows.iter().filter(|(_, depth)| *depth == 0).count();
+    let mut out = format!("{} {kind} run(s), {scope}", rows.len());
+    if tops > LIST_CAP {
+        out.push_str(&format!(", showing the newest {LIST_CAP} of {tops}"));
     }
-    table
+    // The conversation goes before the task, which is wide enough to push
+    // a last column out of the pane.
+    out.push_str(if flags.all {
+        "\n\n| Run | Status | Conversation | Task |\n|---|---|---|---|\n"
+    } else {
+        "\n\n| Run | Status | Task |\n|---|---|---|\n"
+    });
+    let mut shown = 0;
+    for (run, depth) in &rows {
+        if *depth == 0 {
+            shown += 1;
+            if shown > LIST_CAP {
+                break;
+            }
+        }
+        // In the code span: the monospace font has box drawing, the text
+        // font doesn't.
+        let mark = if *depth == 0 { "" } else { "└ " };
+        out.push_str(&format!("| `{mark}{}` | {} |", run.run_id, run.status));
+        if flags.all {
+            let conversation = run.session_id.as_deref().unwrap_or("(none)");
+            out.push_str(&format!(" {} |", cell(conversation)));
+        }
+        out.push_str(&format!(" {} |\n", cell(&run.task)));
+    }
+    out
 }
 
 /// What a source is called in the list: its title, else its URL's host
@@ -1937,10 +2034,79 @@ pub fn is_web_link(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, Entry, Live, blocks, command, common_prefix, finish, is_web_link, link_citations,
-        redact, source_name, tool_summary, truncate, unquote,
+        Block, Entry, Family, LIST_CAP, Live, blocks, command, common_prefix, finish, is_web_link,
+        link_citations, nest, redact, runs_table, source_name, tool_summary, truncate, unquote,
     };
+    use crate::grammar::ListFlags;
     use crate::ppxai::{ChatEvent, CommandSpec, Source, ToolKind, ToolStep};
+
+    fn run(id: &str, parent: Option<&str>, session: Option<&str>) -> crate::ppxai::Run {
+        crate::ppxai::Run::parse(&serde_json::json!({
+            "run_id": id, "status": "running", "task": format!("task {id}"),
+            "kind": "task", "parent_run_id": parent, "session_id": session,
+        }))
+        .unwrap()
+    }
+
+    // ppxai `tests/test_run_ls_scope.py`'s nesting cases.
+    #[test]
+    fn ls_puts_sub_agents_under_their_parent() {
+        let ids = |rows: Vec<(crate::ppxai::Run, usize)>| -> Vec<(String, usize)> {
+            rows.into_iter().map(|(r, d)| (r.run_id, d)).collect()
+        };
+        let pair = |id: &str, d: usize| (id.to_string(), d);
+        // Newest first: a child is listed before its parent.
+        let runs = vec![
+            run("c2", Some("p"), None),
+            run("q", None, None),
+            run("c1", Some("p"), None),
+            run("p", None, None),
+            run("orphan", Some("gone"), None),
+            run("self", Some("self"), None),
+        ];
+        assert_eq!(
+            ids(nest(runs)),
+            vec![
+                pair("q", 0),
+                pair("p", 0),
+                pair("c2", 1),
+                pair("c1", 1),
+                pair("orphan", 0),
+                pair("self", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn ls_tables_say_their_scope() {
+        let flags = |all: bool| ListFlags { all, status: None };
+        assert_eq!(
+            runs_table(vec![], "/task", Family::Task, &flags(false)),
+            "No task runs (this conversation). `/task ls --all` shows every conversation."
+        );
+        let waiting = ListFlags {
+            all: true,
+            status: Some("waiting".into()),
+        };
+        assert_eq!(
+            runs_table(vec![], "/run", Family::Run, &waiting),
+            "No oneshot runs (all conversations, status waiting)."
+        );
+        let runs = vec![run("c", Some("p"), Some("session_a")), run("p", None, None)];
+        let table = runs_table(runs, "/task", Family::Task, &flags(true));
+        assert!(table.starts_with(
+            "2 task run(s), all conversations\n\n| Run | Status | Conversation | Task |"
+        ));
+        assert!(table.contains(
+            "| `p` | running | (none) | task p |\n| `└ c` | running | session_a | task c |"
+        ));
+        let many: Vec<_> = (0..LIST_CAP + 2)
+            .map(|i| run(&format!("r{i}"), None, None))
+            .collect();
+        let table = runs_table(many, "/task", Family::Task, &flags(false));
+        assert!(table.contains("showing the newest 20 of 22"));
+        assert!(table.contains("`r19`") && !table.contains("`r20`"));
+    }
 
     fn step(kind: ToolKind, tool: &str) -> ToolStep {
         ToolStep {
