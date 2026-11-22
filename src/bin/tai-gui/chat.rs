@@ -36,6 +36,7 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -107,6 +108,15 @@ pub struct ChatPane {
     turn: Option<Turn>,
     /// Whether the conversation's tools are on; None until ppxai says.
     tools: Option<bool>,
+    /// The conversation's working directory, where its tools and `/task`
+    /// runs resolve files; None until ppxai says.
+    folder: Option<String>,
+    /// The folder being typed, while it's edited.
+    folder_edit: Option<String>,
+    /// The folder's field has opened and hasn't had the focus yet.
+    folder_focus: bool,
+    /// A command ran that may have moved the folder (`/cd`): look again.
+    folder_stale: bool,
     /// Calls in flight whose answers the pane shows.
     jobs: Vec<Arc<Mutex<Option<Done>>>>,
     /// ppxai's slash commands; None until they've loaded.
@@ -202,6 +212,8 @@ enum Done {
     /// id and what to say about it.
     RunAction(String, Result<String, String>),
     Tools(Result<bool, String>),
+    /// The conversation's working directory, and whether to say it changed.
+    Folder(Result<String, String>, bool),
     Roster(Result<ppxai::Roster, String>),
     /// A slash command, by its roster name.
     Command(String, Result<ppxai::CommandOutcome, String>),
@@ -574,6 +586,10 @@ impl ChatPane {
             input: String::new(),
             turn: None,
             tools: None,
+            folder: None,
+            folder_edit: None,
+            folder_focus: false,
+            folder_stale: false,
             jobs: Vec::new(),
             roster: None,
             running: false,
@@ -600,12 +616,31 @@ impl ChatPane {
                     self.job(ui.ctx(), "chat-commands", move || {
                         Done::Roster(asked.commands())
                     });
+                    // The conversation works where tai-gui was started, as
+                    // a terminal would; ppxai's own default is the home
+                    // folder. Started from a launcher (cwd `/`), keep it.
+                    let asked = client.clone();
+                    let start = launch_dir();
+                    self.job(ui.ctx(), "chat-folder", move || match start {
+                        Some(dir) => Done::Folder(asked.set_working_dir(&dir), false),
+                        None => {
+                            Done::Folder(asked.working_dir().map(Option::unwrap_or_default), false)
+                        }
+                    });
                     self.client = Some(client);
                 }
                 Err(why) => tracing::error!("chat: {why}"),
             }
         }
         let client = self.client.clone();
+        if self.folder_stale
+            && let Some(asked) = client.clone()
+        {
+            self.folder_stale = false;
+            self.job(ui.ctx(), "chat-folder", move || {
+                Done::Folder(asked.working_dir().map(Option::unwrap_or_default), false)
+            });
+        }
         let busy = self.turn.is_some() || self.running;
 
         egui::Panel::bottom("chat-input")
@@ -772,7 +807,72 @@ impl ChatPane {
             if clear.clicked() {
                 self.submit("/clear".into(), client.clone(), ui.ctx());
             }
+            // The working directory, as the web app's folder badge: its
+            // last part, the whole path on hover; a click edits it.
+            if let Some(folder) = self.folder.clone()
+                && self.folder_edit.is_none()
+            {
+                let name = Path::new(&folder)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| folder.clone());
+                let badge = ui
+                    .add_enabled(!busy, egui::Button::new(format!("In {name}")))
+                    .on_hover_text(format!(
+                        "{folder}\nWhere tools and /task runs work. Click to change it."
+                    ));
+                if badge.clicked() {
+                    self.folder_edit = Some(folder);
+                    self.folder_focus = true;
+                }
+            }
         });
+        let Some(mut text) = self.folder_edit.take() else {
+            return;
+        };
+        let mut done = false;
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text("/path/to/project")
+                    .desired_width(ui.available_width() - 120.0),
+            );
+            // Ask until the field has it: the terminal pane takes the focus
+            // whenever nothing holds it, and may win the frame the field
+            // opens in.
+            if self.folder_focus {
+                if field.has_focus() {
+                    self.folder_focus = false;
+                } else {
+                    field.request_focus();
+                }
+            }
+            // Take Enter and Escape out of the frame's input, so the pane
+            // that gets the keys next doesn't see them too.
+            let entered = field.lost_focus()
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            let escaped = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            if (ui.button("Set").clicked() || entered) && !text.trim().is_empty() {
+                let (asked, path) = (client.clone(), text.trim().to_string());
+                self.job(ui.ctx(), "chat-folder", move || {
+                    Done::Folder(asked.set_working_dir(&path), true)
+                });
+                done = true;
+            }
+            if ui.button("Cancel").clicked() || escaped {
+                done = true;
+            }
+        });
+        if done {
+            // Hand the keys back to the chat input. Left with no focus, the
+            // terminal pane would take it this frame and replay this
+            // frame's keys, the Enter among them, into its shell.
+            // The field has taken this frame's text; the input mustn't too.
+            ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+            ui.memory_mut(|m| m.request_focus(egui::Id::new("chat-input-text")));
+        } else {
+            self.folder_edit = Some(text);
+        }
     }
 
     fn status_line(&self, ui: &mut egui::Ui, engine: &Engine) {
@@ -1295,8 +1395,21 @@ impl ChatPane {
                         "ppxai's command list didn't load, so slash commands aren't sent: {why}"
                     )));
                 }
+                Done::Folder(Ok(path), say) => {
+                    if say {
+                        self.entries
+                            .push(Entry::Note(format!("Working directory set to {path}")));
+                    }
+                    self.folder = Some(path);
+                }
+                Done::Folder(Err(why), _) => {
+                    tracing::warn!("chat: working dir: {why}");
+                    self.entries
+                        .push(Entry::Error(format!("Working directory: {why}")));
+                }
                 Done::Command(name, outcome) => {
                     self.running = false;
+                    self.folder_stale = true;
                     match outcome {
                         Ok(outcome) => {
                             if let Some(on) = outcome.tools_enabled {
@@ -1728,6 +1841,15 @@ fn link_citations(markdown: &str, sources: &[ppxai::Source]) -> String {
 
 /// `/run`'s argument without one layer of outer quotes, as the web app
 /// strips them: quoting is allowed, never required.
+/// The folder tai-gui was started in, for the conversation to work in. None
+/// when that's the filesystem root, as for an app started from a launcher,
+/// which leaves ppxai's default.
+fn launch_dir() -> Option<String> {
+    let dir = std::env::current_dir().ok()?;
+    dir.parent()?;
+    Some(dir.to_string_lossy().into_owned())
+}
+
 fn unquote(text: &str) -> &str {
     let text = text.trim();
     for q in ['"', '\''] {
