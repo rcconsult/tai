@@ -492,12 +492,25 @@ fn event_line(event: &RunEvent) -> Option<String> {
     let detail = match event.kind.as_str() {
         "agent_beat" => return None,
         "tool_call" | "tool_denied" => s("tool").or_else(|| s("name")),
+        // `{tool, status: ok|error|cancelled, duration_s, result|error}`.
         "tool_result" => s("tool").map(|tool| {
-            let result = d["result"]
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| d["result"].to_string());
-            format!("{tool}: {}", one_line(&result, 80))
+            let text =
+                |v: &serde_json::Value| v.as_str().map_or_else(|| v.to_string(), str::to_string);
+            let status = s("status").filter(|st| st != "ok");
+            let body = match (&status, d.get("error"), d.get("result")) {
+                (Some(_), Some(e), _) if !e.is_null() => text(e),
+                (_, _, Some(r)) if !r.is_null() => text(r),
+                _ => String::new(),
+            };
+            let head = match status {
+                Some(status) => format!("{tool} {status}"),
+                None => tool,
+            };
+            if body.is_empty() {
+                head
+            } else {
+                format!("{head}: {}", one_line(&body, 80))
+            }
         }),
         "network_policy_allowed" | "network_policy_denied" => Some(format!(
             "{}{}",
@@ -563,6 +576,23 @@ mod tests {
             ))
             .as_deref(),
             Some("tool_result  read: a b")
+        );
+        assert_eq!(
+            event_line(&event(
+                "tool_result",
+                json!({"tool": "read_file", "status": "error", "duration_s": 0.1,
+                       "error": "no such file"})
+            ))
+            .as_deref(),
+            Some("tool_result  read_file error: no such file")
+        );
+        assert_eq!(
+            event_line(&event(
+                "tool_result",
+                json!({"tool": "spawn_subagent", "status": "cancelled", "duration_s": 2.0})
+            ))
+            .as_deref(),
+            Some("tool_result  spawn_subagent cancelled")
         );
         assert_eq!(
             event_line(&event("agent_run_sources", json!({"sources": [{}, {}]}))).as_deref(),
