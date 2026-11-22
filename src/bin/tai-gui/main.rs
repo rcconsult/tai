@@ -51,6 +51,7 @@ mod chat;
 mod engine;
 mod gpu;
 mod grammar;
+mod images;
 mod ppxai;
 mod runs;
 mod terminal;
@@ -76,6 +77,9 @@ enum Tab {
     Chat,
     Terminal,
     Preview,
+    /// An image opened from an answer or by `/show`, by its index in
+    /// `App::images`.
+    Image(usize),
 }
 
 impl Tab {
@@ -84,6 +88,7 @@ impl Tab {
             Tab::Chat => "Chat",
             Tab::Terminal => "Terminal",
             Tab::Preview => "Preview",
+            Tab::Image(_) => "Image",
         }
     }
 }
@@ -102,6 +107,7 @@ struct Panes<'a> {
     chat: &'a mut chat::ChatPane,
     runs: &'a mut runs::RunsPane,
     engine: &'a engine::Engine,
+    images: &'a [std::path::PathBuf],
     /// Tabs closed this frame; the app keeps them to show again.
     closed: Vec<Tab>,
 }
@@ -114,7 +120,16 @@ impl TabViewer for Panes<'_> {
     }
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
-        tab.title().into()
+        match tab {
+            Tab::Image(i) => self
+                .images
+                .get(*i)
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Image".into())
+                .into(),
+            tab => tab.title().into(),
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
@@ -125,6 +140,12 @@ impl TabViewer for Panes<'_> {
             }
             (Tab::Chat, _) => self.chat.ui(ui, self.engine),
             (Tab::Preview, _) => self.runs.ui(ui),
+            (Tab::Image(i), _) => match self.images.get(*i) {
+                Some(path) => images::show_file(ui, path),
+                None => {
+                    ui.label("No image.");
+                }
+            },
         }
     }
 
@@ -145,7 +166,10 @@ impl TabViewer for Panes<'_> {
     }
 
     fn on_close(&mut self, tab: &mut Tab) -> OnCloseResponse {
-        self.closed.push(*tab);
+        // An image tab just closes; answers and /show open it again.
+        if !matches!(tab, Tab::Image(_)) {
+            self.closed.push(*tab);
+        }
         OnCloseResponse::Close
     }
 }
@@ -227,9 +251,42 @@ struct App {
     chat: chat::ChatPane,
     runs: runs::RunsPane,
     engine: engine::Engine,
+    /// The images opened in tabs, which `Tab::Image` indexes.
+    images: Vec<std::path::PathBuf>,
 }
 
 impl App {
+    /// Show an image in the Preview stack, in its own tab, or bring its tab
+    /// forward if it's open already.
+    fn open_image(&mut self, path: std::path::PathBuf) {
+        let i = match self.images.iter().position(|p| *p == path) {
+            Some(i) => i,
+            None => {
+                self.images.push(path);
+                self.images.len() - 1
+            }
+        };
+        let tab = Tab::Image(i);
+        if self.dock.find_tab(&tab).is_none() {
+            let preview = self
+                .dock
+                .find_tab(&Tab::Preview)
+                .map(|p| egui_dock::NodePath {
+                    surface: p.surface,
+                    node: p.node,
+                })
+                .or_else(|| self.last_place.get(&Tab::Preview).copied());
+            match preview.and_then(|path| self.dock.leaf_mut(path).ok()) {
+                Some(leaf) => leaf.append_tab(tab),
+                None => self.dock.push_to_first_leaf(tab),
+            }
+        }
+        if let Some(path) = self.dock.find_tab(&tab) {
+            _ = self.dock.set_active_tab(path);
+        }
+        self.zoomed = None;
+    }
+
     /// Zoom the focused pane, or the first tab when none has focus yet;
     /// zoomed already, go back to the layout.
     fn toggle_zoom(&mut self) {
@@ -354,6 +411,7 @@ impl eframe::App for App {
             chat: &mut self.chat,
             runs: &mut self.runs,
             engine: &self.engine,
+            images: &self.images,
             closed: Vec::new(),
         };
         if let Some(mut tab) = self.zoomed {
@@ -382,6 +440,30 @@ impl eframe::App for App {
         for note in self.runs.take_notes() {
             self.chat.note(note);
         }
+        // Answers are model output, and a Markdown link can name any
+        // scheme: file:, or a Windows protocol handler. Only web links open
+        // (in the browser); an answer's "open in Preview" link opens its
+        // image here. The hover still shows the full target.
+        let mut open = images::take_open();
+        ui.ctx().output_mut(|o| {
+            o.commands.retain(|command| match command {
+                egui::OutputCommand::OpenUrl(link) => {
+                    if let Some(path) = link.url.strip_prefix(images::OPEN_SCHEME) {
+                        open.push(path.into());
+                        false
+                    } else if chat::is_web_link(&link.url) {
+                        true
+                    } else {
+                        tracing::warn!("not opening a non-web link: {}", link.url);
+                        false
+                    }
+                }
+                _ => true,
+            })
+        });
+        for path in open {
+            self.open_image(path);
+        }
         if let Some(stats) = &mut self.stats {
             stats.record(ui.ctx(), started.elapsed());
         }
@@ -400,7 +482,11 @@ impl eframe::App for App {
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // egui_commonmark asks egui_extras for image loaders, which
+                // tai-gui builds without: its own are in images.rs.
+                "info,egui_extras::loaders=error".into()
+            }),
         )
         .init();
 
@@ -482,6 +568,7 @@ fn main() -> eframe::Result {
                     priority: egui::epaint::text::FontPriority::Highest,
                 }],
             ));
+            images::install(&cc.egui_ctx);
             let terminal = fonts::Coverage::new()
                 .map_err(Into::into)
                 .and_then(|coverage| TerminalPane::new(coverage, cc.egui_ctx.clone()))
@@ -497,6 +584,7 @@ fn main() -> eframe::Result {
                 zoomed: None,
                 stats: FrameStats::new(),
                 engine: engine::Engine::start(cc.egui_ctx.clone()),
+                images: Vec::new(),
             }))
         }),
     );

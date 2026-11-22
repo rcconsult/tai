@@ -652,6 +652,7 @@ impl ChatPane {
                 for note in self.picker.notes.drain(..) {
                     self.entries.push(Entry::Note(note));
                 }
+                web_images_bar(ui);
                 if let Some(client) = &client {
                     self.controls(ui, client, busy);
                 }
@@ -759,19 +760,7 @@ impl ChatPane {
         });
 
         self.consent_dialog(ui.ctx());
-
-        // Answers are model output, and a Markdown link can name any
-        // scheme: file:, or a Windows protocol handler. Open only web links;
-        // the hover still shows the full target.
-        ui.ctx().output_mut(|o| {
-            o.commands.retain(|command| match command {
-                egui::OutputCommand::OpenUrl(open) if !is_web_link(&open.url) => {
-                    tracing::warn!("chat: not opening a non-web link: {}", open.url);
-                    false
-                }
-                _ => true,
-            })
-        });
+        // Which links open is decided for every pane in main.rs.
     }
 
     /// The Tools switch and Clear, as in the web app's header.
@@ -1423,6 +1412,7 @@ impl ChatPane {
                         self.entries
                             .push(Entry::Note(format!("Working directory set to {path}")));
                     }
+                    crate::images::set_workdir(Some(&path));
                     self.folder = Some(path);
                 }
                 Done::Folder(Err(why), _) => {
@@ -1441,6 +1431,12 @@ impl ChatPane {
                             if outcome.ok && RESETS_TRANSCRIPT.contains(&name.as_str()) {
                                 self.entries.clear();
                                 self.markdown = CommonMarkCache::default();
+                                crate::images::new_conversation();
+                            }
+                            // /show <image>: the web app opens it in its
+                            // right-hand panel; here, in the Preview stack.
+                            for path in &outcome.show_images {
+                                crate::images::request_open(path);
                             }
                             if outcome.error {
                                 self.entries.push(Entry::Error(outcome.markdown));
@@ -1666,8 +1662,12 @@ pub fn show_reply(
         }
         for (b, block) in reply.blocks.iter().enumerate() {
             ui.push_id(b, |ui| {
+                // Images resolved and gated first (images.rs).
+                let text = crate::images::prepare(&block.text);
                 let mut show = |ui: &mut egui::Ui| {
-                    CommonMarkViewer::new().show(ui, markdown, &block.text);
+                    CommonMarkViewer::new()
+                        .explicit_image_uri_scheme(true)
+                        .show(ui, markdown, &text);
                 };
                 if block.table {
                     // Only as wide as the pane; a wider table scrolls
@@ -1791,7 +1791,7 @@ fn blocks(markdown: &str) -> Vec<Block> {
 
 /// egui_commonmark's parser options (`parser_options` in
 /// egui_commonmark_backend 0.25), so tai reads answers as it draws them.
-fn markdown_options() -> pulldown_cmark::Options {
+pub(crate) fn markdown_options() -> pulldown_cmark::Options {
     use pulldown_cmark::Options;
     Options::ENABLE_TABLES
         | Options::ENABLE_TASKLISTS
@@ -2026,6 +2026,54 @@ fn source_name(source: &ppxai::Source) -> &str {
 }
 
 /// Whether a link is http or https, the only schemes the chat opens.
+/// The bar that asks whether this conversation's web images may load. It
+/// names their hosts, and which of them send a query with the request,
+/// since loading an image tells its host the URL, and an answer can put
+/// anything into it.
+fn web_images_bar(ui: &mut egui::Ui) {
+    let hosts = crate::images::pending_hosts();
+    if hosts.is_empty() {
+        return;
+    }
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        let names = hosts
+            .iter()
+            .map(|(host, query)| {
+                if *query {
+                    format!("{host} (with a query)")
+                } else {
+                    host.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.add(
+            egui::Label::new(format!(
+                "Answers here show web images from {names}. Loading one tells \
+                 its host the full address, which can carry data from this \
+                 conversation."
+            ))
+            .wrap(),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .button("Load web images")
+                .on_hover_text("For this conversation; /clear asks again")
+                .clicked()
+            {
+                crate::images::set_web(ui.ctx(), crate::images::Web::Allowed);
+            }
+            if ui
+                .button("Keep them as links")
+                .on_hover_text("For this conversation; /clear asks again")
+                .clicked()
+            {
+                crate::images::set_web(ui.ctx(), crate::images::Web::Denied);
+            }
+        });
+    });
+}
+
 pub fn is_web_link(url: &str) -> bool {
     let lower = url.trim_start().to_ascii_lowercase();
     lower.starts_with("https://") || lower.starts_with("http://")

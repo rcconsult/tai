@@ -556,6 +556,9 @@ pub struct CommandOutcome {
     pub markdown: String,
     /// `tools_enabled` from the envelope's `state_sync` events.
     pub tools_enabled: Option<bool>,
+    /// The files of the envelope's `show_image` side effects (`/show` of
+    /// an image; ppxai `commands/results.py`, `SideEffectKind`).
+    pub show_images: Vec<String>,
 }
 
 impl CommandOutcome {
@@ -572,6 +575,13 @@ impl CommandOutcome {
             error: v["result"]["status"] == "error",
             markdown: result_markdown(&v["result"]),
             tools_enabled,
+            show_images: v["side_effects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["kind"] == "show_image")
+                .filter_map(|e| e["filepath"].as_str().map(str::to_string))
+                .collect(),
         }
     }
 }
