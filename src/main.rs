@@ -83,6 +83,17 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// lost ("out of space, 16 bytes required", seen in tai-gui). Every key and
 /// mouse sequence fits in this.
 const ENCODE_ROOM: usize = 64;
+/// The modes that set the mouse encoder's tracking mode and format.
+const MOUSE_MODES: [Mode; 8] = [
+    Mode::X10_MOUSE,
+    Mode::NORMAL_MOUSE,
+    Mode::BUTTON_MOUSE,
+    Mode::ANY_MOUSE,
+    Mode::UTF8_MOUSE,
+    Mode::SGR_MOUSE,
+    Mode::URXVT_MOUSE,
+    Mode::SGR_PIXELS_MOUSE,
+];
 
 /// A material that copies a texture to the screen without blending.
 ///
@@ -1597,6 +1608,9 @@ struct Input<'alloc> {
     key_event: key::Event<'alloc>,
     mouse_encoder: mouse::Encoder<'alloc>,
     mouse_event: mouse::Event<'alloc>,
+    /// The mouse modes and size the encoder was last given; setting either
+    /// makes it forget the last reported cell.
+    mouse_encoder_for: Option<([bool; MOUSE_MODES.len()], mouse::EncoderSize)>,
     response: Vec<u8>,
     selection: SelectionState<'alloc>,
     /// App shortcuts pressed this frame, run by the main loop.
@@ -1628,6 +1642,7 @@ impl<'alloc> Input<'alloc> {
             key_event: key::Event::new()?,
             mouse_encoder: mouse::Encoder::new()?,
             mouse_event: mouse::Event::new()?,
+            mouse_encoder_for: None,
             response: Vec::with_capacity(64),
             selection: SelectionState::new()?,
             actions: Vec::new(),
@@ -1998,57 +2013,81 @@ impl<'alloc> Input<'alloc> {
 
         let (cell_width, cell_height) = dims.cell_pixels();
         let padding = (PADDING * scale) as u32;
-        self.mouse_encoder
-            // Sync encoder tracking mode and format from terminal state so
-            // mode changes (e.g. applications enabling SGR mouse reporting)
-            // are honoured automatically.
-            .set_options_from_terminal(terminal)
-            // Provide the encoder with the current terminal geometry so it
-            // can convert pixel positions to cell coordinates.
-            .set_size(mouse::EncoderSize {
-                screen_width: (dims.window_width * scale) as u32,
-                screen_height: (dims.window_height * scale) as u32,
-                cell_width,
-                cell_height,
-                padding_top: padding,
-                padding_bottom: padding,
-                padding_left: padding,
-                padding_right: padding,
-            })?
-            .set_any_button_pressed(any_pressed)
-            // Enable motion deduplication so the encoder suppresses redundant
-            // motion events within the same cell.
-            .set_track_last_cell(true);
-
-        // Check each mouse button for press/release events.
-        for (mb, btn) in Self::ALL_MOUSE_BUTTONS {
-            let action = if is_mouse_button_released(mb) {
-                if self.selection.is_selecting(terminal)? {
-                    self.selection.on_release(terminal, dims)?;
-                    continue;
-                }
-                mouse::Action::Release
-            } else if is_mouse_button_pressed(mb) {
-                if mb == MouseButton::Left && Self::selection_allowed_with_mods(terminal, mods)? {
-                    self.selection.on_click(terminal, x, y, dims)?;
-                    continue;
-                }
-                mouse::Action::Press
-            } else {
-                continue;
-            };
-
-            self.mouse_event.set_action(action).set_button(Some(btn));
-            self.response.reserve(ENCODE_ROOM);
+        // The encoder's tracking mode and format follow the terminal's,
+        // and it needs the geometry to find cells. Both are set only when
+        // they change: setting either makes the encoder forget the last
+        // cell (src/terminal/c/mouse_encode.zig at 108cacb1), and every
+        // move within a cell was then reported.
+        let size = mouse::EncoderSize {
+            screen_width: (dims.window_width * scale) as u32,
+            screen_height: (dims.window_height * scale) as u32,
+            cell_width,
+            cell_height,
+            padding_top: padding,
+            padding_bottom: padding,
+            padding_left: padding,
+            padding_right: padding,
+        };
+        let mut modes = [false; MOUSE_MODES.len()];
+        for (on, mode) in modes.iter_mut().zip(MOUSE_MODES) {
+            *on = terminal.mode(mode)?;
+        }
+        if self.mouse_encoder_for != Some((modes, size)) {
             self.mouse_encoder
-                .encode_to_vec(&self.mouse_event, &mut self.response)?;
+                .set_options_from_terminal(terminal)
+                .set_size(size)?
+                // Motion within the cell reported last is dropped.
+                .set_track_last_cell(true);
+            self.mouse_encoder_for = Some((modes, size));
+        }
+        self.mouse_encoder.set_any_button_pressed(any_pressed);
+
+        // Each button's press and release this frame. A fast click or a
+        // touchpad tap presses and releases within one frame, and both
+        // count: the press first, unless the button is down again, when a
+        // release came before a new press.
+        for (mb, btn) in Self::ALL_MOUSE_BUTTONS {
+            let actions: &[mouse::Action] =
+                match (is_mouse_button_pressed(mb), is_mouse_button_released(mb)) {
+                    (true, true) if is_mouse_button_down(mb) => {
+                        &[mouse::Action::Release, mouse::Action::Press]
+                    }
+                    (true, true) => &[mouse::Action::Press, mouse::Action::Release],
+                    (true, false) => &[mouse::Action::Press],
+                    (false, true) => &[mouse::Action::Release],
+                    (false, false) => continue,
+                };
+            for &action in actions {
+                match action {
+                    // The release of a press that started a selection ends
+                    // it rather than reaching the program.
+                    mouse::Action::Release
+                        if mb == MouseButton::Left && self.selection.is_selecting() =>
+                    {
+                        self.selection.on_release(terminal, dims)?;
+                        continue;
+                    }
+                    mouse::Action::Press
+                        if mb == MouseButton::Left
+                            && Self::selection_allowed_with_mods(terminal, mods)? =>
+                    {
+                        self.selection.on_click(terminal, x, y, dims)?;
+                        continue;
+                    }
+                    _ => {}
+                }
+                self.mouse_event.set_action(action).set_button(Some(btn));
+                self.response.reserve(ENCODE_ROOM);
+                self.mouse_encoder
+                    .encode_to_vec(&self.mouse_event, &mut self.response)?;
+            }
         }
 
         // Mouse motion — send a motion event with whatever button is held
         // (or no button for pure motion in any-event tracking mode).
         let delta = mouse_delta_position();
         if delta.x.abs() > 1e-6 || delta.y.abs() > 1e-6 {
-            if self.selection.is_selecting(terminal)? {
+            if self.selection.is_selecting() {
                 self.selection.on_drag(terminal, x, y, dims, mods)?;
                 return Ok(());
             }
@@ -2301,6 +2340,8 @@ struct SelectionState<'alloc> {
     start_time: Instant,
     /// The cursor last set, so it is only set again when it changes.
     cursor: Cell<Option<CursorIcon>>,
+    /// A left press started a selection and hasn't been released yet.
+    held: bool,
 }
 
 impl SelectionState<'_> {
@@ -2315,12 +2356,17 @@ impl SelectionState<'_> {
             drag_event: DragEvent::new()?,
             start_time: Instant::now(),
             cursor: Cell::new(None),
+            held: false,
         })
     }
 
-    /// Whether we currently have a selection and the mouse is kept down.
-    fn is_selecting(&self, terminal: &Terminal<'_, '_>) -> Result<bool> {
-        Ok(self.gesture.click_count(terminal)? > 0 && is_mouse_button_down(MouseButton::Left))
+    /// Whether a left press started a selection that its release hasn't
+    /// ended. Asking whether the left button is down, as this did, was
+    /// false in the release's own frame, so the release went to the program
+    /// and the gesture was never ended; every later left drag then counted
+    /// as a selection and its motion didn't reach the program.
+    fn is_selecting(&self) -> bool {
+        self.held
     }
 
     /// Update the selection state upon a left click.
@@ -2342,6 +2388,7 @@ impl SelectionState<'_> {
             .apply(&mut self.gesture, terminal, grid_ref)?;
 
         terminal.set_selection(selection.as_ref())?;
+        self.held = true;
         Ok(())
     }
 
@@ -2353,6 +2400,7 @@ impl SelectionState<'_> {
 
         self.release_event
             .apply(&mut self.gesture, terminal, grid_ref)?;
+        self.held = false;
         Ok(())
     }
 
@@ -2395,7 +2443,7 @@ impl SelectionState<'_> {
         input_enabled: bool,
     ) -> Result<()> {
         let selectable = input_enabled
-            && (self.is_selecting(terminal)? || Input::mouse_over_selectable_text(terminal, dims)?);
+            && (self.is_selecting() || Input::mouse_over_selectable_text(terminal, dims)?);
         let rectangle = Input::selection_rectangle_mods(Input::keyboard_mods());
 
         let cursor = if selectable {
