@@ -83,6 +83,21 @@ impl Pty {
         let locale = crate::locale::child_env();
         // Other terminals' identity variables to drop (ADR 0005).
         let foreign = crate::identity::foreign_vars(std::env::vars_os());
+        // Determine the user's preferred shell. We try $SHELL first (the
+        // standard convention), then fall back to the passwd entry, and
+        // finally to /bin/sh if nothing else is available. Chosen before
+        // forking, so the shell integration's scripts can be written.
+        let shell = match std::env::var_os("SHELL") {
+            Some(shell) if !shell.is_empty() => PathBuf::from(shell),
+            _ => match unistd::User::from_uid(unistd::getuid()) {
+                Ok(Some(user)) => user.shell,
+                _ => PathBuf::from("/bin/sh"),
+            },
+        };
+        // On macOS, start a login shell ("-zsh") like Terminal.app does,
+        // so ~/.zprofile and path_helper set up PATH. The shell
+        // integration may start it otherwise (src/shell_integration.rs).
+        let launch = crate::shell_integration::launch(&shell, cfg!(target_os = "macos"));
 
         // forkpty() combines openpty + fork + login_tty into one call.
         // In the child it sets up the slave side as stdin/stdout/stderr.
@@ -120,24 +135,12 @@ impl Pty {
                     None,
                 );
 
-                // Determine the user's preferred shell. We try $SHELL first (the
-                // standard convention), then fall back to the passwd entry, and
-                // finally to /bin/sh if nothing else is available.
-                let shell = match std::env::var_os("SHELL") {
-                    Some(shell) if !shell.is_empty() => PathBuf::from(shell),
-                    _ => match unistd::User::from_uid(unistd::getuid()) {
-                        Ok(Some(user)) => user.shell,
-                        _ => PathBuf::from("/bin/sh"),
-                    },
-                };
-
                 // Extract just the program name for argv[0] (e.g. "/bin/zsh" -> "zsh").
                 let name = shell.file_name().unwrap_or(shell.as_os_str());
 
-                // On macOS, start a login shell ("-zsh") like Terminal.app does,
-                // so ~/.zprofile and path_helper set up PATH.
+                // "-zsh" for a login shell.
                 let mut arg0 = std::ffi::OsString::new();
-                if cfg!(target_os = "macos") {
+                if launch.login {
                     arg0.push("-");
                 }
                 arg0.push(name);
@@ -157,6 +160,9 @@ impl Pty {
                     .envs(crate::identity::vars())
                     // A UTF-8 character type; see src/locale.rs.
                     .envs(locale.iter().map(|(k, v)| (k, v)))
+                    // The shell integration's, last.
+                    .envs(launch.env.iter().map(|(k, v)| (k, v)))
+                    .args(&launch.args)
                     .arg0(arg0)
                     .exec();
 

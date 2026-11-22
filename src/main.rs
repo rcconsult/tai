@@ -70,6 +70,9 @@ mod placeholders;
 mod pty;
 mod pty_input;
 mod selection;
+// tai starts shells with it; only tai-gui reads the folder they report.
+#[allow(dead_code)]
+mod shell_integration;
 mod shortcuts;
 mod sixel;
 
