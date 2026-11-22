@@ -6,12 +6,11 @@
 //!   streams in. ppxai keeps the history per engine slot. The model's
 //!   reasoning shows in a collapsed "Thought process", and tool calls in a
 //!   collapsed list of steps.
-//! - `/run <prompt>` asks one-shot (`/v1/oneshot`), outside the
-//!   conversation and grounded on the web when ppxai is set to retrieve;
-//!   its `[n]` markers link to the sources it lists. The web app sends
-//!   `/run` to `/v1/agent/run`, the same one-shot as a background run, but
-//!   that route doesn't return the sources yet (ppxai is reworking
-//!   citations).
+//! - An answer's `[n]` markers link to the sources ppxai lists for the
+//!   turn (`stream_end`'s `sources`, ppxai ADR 0019), shown under it.
+//! - `/run <prompt>` starts a one-shot background run (`/v1/agent/run`),
+//!   as the web app does, and opens it in the run pane (`runs.rs`); `/run
+//!   ls`, `get`, `watch`, `cancel` and `collect` work on runs by id.
 //! - "Tools: off/on" turns the conversation's tools on (`POST /tools`).
 //!   ppxai starts a slot with them off. Each file edit or risky command
 //!   then asks in a dialog: Deny, Never for this, Always allow or Allow.
@@ -67,7 +66,7 @@ enum Entry {
 
 /// An answer as the pane shows it.
 #[derive(Clone, Default)]
-struct Reply {
+pub struct Reply {
     reasoning: String,
     tools: Vec<ToolStep>,
     /// What the model said between tool steps, before its answer.
@@ -82,14 +81,27 @@ struct Reply {
     meta: String,
 }
 
+impl Reply {
+    /// Markdown with the sources its `[n]` markers cite, and a line under
+    /// it: a run's result, as the run pane shows it.
+    pub fn markdown(text: &str, sources: Vec<ppxai::Source>, meta: String) -> Self {
+        let text = link_citations(text, &sources);
+        Self {
+            blocks: blocks(&text),
+            text,
+            sources,
+            meta,
+            ..Self::default()
+        }
+    }
+}
+
 pub struct ChatPane {
     /// The engine slot this pane's calls go through, made once the
     /// engine is ready.
     client: Option<Client>,
     entries: Vec<Entry>,
     input: String,
-    /// The `/run` answer in flight, filled by its thread.
-    pending: Option<(Instant, Arc<Mutex<Option<Entry>>>)>,
     /// The conversation's answer in flight.
     turn: Option<Turn>,
     /// Whether the conversation's tools are on; None until ppxai says.
@@ -100,6 +112,8 @@ pub struct ChatPane {
     roster: Option<ppxai::Roster>,
     /// A slash command running on the server.
     running: bool,
+    /// Runs to open in the run pane; the app hands them over.
+    opened: Vec<crate::runs::Open>,
     /// Whether the input had the focus last frame. egui drops the focus on
     /// Escape before any widget sees the key (egui 0.36
     /// `memory/mod.rs`), so Escape can't ask whether it has it now.
@@ -146,12 +160,17 @@ impl Live {
                 self.reply.text.push_str(&text);
             }
             ChatEvent::Reasoning(text) => self.reply.reasoning.push_str(&text),
-            ChatEvent::End { text, tokens } => {
+            ChatEvent::End {
+                text,
+                tokens,
+                sources,
+            } => {
                 // The whole answer, as ppxai has it.
                 if !text.is_empty() {
                     self.reply.text = text;
                 }
                 self.tokens = tokens;
+                self.reply.sources = sources;
                 self.ended = true;
             }
             ChatEvent::Tool(step) => self.reply.tools.push(step),
@@ -174,6 +193,13 @@ impl Live {
 
 /// A finished call the pane shows the outcome of.
 enum Done {
+    /// A run started from `/run`: its task and its id.
+    RunStarted(String, Result<String, String>),
+    /// `/run ls`, as Markdown.
+    Listed(Result<String, String>),
+    /// `/run collect`, `/run cancel`: the run's id and what to say about
+    /// it.
+    RunAction(String, Result<String, String>),
     Tools(Result<bool, String>),
     Roster(Result<ppxai::Roster, String>),
     /// A slash command, by its roster name.
@@ -223,7 +249,7 @@ struct Picker {
 }
 
 /// Where a thread's result lands; the UI takes it from there.
-type Slot<T> = Arc<Mutex<Option<T>>>;
+pub type Slot<T> = Arc<Mutex<Option<T>>>;
 
 /// A model switch in flight: ppxai's answer, how many messages it cleared.
 struct Switch {
@@ -407,7 +433,7 @@ fn load(
 
 /// Run `f` on a thread of its own and repaint when it's done: the slot
 /// its result lands in.
-fn spawn<T: Send + 'static>(
+pub fn spawn<T: Send + 'static>(
     ctx: &egui::Context,
     name: &str,
     f: impl FnOnce() -> T + Send + 'static,
@@ -511,18 +537,28 @@ impl ChatFonts {
 }
 
 impl ChatPane {
+    /// The runs to open in the run pane since the last call.
+    pub fn take_opened(&mut self) -> Vec<crate::runs::Open> {
+        std::mem::take(&mut self.opened)
+    }
+
+    /// A line in the transcript, such as a run pane's "collected".
+    pub fn note(&mut self, text: String) {
+        self.entries.push(Entry::Note(text));
+    }
+
     pub fn new() -> Self {
         Self {
             client: None,
             entries: Vec::new(),
             input: String::new(),
-            pending: None,
             turn: None,
             tools: None,
             jobs: Vec::new(),
             roster: None,
             running: false,
             input_focused: false,
+            opened: Vec::new(),
             picker: Picker::default(),
             markdown: CommonMarkCache::default(),
             fonts: ChatFonts::default(),
@@ -530,7 +566,6 @@ impl ChatPane {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, engine: &Engine) {
-        self.collect_answer(ui.ctx());
         self.collect_turn(ui.ctx());
         self.collect_jobs();
         if self.client.is_none()
@@ -551,7 +586,7 @@ impl ChatPane {
             }
         }
         let client = self.client.clone();
-        let busy = self.pending.is_some() || self.turn.is_some() || self.running;
+        let busy = self.turn.is_some() || self.running;
 
         egui::Panel::bottom("chat-input")
             .resizable(false)
@@ -592,7 +627,7 @@ impl ChatPane {
                         } else if busy {
                             "Answering… (Esc stops)"
                         } else {
-                            "Ask… (Enter sends, Shift+Enter for a new line, /run <prompt> for one-shot)"
+                            "Ask… (Enter sends, Shift+Enter for a new line, /run <prompt> runs one-shot)"
                         }),
                 );
                 self.input_focused = typed.has_focus();
@@ -618,8 +653,8 @@ impl ChatPane {
                 .show(ui, |ui| {
                     if self.entries.is_empty() && self.turn.is_none() {
                         ui.weak(
-                            "A conversation with ppxai. /run <prompt> asks one-shot, \
-                             outside the conversation.",
+                            "A conversation with ppxai. /run <prompt> asks one-shot in \
+                             the background and shows the run in the Preview pane.",
                         );
                     }
                     for (n, entry) in self.entries.iter().enumerate() {
@@ -663,15 +698,6 @@ impl ChatPane {
                     }
                     if stop {
                         self.stop(ui.ctx());
-                    }
-                    if let Some((since, _)) = &self.pending {
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak(format!("{:.0} s", since.elapsed().as_secs_f32()));
-                        });
-                        // Keep the timer moving.
-                        ui.ctx().request_repaint_after(Duration::from_millis(500));
                     }
                 });
         });
@@ -804,20 +830,63 @@ impl ChatPane {
         ctx: &egui::Context,
     ) {
         match action {
-            // `/run <prompt>` asks one-shot. Its lifecycle verbs (`ls`,
-            // `get` and the rest) need run views tai-gui doesn't have yet.
+            // `/run <prompt>` starts a one-shot run in the background, with
+            // the picker's provider and model, as the web app's
+            // RunController does; a lifecycle verb works on a run by id.
             "run.controller" => {
-                let verb = args.split_whitespace().next().unwrap_or_default();
-                if args.is_empty() {
-                    self.entries
-                        .push(Entry::Error(format!("Usage: {}", spec.usage)));
-                } else if spec.subcommands.iter().any(|s| s == verb) {
-                    self.entries.push(Entry::Error(format!(
-                        "/{} {verb} isn't in tai-gui yet; /{} <prompt> is",
-                        spec.name, spec.name
-                    )));
-                } else {
-                    self.oneshot(args.to_string(), client, ctx.clone());
+                let mut words = args.split_whitespace();
+                let verb = words.next().unwrap_or_default();
+                let id = words.next().map(str::to_string);
+                let is_verb = spec.subcommands.iter().any(|s| s == verb);
+                match (verb, id) {
+                    ("", _) => self
+                        .entries
+                        .push(Entry::Error(format!("Usage: {}", spec.usage))),
+                    ("help", _) => self.entries.push(Entry::Note(format!(
+                        "{}. Usage: {}",
+                        spec.description, spec.usage
+                    ))),
+                    ("ls", _) => self.job(ctx, "chat-runs", move || {
+                        Done::Listed(
+                            client
+                                .runs(&ppxai::RunFilter {
+                                    kind: Some("oneshot"),
+                                    ..Default::default()
+                                })
+                                .map(|runs| runs_table(&runs)),
+                        )
+                    }),
+                    ("get" | "watch", Some(id)) => {
+                        self.opened.push(crate::runs::Open { id, client });
+                    }
+                    ("cancel", Some(id)) => self.job(ctx, "chat-run-cancel", move || {
+                        let said = client
+                            .cancel_run(&id)
+                            .map(|()| format!("Asked run {id} to stop"));
+                        Done::RunAction(id, said)
+                    }),
+                    ("collect", Some(id)) => self.job(ctx, "chat-run-collect", move || {
+                        let said = crate::runs::collect_run(&client, &id)
+                            .map(|()| format!("Run {id}'s result is now in the conversation"));
+                        Done::RunAction(id, said)
+                    }),
+                    (verb, None) if is_verb => self.entries.push(Entry::Error(format!(
+                        "/{} {verb} needs a run id. Usage: {}",
+                        spec.name, spec.usage
+                    ))),
+                    (verb, _) if is_verb => self.entries.push(Entry::Error(format!(
+                        "/{} {verb} isn't in tai-gui yet",
+                        spec.name
+                    ))),
+                    _ => {
+                        let task = unquote(args).to_string();
+                        let (provider, model) = self.picker.choice();
+                        let started = task.clone();
+                        self.job(ctx, "chat-run", move || {
+                            let id = client.start_run(&task, provider.as_deref(), model.as_deref());
+                            Done::RunStarted(started, id)
+                        });
+                    }
                 }
             }
             other => tracing::error!("chat: {other} is in CLIENT_ACTIONS but not handled"),
@@ -1045,6 +1114,37 @@ impl ChatPane {
                     self.entries.push(Entry::Error(format!("Tools: {why}")));
                     self.tools = Some(false);
                 }
+                Done::RunStarted(task, Ok(id)) => {
+                    let mut short: String = task.chars().take(60).collect();
+                    if short.len() < task.len() {
+                        short.push('…');
+                    }
+                    self.entries.push(Entry::Note(format!(
+                        "Run {id} started, shown in the Preview pane: {short}"
+                    )));
+                    if let Some(client) = self.client.clone() {
+                        self.opened.push(crate::runs::Open { id, client });
+                    }
+                }
+                Done::RunStarted(_, Err(why)) => self
+                    .entries
+                    .push(Entry::Error(format!("The run didn't start: {why}"))),
+                Done::Listed(Ok(table)) => self.entries.push(Entry::Answer(Reply::markdown(
+                    &table,
+                    Vec::new(),
+                    String::new(),
+                ))),
+                Done::Listed(Err(why)) | Done::RunAction(_, Err(why)) => {
+                    self.entries.push(Entry::Error(why))
+                }
+                Done::RunAction(id, Ok(text)) => {
+                    self.entries.push(Entry::Note(text));
+                    // Show the run as it is now: opening it in the run pane
+                    // looks at it again.
+                    if let Some(client) = self.client.clone() {
+                        self.opened.push(crate::runs::Open { id, client });
+                    }
+                }
                 Done::Roster(Ok(roster)) => self.roster = Some(roster),
                 Done::Roster(Err(why)) => {
                     tracing::warn!("chat: commands: {why}");
@@ -1082,51 +1182,6 @@ impl ChatPane {
                     self.entries.push(Entry::Error(why));
                 }
             }
-        }
-    }
-
-    fn oneshot(&mut self, prompt: String, client: Client, ctx: egui::Context) {
-        let slot = Arc::new(Mutex::new(None));
-        self.pending = Some((Instant::now(), Arc::clone(&slot)));
-        let (provider, model) = self.picker.choice();
-        let spawned = std::thread::Builder::new()
-            .name("oneshot".into())
-            .spawn(move || {
-                let entry = match client.oneshot(&prompt, provider.as_deref(), model.as_deref()) {
-                    Ok(answer) => entry(answer),
-                    Err(e) => Entry::Error(e),
-                };
-                if let Ok(mut slot) = slot.lock() {
-                    *slot = Some(entry);
-                }
-                ctx.request_repaint();
-            });
-        if let Err(e) = spawned {
-            self.pending = None;
-            self.entries
-                .push(Entry::Error(format!("couldn't start a thread: {e}")));
-        }
-    }
-
-    fn collect_answer(&mut self, ctx: &egui::Context) {
-        let done = self
-            .pending
-            .as_ref()
-            .and_then(|(_, slot)| slot.lock().ok()?.take());
-        if let Some(entry) = done {
-            self.pending = None;
-            match &entry {
-                Entry::Answer(reply) => {
-                    self.fonts.cover(ctx, &reply.text);
-                    for title in reply.sources.iter().filter_map(|s| s.title.as_deref()) {
-                        self.fonts.cover(ctx, title);
-                    }
-                }
-                Entry::Prompt(text) | Entry::Note(text) | Entry::Error(text) => {
-                    self.fonts.cover(ctx, text)
-                }
-            }
-            self.entries.push(entry);
         }
     }
 
@@ -1219,6 +1274,7 @@ fn finish(live: Live, stopped: bool, provider: Option<&str>) -> Vec<(Entry, Opti
             meta.push(format!("{tokens} tokens"));
         }
         reply.meta = meta.join(" · ");
+        reply.text = link_citations(&reply.text, &reply.sources);
         reply.blocks = blocks(&reply.text);
         let text = format!("{}{}{}", reply.reasoning, reply.prose.concat(), reply.text);
         out.push((Entry::Answer(reply), Some(text)));
@@ -1277,7 +1333,7 @@ fn redact(spec: Option<&ppxai::CommandSpec>, input: &str) -> String {
 
 /// One answer: its reasoning and tool steps collapsed, the Markdown, the
 /// sources it cites, the engine's notes, and the line naming the model.
-fn show_reply(
+pub fn show_reply(
     ui: &mut egui::Ui,
     markdown: &mut CommonMarkCache,
     n: usize,
@@ -1346,13 +1402,19 @@ fn show_reply(
             });
         }
         if !reply.sources.is_empty() {
-            // Numbered as the answer's `[n]` markers. The hover shows the
-            // URL; only web links open.
+            // Numbered as the answer's `[n]` markers and named as the web
+            // app's list names them (`web/shared/sources-render.js`): the
+            // title, else the host. The hover shows the URL; only web links
+            // are links.
             ui.add_space(2.0);
             ui.weak("Sources");
-            for (i, source) in reply.sources.iter().enumerate() {
-                let name = source.title.as_deref().unwrap_or(&source.url);
-                ui.hyperlink_to(format!("[{}] {name}", i + 1), &source.url);
+            for source in &reply.sources {
+                let label = format!("[{}] {}", source.n, source_name(source));
+                if is_web_link(&source.url) {
+                    ui.hyperlink_to(label, &source.url);
+                } else {
+                    ui.label(label).on_hover_text(&source.url);
+                }
             }
         }
         for note in &reply.notes {
@@ -1459,8 +1521,8 @@ fn markdown_options() -> pulldown_cmark::Options {
         | Options::ENABLE_DEFINITION_LIST
 }
 
-/// Turn a grounded answer's bare `[n]` markers into links to the nth
-/// source, so a click opens what it cites. Markers in code, inside a link
+/// Turn an answer's bare `[n]` markers into links to the source numbered
+/// `n`, so a click opens what it cites. Markers in code, inside a link
 /// or HTML, escaped, or followed by `(` or `:` (already a link, or a
 /// reference definition) stay as written, and so does a number with no
 /// web source.
@@ -1503,7 +1565,7 @@ fn link_citations(markdown: &str, sources: &[ppxai::Source]) -> String {
                 .filter(|()| bytes.get(close) == Some(&b']'))
                 .filter(|()| !matches!(bytes.get(close + 1), Some(b'(' | b':')))
                 .and_then(|()| markdown[i + 1..close].parse::<usize>().ok())
-                .and_then(|n| sources.get(n.checked_sub(1)?))
+                .and_then(|n| sources.iter().find(|s| s.n == n))
                 .map(|source| source.url.as_str())
                 .filter(|url| is_web_link(url) && !url.contains(['<', '>', ' ', '\n']));
             if let Some(url) = url {
@@ -1521,36 +1583,57 @@ fn link_citations(markdown: &str, sources: &[ppxai::Source]) -> String {
     out
 }
 
-/// A `/run` answer, with a line naming the model and the tokens used.
-fn entry(answer: ppxai::Answer) -> Entry {
-    let mut meta = format!("{} · {}", answer.provider, answer.model);
-    if let Some(total) = answer.total_tokens {
-        meta.push_str(&format!(" · {total} tokens"));
+/// `/run`'s argument without one layer of outer quotes, as the web app
+/// strips them: quoting is allowed, never required.
+fn unquote(text: &str) -> &str {
+    let text = text.trim();
+    for q in ['"', '\''] {
+        if text.len() > 1 && text.starts_with(q) && text.ends_with(q) {
+            return text[1..text.len() - 1].trim();
+        }
     }
-    if let Some(reason) = answer.finish_reason.as_deref().and_then(finish_reason) {
-        meta.push_str(&format!(" · finished: {reason}"));
-    }
-    let text = link_citations(&answer.content, &answer.sources);
-    Entry::Answer(Reply {
-        blocks: blocks(&text),
-        sources: answer.sources,
-        text,
-        meta,
-        ..Reply::default()
-    })
+    text
 }
 
-/// Why an answer ended, or `None` when it ended normally. ppxai passes the
-/// provider's own value through (bac85e6e): OpenAI's `stop`, Anthropic's
-/// `end_turn`, and Gemini's enum as `str()` prints it, `FinishReason.STOP`
-/// (`engine/providers/gemini.py`).
-fn finish_reason(raw: &str) -> Option<String> {
-    let reason = raw.rsplit('.').next().unwrap_or(raw).to_ascii_lowercase();
-    (!matches!(reason.as_str(), "stop" | "end_turn")).then_some(reason)
+/// `/run ls` as a Markdown table, newest first as ppxai lists them.
+fn runs_table(runs: &[ppxai::Run]) -> String {
+    if runs.is_empty() {
+        return "No one-shot runs.".into();
+    }
+    let cell = |text: &str| {
+        let short: String = text.chars().take(60).collect();
+        short.replace('|', "\\|").replace('\n', " ")
+    };
+    let mut table = String::from("| Run | Status | Task |\n|---|---|---|\n");
+    for run in runs {
+        table.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            run.run_id,
+            run.status,
+            cell(&run.task)
+        ));
+    }
+    table
+}
+
+/// What a source is called in the list: its title, else its URL's host
+/// without `www.`, else the URL.
+fn source_name(source: &ppxai::Source) -> &str {
+    if let Some(title) = source.title.as_deref().filter(|t| !t.trim().is_empty()) {
+        return title;
+    }
+    let rest = source
+        .url
+        .split_once("://")
+        .map_or(source.url.as_str(), |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    if host.is_empty() { &source.url } else { host }
 }
 
 /// Whether a link is http or https, the only schemes the chat opens.
-fn is_web_link(url: &str) -> bool {
+pub fn is_web_link(url: &str) -> bool {
     let lower = url.trim_start().to_ascii_lowercase();
     lower.starts_with("https://") || lower.starts_with("http://")
 }
@@ -1558,10 +1641,10 @@ fn is_web_link(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, Entry, Live, Reply, blocks, command, common_prefix, entry, finish, is_web_link,
-        link_citations, redact, tool_summary, truncate,
+        Block, Entry, Live, blocks, command, common_prefix, finish, is_web_link, link_citations,
+        redact, source_name, tool_summary, truncate, unquote,
     };
-    use crate::ppxai::{Answer, ChatEvent, CommandSpec, Source, ToolKind, ToolStep};
+    use crate::ppxai::{ChatEvent, CommandSpec, Source, ToolKind, ToolStep};
 
     fn step(kind: ToolKind, tool: &str) -> ToolStep {
         ToolStep {
@@ -1594,6 +1677,7 @@ mod tests {
             ChatEvent::End {
                 text: "Hello!".into(),
                 tokens: Some(9),
+                sources: Vec::new(),
             },
         ]);
         assert_eq!(l.activity, None);
@@ -1635,6 +1719,7 @@ mod tests {
                 ChatEvent::End {
                     text: String::new(),
                     tokens: None,
+                    sources: Vec::new(),
                 },
             ]),
             false,
@@ -1717,10 +1802,12 @@ mod tests {
     fn citation_markers_link_to_their_sources() {
         let sources = [
             Source {
+                n: 1,
                 url: "https://a.example/x".into(),
                 title: Some("a.example".into()),
             },
             Source {
+                n: 2,
                 url: "file:///etc/passwd".into(),
                 title: None,
             },
@@ -1781,46 +1868,66 @@ mod tests {
         assert!(!is_web_link("httpx://example.com"));
     }
 
-    fn answer(tokens: Option<u64>, finish: &str) -> Answer {
-        Answer {
-            content: "**hi**".into(),
-            provider: "p1".into(),
-            model: "m1".into(),
-            total_tokens: tokens,
-            finish_reason: Some(finish.into()),
-            sources: Vec::new(),
-        }
+    #[test]
+    fn a_chat_answer_links_the_sources_its_turn_cites() {
+        let source = |n: usize, url: &str| Source {
+            n,
+            url: url.into(),
+            title: None,
+        };
+        let out = finish(
+            live(vec![ChatEvent::End {
+                text: "Two [2] and three [3].".into(),
+                tokens: None,
+                sources: vec![
+                    source(2, "https://b.example/"),
+                    source(3, "https://c.example/"),
+                ],
+            }]),
+            false,
+            None,
+        );
+        let Entry::Answer(reply) = &out[0].0 else {
+            panic!("not an answer");
+        };
+        // Found by `n`, not by place in the list.
+        assert!(
+            reply.text.contains(r"[\[2\]](<https://b.example/>)"),
+            "{}",
+            reply.text
+        );
+        assert!(
+            reply.text.contains(r"[\[3\]](<https://c.example/>)"),
+            "{}",
+            reply.text
+        );
+        assert_eq!(reply.sources.len(), 2);
     }
 
     #[test]
-    fn an_answer_names_provider_model_and_tokens() {
-        let Entry::Answer(Reply { text, meta, .. }) = entry(answer(Some(3), "stop")) else {
-            panic!("not an answer");
+    fn a_source_is_named_by_its_title_or_its_host() {
+        let named = |url: &str, title: Option<&str>| {
+            source_name(&Source {
+                n: 1,
+                url: url.into(),
+                title: title.map(str::to_string),
+            })
+            .to_string()
         };
-        assert_eq!(text, "**hi**");
-        assert_eq!(meta, "p1 · m1 · 3 tokens");
+        assert_eq!(named("https://www.uefa.com/x?y", None), "uefa.com");
+        assert_eq!(
+            named("https://user@a.example:8/p", Some(" ")),
+            "a.example:8"
+        );
+        assert_eq!(named("https://a.example/", Some("A page")), "A page");
+        assert_eq!(named("not a url", None), "not a url");
     }
 
     #[test]
-    fn a_cut_off_answer_says_why() {
-        let Entry::Answer(Reply { meta, .. }) = entry(answer(None, "length")) else {
-            panic!("not an answer");
-        };
-        assert_eq!(meta, "p1 · m1 · finished: length");
-    }
-
-    #[test]
-    fn a_normal_end_is_not_shown_in_any_provider_spelling() {
-        for normal in ["stop", "end_turn", "FinishReason.STOP"] {
-            let Entry::Answer(Reply { meta, .. }) = entry(answer(None, normal)) else {
-                panic!("not an answer");
-            };
-            assert_eq!(meta, "p1 · m1", "{normal}");
-        }
-        let Entry::Answer(Reply { meta, .. }) = entry(answer(None, "FinishReason.MAX_TOKENS"))
-        else {
-            panic!("not an answer");
-        };
-        assert_eq!(meta, "p1 · m1 · finished: max_tokens");
+    fn run_strips_one_layer_of_quotes() {
+        assert_eq!(unquote("\"hello world\""), "hello world");
+        assert_eq!(unquote("'a' and 'b'"), "a' and 'b");
+        assert_eq!(unquote("plain"), "plain");
+        assert_eq!(unquote("\""), "\"");
     }
 }
