@@ -178,6 +178,8 @@ pub struct TerminalPane {
     /// Wheel travel not yet a whole row, in points, as Ghostty's
     /// `pending_scroll_y` (src/Surface.zig at 108cacb1, scrollCallback).
     pending_scroll: f32,
+    /// The mouse modes and size the encoder was last given (`sync_encoder`).
+    encoder_for: Option<([bool; MOUSE_MODES.len()], mouse::EncoderSize)>,
 }
 
 impl TerminalPane {
@@ -267,6 +269,7 @@ impl TerminalPane {
             mouse_event: mouse::Event::new()?,
             reported: [false; 3],
             pending_scroll: 0.0,
+            encoder_for: None,
         })
     }
 
@@ -470,52 +473,76 @@ impl TerminalPane {
             self.reported = [false; 3];
             return Ok(());
         }
-        let (pos, held, presses, releases, downs, moved) = ui.input(|i| {
-            let each = |f: &dyn Fn(egui::PointerButton) -> bool| BUTTONS.map(|(b, _)| f(b));
+        // The button events in the order they came: a fast click, or a
+        // touchpad tap, presses and releases within one frame, and both
+        // must reach the program (popos-tai's test of gui-mouse).
+        let (buttons, pos, held, downs, moved) = ui.input(|i| {
+            let buttons: Vec<_> = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        modifiers,
+                    } => {
+                        let index = BUTTONS.iter().position(|(b, _)| b == button)?;
+                        Some((index, *pos, *pressed, *modifiers))
+                    }
+                    _ => None,
+                })
+                .collect();
             (
+                buttons,
                 i.pointer.latest_pos(),
                 i.modifiers,
-                each(&|b| i.pointer.button_pressed(b)),
-                each(&|b| i.pointer.button_released(b)),
-                each(&|b| i.pointer.button_down(b)),
+                BUTTONS.map(|(b, _)| i.pointer.button_down(b)),
                 i.pointer.delta() != egui::Vec2::ZERO,
             )
         });
-        let Some(pos) = pos else {
-            return Ok(());
-        };
         let mut out = Vec::new();
-        let at = self.surface_position(pos - rect.min);
-        self.mouse_event.set_mods(mods_from(held)).set_position(at);
-        self.mouse_encoder
-            .set_options_from_terminal(&self.terminal)
-            .set_size(encoder_size(self.dims))?
-            .set_track_last_cell(true);
-        for (i, &(_, button)) in BUTTONS.iter().enumerate() {
-            let action = if releases[i] && self.reported[i] {
-                self.reported[i] = false;
-                mouse::Action::Release
-            } else if presses[i] && rect.contains(pos) && !held.shift && !self.selecting {
-                self.reported[i] = true;
+        self.sync_encoder()?;
+        for (index, at, pressed, mods) in buttons {
+            let action = if pressed {
+                if !rect.contains(at) || mods.shift || self.selecting {
+                    continue;
+                }
+                self.reported[index] = true;
                 mouse::Action::Press
+            } else if self.reported[index] {
+                self.reported[index] = false;
+                mouse::Action::Release
             } else {
                 continue;
             };
+            let position = self.surface_position(at - rect.min);
             self.mouse_encoder
                 .set_any_button_pressed(self.reported.iter().any(|&r| r));
-            self.mouse_event.set_action(action).set_button(Some(button));
+            self.mouse_event
+                .set_mods(mods_from(mods))
+                .set_position(position)
+                .set_action(action)
+                .set_button(Some(BUTTONS[index].1));
             self.mouse_encoder
                 .encode_to_vec(&self.mouse_event, &mut out)?;
         }
         let dragging = self.reported.iter().any(|&r| r);
-        if moved && !self.selecting && (dragging || rect.contains(pos)) {
+        if let Some(pos) = pos
+            && moved
+            && !self.selecting
+            && (dragging || rect.contains(pos))
+        {
             let button = BUTTONS
                 .iter()
                 .zip(downs)
                 .find(|&(_, down)| down)
                 .map(|(&(_, b), _)| b);
+            let position = self.surface_position(pos - rect.min);
             self.mouse_encoder.set_any_button_pressed(dragging);
             self.mouse_event
+                .set_mods(mods_from(held))
+                .set_position(position)
                 .set_action(mouse::Action::Motion)
                 .set_button(button);
             self.mouse_encoder
@@ -523,6 +550,26 @@ impl TerminalPane {
         }
         if !out.is_empty() {
             self.pty.write(&out);
+        }
+        Ok(())
+    }
+
+    /// Give the encoder the program's mouse modes and the pane's size, but
+    /// only when they changed: setting either makes it forget the last
+    /// reported cell (src/terminal/c/mouse_encode.zig at 108cacb1), and
+    /// every small move within a cell was then reported (popos-tai).
+    fn sync_encoder(&mut self) -> Result<()> {
+        let mut modes = [false; MOUSE_MODES.len()];
+        for (on, mode) in modes.iter_mut().zip(MOUSE_MODES) {
+            *on = self.terminal.mode(mode)?;
+        }
+        let key = (modes, encoder_size(self.dims));
+        if self.encoder_for != Some(key) {
+            self.mouse_encoder
+                .set_options_from_terminal(&self.terminal)
+                .set_size(key.1)?
+                .set_track_last_cell(true);
+            self.encoder_for = Some(key);
         }
         Ok(())
     }
@@ -587,9 +634,8 @@ impl TerminalPane {
                 } else {
                     mouse::Button::Five
                 }));
+            self.sync_encoder()?;
             self.mouse_encoder
-                .set_options_from_terminal(&self.terminal)
-                .set_size(encoder_size(self.dims))?
                 .set_any_button_pressed(self.reported.iter().any(|&r| r))
                 // Every row is a report, even within one cell.
                 .set_track_last_cell(false);
@@ -597,6 +643,7 @@ impl TerminalPane {
                 self.mouse_encoder
                     .encode_to_vec(&self.mouse_event, &mut out)?;
             }
+            self.mouse_encoder.set_track_last_cell(true);
         } else {
             let seq = arrow_seq(rows > 0, self.terminal.mode(Mode::DECCKM)?);
             for _ in 0..rows.unsigned_abs() {
@@ -665,7 +712,11 @@ impl TerminalPane {
                 .apply(&mut self.gesture, &self.terminal, grid_ref, geometry)?;
             self.terminal.set_selection(selection.as_ref())?;
             self.selection_changed = true;
-        } else if self.selecting && released {
+        }
+        // Not an else: a fast click presses and releases in one frame, and
+        // a selection left open would keep the next presses from the
+        // program (popos-tai's test of gui-mouse).
+        if self.selecting && released {
             // Released outside the grid is fine: no cell, no change.
             let grid_ref = self
                 .viewport_point(local)
@@ -1041,6 +1092,18 @@ const BUTTONS: [(egui::PointerButton, mouse::Button); 3] = [
     (egui::PointerButton::Primary, mouse::Button::Left),
     (egui::PointerButton::Secondary, mouse::Button::Right),
     (egui::PointerButton::Middle, mouse::Button::Middle),
+];
+
+/// The modes that set the encoder's tracking mode and format.
+const MOUSE_MODES: [Mode; 8] = [
+    Mode::X10_MOUSE,
+    Mode::NORMAL_MOUSE,
+    Mode::BUTTON_MOUSE,
+    Mode::ANY_MOUSE,
+    Mode::UTF8_MOUSE,
+    Mode::SGR_MOUSE,
+    Mode::URXVT_MOUSE,
+    Mode::SGR_PIXELS_MOUSE,
 ];
 
 /// The pane's geometry in surface pixels, as the encoder needs it to find
