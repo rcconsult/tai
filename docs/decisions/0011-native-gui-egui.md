@@ -17,9 +17,11 @@
   resume (`b4d3eed`, `5a87cc0`). The owner kept the picker for now in
   place of a tab per run. `/task ls` and `/run ls` list this
   conversation's runs (`be860b5`), and the conversation starts in the
-  folder tai-gui was launched from (`cf5844e`). Still to build: images
-  and mouse reporting in the terminal pane, workspace tabs (there is one
-  layout per window), and ADR 0010's plain-mode fallback.)
+  folder tai-gui was launched from (`cf5844e`). The terminal pane reports
+  the mouse to programs that track it, with the wheel as Ghostty sends
+  it (branch `gui-mouse`). Still to build: images in the terminal pane,
+  workspace tabs (there is one layout per window), and ADR 0010's
+  plain-mode fallback.)
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host.
 - **Amends:** decision 3 of [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)
