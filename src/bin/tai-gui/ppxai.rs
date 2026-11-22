@@ -192,6 +192,25 @@ impl Client {
         }
     }
 
+    /// Make `path` the slot's working directory, `POST
+    /// /context/working_dir`: where chat's tools and `/task` runs resolve
+    /// files. ppxai expands `~`, resolves a relative path against the
+    /// current one, and answers 400 for a path that isn't a directory. The
+    /// directory it set.
+    pub fn set_working_dir(&self, path: &str) -> Result<String, String> {
+        let body = serde_json::json!({ "path": path });
+        match self
+            .link
+            .post_json("/context/working_dir", &body, CALL_TIMEOUT)?
+        {
+            (200, text) => json(&text)?["path"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("no path in {text}")),
+            (status, text) => Err(format!("{status}: {}", detail(&text))),
+        }
+    }
+
     /// Answer run `id`, parked in `waiting` with `token`: `POST
     /// /v1/agent/runs/{id}/respond`. To a consent park only `approved:
     /// true` approves; text alone denies, with the text as a note.
@@ -1893,6 +1912,14 @@ mod tests {
         // macOS's temp dir is behind a symlink, which ppxai may resolve.
         let dir = dir.canonicalize().unwrap();
         let workdir = dir.to_string_lossy().into_owned();
+        // The slot's working directory: set, read back, and refused for a
+        // path that isn't a directory.
+        assert_eq!(a.set_working_dir(&workdir).unwrap(), workdir);
+        assert_eq!(a.working_dir().unwrap().as_deref(), Some(workdir.as_str()));
+        assert!(
+            a.set_working_dir(&dir.join("name.txt").to_string_lossy())
+                .is_err_and(|e| e.starts_with("400"))
+        );
         let launch = |line: &str| {
             let args = crate::grammar::TaskArgs::parse(line);
             assert!(args.errors.is_empty(), "{:?}", args.errors);
