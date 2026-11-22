@@ -554,35 +554,146 @@ pub struct CommandOutcome {
     /// The result's `status` was `error`.
     pub error: bool,
     pub markdown: String,
-    /// `tools_enabled` from the envelope's `state_sync` events.
-    pub tools_enabled: Option<bool>,
-    /// The files of the envelope's `show_image` side effects (`/show` of
-    /// an image; ppxai `commands/results.py`, `SideEffectKind`).
-    pub show_images: Vec<String>,
+    /// What the envelope's `state_sync` events changed.
+    pub state: StateSync,
+    /// The envelope's side effects that tai-gui acts on, in order.
+    pub effects: Vec<SideEffect>,
 }
 
 impl CommandOutcome {
     fn parse(v: &Value) -> Self {
-        let tools_enabled = v["events"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|e| e["type"] == "state_sync")
-            .filter_map(|e| e["data"]["tools_enabled"].as_bool())
-            .next_back();
+        let mut state = StateSync::default();
+        for event in v["events"].as_array().into_iter().flatten() {
+            state.merge_event(event);
+        }
         Self {
             ok: v["ok"].as_bool().unwrap_or(true),
             error: v["result"]["status"] == "error",
             markdown: result_markdown(&v["result"]),
-            tools_enabled,
-            show_images: v["side_effects"]
+            state,
+            effects: v["side_effects"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter(|e| e["kind"] == "show_image")
-                .filter_map(|e| e["filepath"].as_str().map(str::to_string))
+                .filter_map(SideEffect::parse)
                 .collect(),
         }
+    }
+}
+
+/// The fields of ppxai's AppState that tai-gui follows, as `state_sync`
+/// and `working_dir_changed` events report them (ppxai `engine/client.py`,
+/// `SSE_SYNC_FIELDS`). ppxai queues them as they change and sends them in
+/// the next `/chat` stream or command envelope. None is "not reported".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StateSync {
+    pub working_dir: Option<String>,
+    pub tools_enabled: Option<bool>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+impl StateSync {
+    /// Take what a `state_sync` or `working_dir_changed` event reports;
+    /// a later event wins.
+    fn merge_event(&mut self, event: &Value) -> bool {
+        let data = &event["data"];
+        let string = |key: &str| {
+            data[key]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        match event["type"].as_str() {
+            Some("working_dir_changed") => {
+                self.working_dir = string("path").or(self.working_dir.take());
+                true
+            }
+            Some("state_sync") => {
+                self.working_dir = string("working_dir").or(self.working_dir.take());
+                self.tools_enabled = data["tools_enabled"].as_bool().or(self.tools_enabled);
+                self.provider = string("provider").or(self.provider.take());
+                self.model = string("model").or(self.model.take());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Later reports win.
+    pub fn merge(&mut self, later: StateSync) {
+        self.working_dir = later.working_dir.or(self.working_dir.take());
+        self.tools_enabled = later.tools_enabled.or(self.tools_enabled);
+        self.provider = later.provider.or(self.provider.take());
+        self.model = later.model.or(self.model.take());
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A command's side effect that tai-gui acts on (ppxai
+/// `commands/results.py`, `SideEffectKind`; the payload's keys sit beside
+/// `kind`). The kinds are an open set: others are left out.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SideEffect {
+    /// `show_image`: `/show` of an image.
+    ShowImage(String),
+    /// `open_terminal` (`/terminal`), or `run_shell` with the command to
+    /// type into it. `cwd` is where a new terminal starts.
+    Terminal {
+        cwd: Option<String>,
+        command: Option<String>,
+    },
+    /// `refresh_command_roster`: `/reload` changed the commands.
+    RefreshRoster,
+    /// `copy_to_clipboard`.
+    Copy(String),
+    /// `notify`: a message, an error when `error` is set.
+    Notify { message: String, error: bool },
+}
+
+impl SideEffect {
+    fn parse(v: &Value) -> Option<Self> {
+        let string = |key: &str| {
+            v[key]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        Some(match v["kind"].as_str()? {
+            "show_image" => Self::ShowImage(string("filepath")?),
+            "open_terminal" => Self::Terminal {
+                cwd: string("cwd"),
+                command: None,
+            },
+            "run_shell" => Self::Terminal {
+                cwd: string("cwd"),
+                command: string("command"),
+            },
+            "refresh_command_roster" => Self::RefreshRoster,
+            "copy_to_clipboard" => Self::Copy(v["text"].as_str()?.to_string()),
+            "notify" => {
+                let level = v["level"].as_str().unwrap_or("info");
+                let message = string("message")?;
+                match level {
+                    "error" => Self::Notify {
+                        message,
+                        error: true,
+                    },
+                    "warn" | "warning" => Self::Notify {
+                        message: format!("Warning: {message}"),
+                        error: false,
+                    },
+                    _ => Self::Notify {
+                        message,
+                        error: false,
+                    },
+                }
+            }
+            _ => return None,
+        })
     }
 }
 
@@ -795,6 +906,18 @@ pub enum ChatEvent {
     /// `display_file`: the `display_file` tool showed this file, by its
     /// absolute path (ppxai `engine/chat.py`).
     Display(String),
+    /// `state_sync` or `working_dir_changed`: ppxai's state changed, by a
+    /// tool or by a command run before this turn.
+    State(StateSync),
+    /// `provider_throttled`: the provider refused for rate or quota (HTTP
+    /// 429 or 403), as a message saying so. It ends the answer.
+    Throttled(String),
+    /// `agent_run_complete` of a turn whose tools were cut short: the
+    /// reasons, as ppxai's `ToolGuardReason` values (`engine/types.py`).
+    Degraded(Vec<String>),
+    /// `agent_run_error` for a reason no other event reports, such as
+    /// `zombie` (too many tool failures in a row): what happened.
+    Stopped(String),
 }
 
 /// A tool call, its result or its error, as `tool_call`, `tool_result`
@@ -892,12 +1015,69 @@ impl ChatEvent {
                 data["message"].as_str().map_or_else(string, str::to_string),
             )),
             "error" => Some(Self::Error(string())),
+            "working_dir_changed" | "state_sync" => {
+                let mut state = StateSync::default();
+                state.merge_event(v);
+                (!state.is_empty()).then_some(Self::State(state))
+            }
+            "provider_throttled" => Some(Self::Throttled(throttled(data))),
+            "agent_run_complete" => {
+                let mut reasons: Vec<String> = data["degradation_reasons"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.as_str().map(str::to_string))
+                    .collect();
+                if data["max_iterations_reached"] == true
+                    && !reasons.iter().any(|r| r == "iteration_cap")
+                {
+                    reasons.push("iteration_cap".into());
+                }
+                (!reasons.is_empty()).then_some(Self::Degraded(reasons))
+            }
+            // Interrupts and provider errors come as `error` or
+            // `provider_throttled` too.
+            "agent_run_error" => match data["reason"].as_str().unwrap_or_default() {
+                "interrupted" | "provider_error" | "provider_throttled" => None,
+                reason => Some(Self::Stopped(
+                    data["detail"]
+                        .as_str()
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or(reason)
+                        .to_string(),
+                )),
+            },
             "display_file" => data["filepath"]
                 .as_str()
                 .map(|p| Self::Display(p.to_string())),
             _ => None,
         }
     }
+}
+
+/// A `provider_throttled` payload as a line: `{status_code, provider,
+/// model?, message, retry_after?}` (ppxai `engine/types.py`).
+fn throttled(data: &Value) -> String {
+    let provider = data["provider"]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .unwrap_or("The provider");
+    let mut line = format!("{provider} refused the request");
+    if let Some(code) = data["status_code"].as_u64() {
+        let why = if code == 429 {
+            "rate limit"
+        } else {
+            "quota or access"
+        };
+        line.push_str(&format!(" (HTTP {code}, {why})"));
+    }
+    if let Some(message) = data["message"].as_str().filter(|m| !m.is_empty()) {
+        line.push_str(&format!(": {message}"));
+    }
+    if let Some(secs) = data["retry_after"].as_f64() {
+        line.push_str(&format!(". Try again in {} s", secs.ceil() as u64));
+    }
+    line
 }
 
 /// A 200 from `/v1/oneshot`.
@@ -1299,7 +1479,8 @@ mod tests {
 
     use super::{
         Answer, ChatEvent, Client, CommandOutcome, Consent, MergeError, Model, Provider, Providers,
-        Roster, Run, RunFilter, Source, Sse, ToolKind, ToolStep, detail, encode, json, sse_line,
+        Roster, Run, RunFilter, SideEffect, Source, Sse, StateSync, ToolKind, ToolStep, detail,
+        encode, json, sse_line,
     };
 
     // The shapes below are the ones ppxai's fence pins
@@ -1549,6 +1730,53 @@ mod tests {
                 detail: "{\n  \"path\": \"a\"\n}".into(),
             }))
         );
+        // ppxai engine/client.py's queued events, and the run's end.
+        assert_eq!(
+            parse(serde_json::json!({"type":"working_dir_changed","data":{"path":"/w"}})),
+            Some(ChatEvent::State(StateSync {
+                working_dir: Some("/w".into()),
+                ..StateSync::default()
+            }))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"state_sync","data":{"agent_beat":{}}})),
+            None
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"provider_throttled","data":{"status_code":429,
+                "provider":"openrouter","model":"m","message":"slow down","retry_after":2.5}})),
+            Some(ChatEvent::Throttled(
+                "openrouter refused the request (HTTP 429, rate limit): slow down. Try again in 3 s"
+                    .into()
+            ))
+        );
+        assert_eq!(
+            parse(
+                serde_json::json!({"type":"agent_run_complete","data":{"iterations":3,
+                "max_iterations_reached":true,"degradation_reasons":[]}})
+            ),
+            Some(ChatEvent::Degraded(vec!["iteration_cap".into()]))
+        );
+        assert_eq!(
+            parse(
+                serde_json::json!({"type":"agent_run_complete","data":{"iterations":1,
+                "degradation_reasons":[]}})
+            ),
+            None
+        );
+        assert_eq!(
+            parse(
+                serde_json::json!({"type":"agent_run_error","data":{"reason":"zombie",
+                "detail":"Circuit breaker tripped at 5 consecutive failures on tool 'x'."}})
+            ),
+            Some(ChatEvent::Stopped(
+                "Circuit breaker tripped at 5 consecutive failures on tool 'x'.".into()
+            ))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type":"agent_run_error","data":{"reason":"interrupted"}})),
+            None
+        );
         // ppxai engine/chat.py, after the display_file tool.
         assert_eq!(
             parse(serde_json::json!({"type":"display_file",
@@ -1627,8 +1855,51 @@ mod tests {
         let tools = outcome(serde_json::json!({"ok": true,
             "result": {"type":"ConfirmationResult","status":"success","message":"Tools enabled!"},
             "events": [{"type":"state_sync","data":{"tools_enabled":true}}]}));
-        assert_eq!(tools.tools_enabled, Some(true));
+        assert_eq!(tools.state.tools_enabled, Some(true));
         assert_eq!(tools.markdown, "**Tools enabled!**");
+        // The envelope's state changes and side effects (ppxai
+        // commands/results.py); unknown kinds are left out.
+        let effects = outcome(serde_json::json!({"result": {"type":"NotificationResult",
+            "status":"success","message":"Opening terminal"},
+            "events": [{"type":"state_sync","data":{"model":"m1","provider":"p"}},
+                {"type":"state_sync","data":{"model":"m2"}},
+                {"type":"working_dir_changed","data":{"path":"/w"}}],
+            "side_effects": [{"kind":"open_terminal","cwd":"/w"},
+                {"kind":"run_shell","command":"ls -la","cwd":""},
+                {"kind":"refresh_command_roster","version":3},
+                {"kind":"copy_to_clipboard","text":"t"},
+                {"kind":"notify","level":"warn","message":"careful"},
+                {"kind":"set_theme","theme":"dark"},
+                {"kind":"show_image","filepath":"/w/a.png"}]}));
+        assert_eq!(
+            effects.state,
+            StateSync {
+                working_dir: Some("/w".into()),
+                tools_enabled: None,
+                provider: Some("p".into()),
+                model: Some("m2".into()),
+            }
+        );
+        assert_eq!(
+            effects.effects,
+            vec![
+                SideEffect::Terminal {
+                    cwd: Some("/w".into()),
+                    command: None
+                },
+                SideEffect::Terminal {
+                    cwd: None,
+                    command: Some("ls -la".into())
+                },
+                SideEffect::RefreshRoster,
+                SideEffect::Copy("t".into()),
+                SideEffect::Notify {
+                    message: "Warning: careful".into(),
+                    error: false
+                },
+                SideEffect::ShowImage("/w/a.png".into()),
+            ]
+        );
         let md = outcome(serde_json::json!({"result": {"type":"MarkdownResult",
             "status":"error","message":"x","content":"## Help"}}));
         assert!(md.error);
@@ -1809,7 +2080,7 @@ mod tests {
         );
         assert!(c.command("clear", "").unwrap().ok);
         let enabled = c.command("tools", "enable").unwrap();
-        assert_eq!(enabled.tools_enabled, Some(true));
+        assert_eq!(enabled.state.tools_enabled, Some(true));
         assert!(c.tools().unwrap());
         c.set_tools(false).unwrap();
         assert!(!c.command("status", "").unwrap().markdown.is_empty());

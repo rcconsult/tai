@@ -211,7 +211,7 @@ async fn main() -> Result<()> {
     // restricts tai's DLL search to its own folder and System32 (ADR 0007),
     // so keep it after the window and GL context exist, as it is here inside
     // macroquad::main.
-    let (pty, mut child) = Pty::new(dims)?;
+    let (pty, mut child) = Pty::new(dims, None)?;
 
     // Install the PNG decoder so the terminal can handle PNG images in the
     // Kitty Graphics Protocol. This is a process-global setting and must be

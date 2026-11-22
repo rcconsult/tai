@@ -180,15 +180,44 @@ pub struct TerminalPane {
     pending_scroll: f32,
     /// The mouse modes and size the encoder was last given (`sync_encoder`).
     encoder_for: Option<([bool; MOUSE_MODES.len()], mouse::EncoderSize)>,
+    /// Take the focus next frame: a command was typed for the user.
+    want_focus: bool,
+    /// A command to type once a new shell has drawn its prompt.
+    pending_command: Option<String>,
+    /// When output last arrived, to tell a prompt that has settled.
+    last_output: Option<Instant>,
+    ctx: egui::Context,
+}
+
+/// How long a new shell's output must have stopped before a command is
+/// typed at its prompt: startup files print first, and a shell may drop
+/// input that comes before it reads the line.
+const PROMPT_SETTLE: Duration = Duration::from_millis(300);
+
+/// A command as typed at a prompt: one line, without control characters,
+/// so typing it never runs it or sends a key. The user presses Enter.
+fn typed_command(command: &str) -> String {
+    command
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 impl TerminalPane {
-    pub fn new(coverage: Coverage, ctx: egui::Context) -> Result<Self> {
+    /// A shell in `cwd`, or in tai-gui's own folder.
+    pub fn new(
+        coverage: Coverage,
+        ctx: egui::Context,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let dpi_scale = ctx.pixels_per_point();
         let font_size = shortcuts::DEFAULT_FONT_SIZE;
         let dims = Dimensions::new(&coverage, font_size, dpi_scale, egui::vec2(800.0, 600.0));
         let (cols, rows) = dims.grid_size();
-        let (pty, child) = Pty::new(dims)?;
+        let (pty, child) = Pty::new(dims, cwd)?;
+        let repaint = ctx.clone();
         // egui sleeps until something happens; output is something.
         // One wake per frame at most: the reader calls this for every
         // chunk, about 40,000 times a second during a flood on Linux.
@@ -270,7 +299,42 @@ impl TerminalPane {
             reported: [false; 3],
             pending_scroll: 0.0,
             encoder_for: None,
+            want_focus: false,
+            pending_command: None,
+            last_output: None,
+            ctx: repaint,
         })
+    }
+
+    /// Type `command` at the shell's prompt, without running it, and take
+    /// the focus. Not while a full-screen program has the terminal, where
+    /// the keys would go to it: returns false then. A shell that hasn't
+    /// drawn its prompt yet gets it once it has.
+    pub fn type_command(&mut self, command: &str) -> Result<bool> {
+        let line = typed_command(command);
+        if line.is_empty() || self.exited() {
+            return Ok(false);
+        }
+        if self.last_output.is_none() || self.pending_command.is_some() {
+            self.pending_command = Some(line);
+            self.want_focus = true;
+            self.ctx.request_repaint_after(PROMPT_SETTLE);
+            return Ok(true);
+        }
+        if self.terminal.active_screen()? == Screen::Alternate {
+            return Ok(false);
+        }
+        let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
+        let bytes = shortcuts::encode_paste(&line, bracketed)?;
+        self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        self.pty.write(&bytes);
+        self.want_focus = true;
+        Ok(true)
+    }
+
+    /// Take the focus next frame.
+    pub fn focus(&mut self) {
+        self.want_focus = true;
     }
 
     pub fn exited(&self) -> bool {
@@ -302,13 +366,32 @@ impl TerminalPane {
                 self.child.mark_exited();
             }
         }
+        let now = Instant::now();
+        if got {
+            self.last_output = Some(now);
+        }
+        if self.pending_command.is_some() {
+            match self.last_output {
+                Some(at) if now >= at + PROMPT_SETTLE => {
+                    if let Some(line) = self.pending_command.take()
+                        && let Err(e) = self.type_command(&line)
+                    {
+                        tracing::warn!("typing a command: {e}");
+                    }
+                }
+                _ => self.ctx.request_repaint_after(PROMPT_SETTLE),
+            }
+        }
         got
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-        if response.clicked() || !ui.ctx().memory(|m| m.focused().is_some()) {
+        if std::mem::take(&mut self.want_focus)
+            || response.clicked()
+            || !ui.ctx().memory(|m| m.focused().is_some())
+        {
             response.request_focus();
         }
         // Keep Tab, arrows and Escape for the shell instead of egui's focus
@@ -1263,6 +1346,16 @@ fn key_for(k: egui::Key) -> Option<(Key, char)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command from ppxai's `run_shell` is typed, never run: no newline,
+    /// no escape sequence, no other control key gets through.
+    #[test]
+    fn a_typed_command_is_one_line_of_text() {
+        assert_eq!(typed_command("ls -la\n"), "ls -la");
+        assert_eq!(typed_command("a\rb\x1b[201~c\x03"), "a b [201~c");
+        assert_eq!(typed_command("echo \u{9b}x\ty"), "echo  x y");
+        assert_eq!(typed_command("\n\n"), "");
+    }
 
     #[test]
     fn wheel_travel_becomes_whole_rows() {

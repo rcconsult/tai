@@ -256,6 +256,50 @@ struct App {
 }
 
 impl App {
+    /// `/terminal`, or a command to type into a terminal (ppxai's
+    /// `open_terminal` and `run_shell`). A running shell is brought
+    /// forward where it is; one that has exited, or never started, is
+    /// started again in the folder the request names.
+    fn open_terminal(&mut self, request: chat::TerminalRequest, ctx: &egui::Context) {
+        if self.terminal.as_ref().is_none_or(TerminalPane::exited) {
+            let cwd = request.cwd.as_deref().map(std::path::Path::new);
+            match fonts::Coverage::new()
+                .map_err(Into::into)
+                .and_then(|coverage| TerminalPane::new(coverage, ctx.clone(), cwd))
+            {
+                Ok(terminal) => self.terminal = Some(terminal),
+                Err(e) => {
+                    tracing::error!("the terminal didn't start: {e}");
+                    self.chat.note(format!("The terminal didn't start: {e}"));
+                    return;
+                }
+            }
+        }
+        let Some(terminal) = &mut self.terminal else {
+            return;
+        };
+        match request.command {
+            Some(command) => match terminal.type_command(&command) {
+                Ok(true) => {}
+                Ok(false) => self.chat.note(format!(
+                    "A program is running in the terminal, so this wasn't typed there: `{command}`"
+                )),
+                Err(e) => {
+                    tracing::warn!("typing a command: {e}");
+                    self.chat.note(format!("Run in the terminal: `{command}`"));
+                }
+            },
+            None => terminal.focus(),
+        }
+        self.reveal(Tab::Terminal);
+        if let Some(path) = self.dock.find_tab(&Tab::Terminal) {
+            self.dock.set_focused_node_and_surface(egui_dock::NodePath {
+                surface: path.surface,
+                node: path.node,
+            });
+        }
+    }
+
     /// Show an image in the Preview stack, in its own tab, or bring its tab
     /// forward if it's open already.
     fn open_image(&mut self, path: std::path::PathBuf) {
@@ -440,6 +484,9 @@ impl eframe::App for App {
         for note in self.runs.take_notes() {
             self.chat.note(note);
         }
+        for request in self.chat.take_terminals() {
+            self.open_terminal(request, ui.ctx());
+        }
         // Answers are model output, and a Markdown link can name any
         // scheme: file:, or a Windows protocol handler. Only web links open
         // (in the browser); an answer's "open in Preview" link opens its
@@ -571,7 +618,7 @@ fn main() -> eframe::Result {
             images::install(&cc.egui_ctx);
             let terminal = fonts::Coverage::new()
                 .map_err(Into::into)
-                .and_then(|coverage| TerminalPane::new(coverage, cc.egui_ctx.clone()))
+                .and_then(|coverage| TerminalPane::new(coverage, cc.egui_ctx.clone(), None))
                 .map_err(|e| tracing::error!("the terminal didn't start: {e}"))
                 .ok();
             Ok(Box::new(App {
