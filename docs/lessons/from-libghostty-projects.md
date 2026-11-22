@@ -137,6 +137,8 @@ Links are pinned to the commits the lessons were read at.
 
 - awesome-libghostty, the list surveyed:
   https://github.com/Uzaaft/awesome-libghostty/tree/b09654cfc5435f554e1f4213767b67801bf397ce
+  (a later read, sorted by what tai and ppxai could use, is
+  [`../research/libghostty-ecosystem.md`](../research/libghostty-ecosystem.md))
 - Ghostty PR #14296, "terminal: add option to disable scrollback pull on
   resize": https://github.com/ghostty-org/ghostty/pull/14296
 - libghostty-rs, `Terminal::set_resize_pull_scrollback`:
