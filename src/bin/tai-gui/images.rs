@@ -688,8 +688,8 @@ fn decode(bytes: &[u8]) -> Result<ColorImage, String> {
 /// An image in the Preview stack: the file, fitted to the pane.
 pub fn show_file(ui: &mut egui::Ui, path: &Path) {
     let shown = path.to_string_lossy();
-    ui.add(egui::Label::new(egui::RichText::new(shown.as_ref()).weak()).truncate())
-        .on_hover_text(shown.as_ref());
+    // A cut-off label shows the whole text on hover by itself.
+    ui.add(egui::Label::new(egui::RichText::new(shown.as_ref()).weak()).truncate());
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
