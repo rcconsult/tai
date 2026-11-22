@@ -50,6 +50,7 @@ mod shortcuts;
 mod chat;
 mod engine;
 mod gpu;
+mod grammar;
 mod ppxai;
 mod runs;
 mod terminal;

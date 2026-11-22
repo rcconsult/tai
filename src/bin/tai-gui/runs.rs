@@ -1,5 +1,5 @@
-//! The run pane, in the Preview tab: the runs started from chat (`/run`),
-//! one at a time, as the web app's right-hand run panel shows them
+//! The run pane, in the Preview tab: the runs started from chat (`/run`,
+//! `/task`), one at a time, as the web app's right-hand run panel shows them
 //! (ppxai `web/components/views/agent-run-view.js`, `task-run-view.js`).
 //!
 //! - A header with the run's id, status and task, and a picker of the runs
@@ -11,6 +11,9 @@
 //!   (`completed_pending_ack`): ack, then merge it into the conversation,
 //!   as the web app's `RunController.ack` does. Under `execution.collect:
 //!   auto` the watcher merges it itself, once; under `no` Collect is off.
+//! - A `/task` run's tools and working dir; Approve and Deny while it waits
+//!   for consent (a sub-agent spawn); Resume when it stopped at a clean
+//!   checkpoint.
 //!
 //! A thread watches each run by polling `GET /v1/agent/runs/{id}` and its
 //! events since the last seen `seq`, every second, backing off to 30 s
@@ -26,7 +29,7 @@ use eframe::egui;
 use egui_commonmark::CommonMarkCache;
 
 use crate::chat::{Reply, Slot, show_reply, spawn};
-use crate::ppxai::{Client, MergeError, Run, RunEvent};
+use crate::ppxai::{Client, MergeError, Run, RunEvent, Waiting};
 
 /// How often a running run is looked at.
 const POLL: Duration = Duration::from_secs(1);
@@ -149,7 +152,7 @@ impl RunsPane {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         if self.views.is_empty() {
-            ui.weak("No runs yet. /run <prompt> in chat starts one and shows it here.");
+            ui.weak("No runs yet. /run <prompt> or /task <prompt> --tools <a,b> in chat starts one and shows it here.");
             return;
         }
         self.collect(ui.ctx());
@@ -217,6 +220,19 @@ impl RunsPane {
                     });
                 }
             }
+            if run.resumable && matches!(run.status.as_str(), "interrupted" | "cancelled") {
+                let button = ui
+                    .add_enabled(!busy, egui::Button::new("Resume"))
+                    .on_hover_text("Go on from where the run stopped");
+                if button.clicked() {
+                    let (client, id) = (view.client.clone(), view.id.clone());
+                    view.action = spawn(ui.ctx(), "run-resume", move || {
+                        client
+                            .resume_run(&id)
+                            .map(|()| format!("Run {id} goes on from where it stopped"))
+                    });
+                }
+            }
             if finished && !run.ended() {
                 // The watcher gave up; let the user look again.
                 if ui.button("Refresh").clicked() {
@@ -226,6 +242,16 @@ impl RunsPane {
         });
         if !run.task.is_empty() {
             ui.label(egui::RichText::new(&run.task).italics());
+        }
+        if !run.tools.is_empty() {
+            let mut grant = format!("Tools: {}", run.tools.join(", "));
+            if let Some(dir) = &run.workdir {
+                grant.push_str(&format!(" · in {dir}"));
+            }
+            ui.weak(grant);
+        }
+        if let (Some(waiting), "waiting") = (&run.waiting, run.status.as_str()) {
+            consent_card(ui, view, waiting);
         }
         if let Some(why) = &error {
             ui.colored_label(ui.visuals().warn_fg_color, why);
@@ -326,6 +352,43 @@ impl RunsPane {
             }
         }
     }
+}
+
+/// A run parked for an answer, as the web app's consent card: what it asks,
+/// and Approve and Deny. Another kind of park is answered from chat.
+fn consent_card(ui: &mut egui::Ui, view: &mut View, waiting: &Waiting) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        let prompt = if waiting.prompt.is_empty() {
+            "The run asks to go on."
+        } else {
+            &waiting.prompt
+        };
+        ui.label(prompt);
+        if waiting.kind != "consent" {
+            ui.weak(format!(
+                "Answer with /task respond {} \"<text>\" in chat.",
+                view.id
+            ));
+            return;
+        }
+        let busy = view.action.is_some();
+        ui.horizontal(|ui| {
+            for (label, approved) in [("Approve", true), ("Deny", false)] {
+                if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                    let (client, id) = (view.client.clone(), view.id.clone());
+                    let token = waiting.token.clone();
+                    view.action = spawn(ui.ctx(), "run-respond", move || {
+                        client
+                            .respond_run(&id, &token, Some(approved), None)
+                            .map(|()| match approved {
+                                true => format!("Approved; run {id} goes on"),
+                                false => format!("Denied; run {id} goes on without it"),
+                            })
+                    });
+                }
+            }
+        });
+    });
 }
 
 /// Collect run `id`'s result: ack a held result, then merge it into the
