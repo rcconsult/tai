@@ -1431,12 +1431,13 @@ impl ChatPane {
 
     /// Follow what ppxai says changed: the folder, the tools, the provider
     /// and the model. A tool can move the folder, and a command such as
-    /// `/model` can switch the model.
-    fn apply_state(&mut self, state: ppxai::StateSync, ctx: &egui::Context) {
+    /// `/model` can switch the model. `say` adds a line for a folder
+    /// change; a command's result says it already.
+    fn apply_state(&mut self, state: ppxai::StateSync, ctx: &egui::Context, say: bool) {
         if let Some(path) = state.working_dir
             && self.folder.as_ref() != Some(&path)
         {
-            if self.folder.is_some() {
+            if say && self.folder.is_some() {
                 self.entries
                     .push(Entry::Note(format!("Working directory changed to {path}")));
             }
@@ -1540,7 +1541,7 @@ impl ChatPane {
                                 self.markdown = CommonMarkCache::default();
                                 crate::images::new_conversation();
                             }
-                            self.apply_state(outcome.state, ctx);
+                            self.apply_state(outcome.state, ctx, false);
                             let mut notes = Vec::new();
                             for effect in outcome.effects {
                                 match effect {
@@ -1604,7 +1605,7 @@ impl ChatPane {
             .map(|mut live| std::mem::take(&mut live.state))
             .unwrap_or_default();
         if !state.is_empty() {
-            self.apply_state(state, ctx);
+            self.apply_state(state, ctx, true);
         }
         let Some(turn) = &self.turn else {
             return;
