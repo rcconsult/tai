@@ -313,6 +313,23 @@ fn is_animated(uri: &str) -> bool {
     lower.ends_with(".gif") || lower.ends_with(".webp")
 }
 
+/// Markdown that shows the image at `path` (absolute, from the
+/// `display_file` tool), or `None` when it isn't an image tai-gui decodes.
+pub fn shown_markdown(path: &str) -> Option<String> {
+    let lower = path.to_ascii_lowercase();
+    let image = [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+        .iter()
+        .any(|ext| lower.ends_with(ext));
+    if !image || path.contains(['<', '>', '\n']) {
+        return None;
+    }
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Some(format!("\n\n![{}](<{path}>)\n", escape(&name)))
+}
+
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -795,6 +812,16 @@ mod tests {
         for ip in ["93.184.215.14", "2606:4700::6810:84e5"] {
             assert!(public(ip.parse().unwrap()).is_ok(), "{ip}");
         }
+    }
+
+    #[test]
+    fn a_displayed_file_becomes_an_image_if_it_is_one() {
+        assert_eq!(
+            shown_markdown("/r/ppxai-original-preview.png").as_deref(),
+            Some("\n\n![ppxai\\-original\\-preview.png](</r/ppxai-original-preview.png>)\n")
+        );
+        assert_eq!(shown_markdown("/r/notes.md"), None);
+        assert_eq!(shown_markdown("/r/logo.svg"), None);
     }
 
     /// egui asks for a GIF or WebP as `{uri}#{frame}` (popos-tai's test).

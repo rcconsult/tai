@@ -792,6 +792,9 @@ pub enum ChatEvent {
     Warning(String),
     /// `error`; an interrupted stream ends with "Interrupted by user".
     Error(String),
+    /// `display_file`: the `display_file` tool showed this file, by its
+    /// absolute path (ppxai `engine/chat.py`).
+    Display(String),
 }
 
 /// A tool call, its result or its error, as `tool_call`, `tool_result`
@@ -889,6 +892,9 @@ impl ChatEvent {
                 data["message"].as_str().map_or_else(string, str::to_string),
             )),
             "error" => Some(Self::Error(string())),
+            "display_file" => data["filepath"]
+                .as_str()
+                .map(|p| Self::Display(p.to_string())),
             _ => None,
         }
     }
@@ -1542,6 +1548,12 @@ mod tests {
                 tool: "read_file".into(),
                 detail: "{\n  \"path\": \"a\"\n}".into(),
             }))
+        );
+        // ppxai engine/chat.py, after the display_file tool.
+        assert_eq!(
+            parse(serde_json::json!({"type":"display_file",
+                "data":{"filepath":"/r/a.png"}})),
+            Some(ChatEvent::Display("/r/a.png".into()))
         );
         assert_eq!(
             parse(serde_json::json!({"type":"consent_request",

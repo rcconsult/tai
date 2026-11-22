@@ -160,6 +160,10 @@ struct Live {
     error: Option<String>,
     /// The stream is over, and its thread done.
     finished: bool,
+    /// The images the `display_file` tool showed, as Markdown kept after
+    /// the answer: `stream_end` brings the answer's text without them, as
+    /// the web app's `_streamInlineImages` works around.
+    displayed: String,
 }
 
 impl Live {
@@ -179,6 +183,7 @@ impl Live {
                 // The whole answer, as ppxai has it.
                 if !text.is_empty() {
                     self.reply.text = text;
+                    self.reply.text.push_str(&self.displayed);
                 }
                 self.tokens = tokens;
                 self.reply.sources = sources;
@@ -198,6 +203,19 @@ impl Live {
             }
             ChatEvent::Warning(text) => self.reply.notes.push(format!("Warning: {text}")),
             ChatEvent::Error(why) => self.error = Some(why),
+            // An image goes into the answer, as the web app shows it; the
+            // other kinds the web app opens in its right-hand panel, which
+            // tai-gui doesn't have for them yet.
+            ChatEvent::Display(path) => match crate::images::shown_markdown(&path) {
+                Some(markdown) => {
+                    self.activity = None;
+                    self.displayed.push_str(&markdown);
+                    self.reply.text.push_str(&markdown);
+                }
+                None => self.reply.notes.push(format!(
+                    "ppxai showed {path}; tai-gui shows only images so far."
+                )),
+            },
         }
     }
 }
