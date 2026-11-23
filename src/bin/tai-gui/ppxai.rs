@@ -182,6 +182,15 @@ impl Client {
 
     /// The slot's working directory, `GET /context/working_dir`, which a
     /// `/task` run gets unless its line names one.
+    /// How full the conversation's context is, `GET /context/info` (the
+    /// web app's context badge, `updateContextInfo`).
+    pub fn context_info(&self) -> Result<ContextInfo, String> {
+        match self.link.get("/context/info")? {
+            (200, text) => Ok(ContextInfo::parse(&json(&text)?)),
+            (status, text) => Err(format!("/context/info: {status}: {}", detail(&text))),
+        }
+    }
+
     pub fn working_dir(&self) -> Result<Option<String>, String> {
         match self.link.get("/context/working_dir")? {
             (200, text) => Ok(json(&text)?["path"]
@@ -469,6 +478,48 @@ impl Client {
             (200, text) => Ok(CommandOutcome::parse(&json(&text)?)),
             (_, text) => Err(detail(&text)),
         }
+    }
+}
+
+/// `GET /context/info`: the conversation's estimated tokens against the
+/// model's context window (ppxai `engine/session_ops.py`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextInfo {
+    pub tokens: u64,
+    pub limit: u64,
+    pub percent: f64,
+    /// Files attached with `@file` and the like.
+    pub attached: usize,
+}
+
+impl ContextInfo {
+    fn parse(v: &Value) -> Self {
+        Self {
+            tokens: v["estimated_tokens"].as_u64().unwrap_or(0),
+            // The web app's fallback.
+            limit: v["context_limit"].as_u64().unwrap_or(128_000),
+            percent: v["usage_percent"].as_f64().unwrap_or(0.0),
+            attached: v["injected_contexts"].as_array().map_or(0, Vec::len),
+        }
+    }
+
+    /// "12% (15K/128K)", as the web app's badge reads.
+    pub fn label(&self) -> String {
+        format!(
+            "Context {:.0}% ({}/{})",
+            self.percent,
+            short_tokens(self.tokens),
+            short_tokens(self.limit)
+        )
+    }
+}
+
+/// Tokens as the web app writes them: 15K from 1,000 up.
+fn short_tokens(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.0}K", n as f64 / 1000.0)
+    } else {
+        n.to_string()
     }
 }
 
@@ -1051,6 +1102,27 @@ pub enum ChatEvent {
     /// `agent_run_error` for a reason no other event reports, such as
     /// `zombie` (too many tool failures in a row): what happened.
     Stopped(String),
+    /// `tool_group_start`: a step of the tool loop starts, with this many
+    /// tool calls (ppxai `engine/chat.py`).
+    StepStart {
+        step: u64,
+        calls: u64,
+    },
+    /// `tool_group_end`: the step's tools, and whether all succeeded.
+    StepEnd {
+        step: u64,
+        tools: Vec<String>,
+        ok: bool,
+    },
+    /// `context_injected`: ppxai attached a file to the message, as the
+    /// web app's badge shows it: its source, language, size in characters
+    /// and whether it was cut.
+    Attached {
+        source: String,
+        language: Option<String>,
+        size: Option<u64>,
+        truncated: bool,
+    },
 }
 
 /// A tool call, its result or its error, as `tool_call`, `tool_result`
@@ -1154,6 +1226,29 @@ impl ChatEvent {
                 (!state.is_empty()).then_some(Self::State(state))
             }
             "provider_throttled" => Some(Self::Throttled(throttled(data))),
+            "tool_group_start" => Some(Self::StepStart {
+                step: data["iteration"].as_u64().unwrap_or(0),
+                calls: data["count"].as_u64().unwrap_or(0),
+            }),
+            "tool_group_end" => Some(Self::StepEnd {
+                step: data["iteration"].as_u64().unwrap_or(0),
+                tools: data["tools"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect(),
+                ok: data["all_succeeded"] != false,
+            }),
+            "context_injected" => Some(Self::Attached {
+                source: data["source"].as_str().unwrap_or("a file").to_string(),
+                language: data["language"]
+                    .as_str()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string),
+                size: data["size"].as_u64(),
+                truncated: data["truncated"] == true,
+            }),
             "agent_run_complete" => {
                 let mut reasons: Vec<String> = data["degradation_reasons"]
                     .as_array()
@@ -1611,9 +1706,9 @@ mod tests {
     };
 
     use super::{
-        Answer, ChatEvent, Client, CommandOutcome, Consent, FileText, MergeError, Model, Provider,
-        Providers, Roster, Run, RunFilter, SideEffect, Source, Sse, StateSync, ToolKind, ToolStep,
-        detail, encode, json, resume_args, sse_line,
+        Answer, ChatEvent, Client, CommandOutcome, Consent, ContextInfo, FileText, MergeError,
+        Model, Provider, Providers, Roster, Run, RunFilter, SideEffect, Source, Sse, StateSync,
+        ToolKind, ToolStep, detail, encode, json, resume_args, sse_line,
     };
 
     // The shapes below are the ones ppxai's fence pins
@@ -1944,6 +2039,35 @@ mod tests {
             parse(serde_json::json!({"type":"agent_intermediate_prose","data":{"text":" "}})),
             None
         );
+        // The tool loop's steps and attached files (ppxai engine/chat.py,
+        // engine/client.py).
+        assert_eq!(
+            parse(serde_json::json!({"type":"tool_group_start","data":{"iteration":2,"count":3}})),
+            Some(ChatEvent::StepStart { step: 2, calls: 3 })
+        );
+        assert_eq!(
+            parse(
+                serde_json::json!({"type":"tool_group_end","data":{"iteration":2,"count":2,
+                "all_succeeded":false,"tools":["read_file","shell"]}})
+            ),
+            Some(ChatEvent::StepEnd {
+                step: 2,
+                tools: vec!["read_file".into(), "shell".into()],
+                ok: false
+            })
+        );
+        assert_eq!(
+            parse(
+                serde_json::json!({"type":"context_injected","data":{"source":"@src/a.rs",
+                "language":"rust","truncated":true,"size":1200}})
+            ),
+            Some(ChatEvent::Attached {
+                source: "@src/a.rs".into(),
+                language: Some("rust".into()),
+                size: Some(1200),
+                truncated: true
+            })
+        );
         assert_eq!(
             parse(serde_json::json!({"type":"state_sync","data":{}})),
             None
@@ -2022,6 +2146,17 @@ mod tests {
         assert_eq!(resume_args("fix it", " add tests "), "fix it — add tests");
         assert_eq!(resume_args("", "add tests"), "add tests");
         assert_eq!(resume_args(" fix it ", "  "), "fix it");
+    }
+
+    #[test]
+    fn context_info_reads_as_the_web_badge() {
+        let info = ContextInfo::parse(&serde_json::json!({"estimated_tokens":15234,
+            "context_limit":128000,"usage_percent":11.9,"injected_contexts":[{},{}],
+            "session_id":"s"}));
+        assert_eq!(info.label(), "Context 12% (15K/128K)");
+        assert_eq!(info.attached, 2);
+        let empty = ContextInfo::parse(&serde_json::json!({}));
+        assert_eq!(empty.label(), "Context 0% (0/128K)");
     }
 
     #[test]
