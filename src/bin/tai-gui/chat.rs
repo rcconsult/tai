@@ -127,6 +127,9 @@ pub struct ChatPane {
     opened: Vec<crate::runs::Open>,
     /// Terminals commands asked for; the app hands them over.
     terminals: Vec<TerminalRequest>,
+    /// The folder of the terminal that last had the focus, when its shell
+    /// has reported one; the app sets it every frame.
+    terminal_folder: Option<String>,
     /// Whether the input had the focus last frame. egui drops the focus on
     /// Escape before any widget sees the key (egui 0.36
     /// `memory/mod.rs`), so Escape can't ask whether it has it now.
@@ -654,6 +657,10 @@ impl ChatPane {
     }
 
     /// A line in the transcript, such as a run pane's "collected".
+    pub fn set_terminal_folder(&mut self, folder: Option<std::path::PathBuf>) {
+        self.terminal_folder = folder.map(|f| f.to_string_lossy().into_owned());
+    }
+
     /// The conversation's working directory, once ppxai has said.
     pub fn folder(&self) -> Option<&str> {
         self.folder.as_deref()
@@ -676,6 +683,7 @@ impl ChatPane {
             tools: None,
             folder: None,
             terminals: Vec::new(),
+            terminal_folder: None,
             folder_edit: None,
             folder_focus: false,
             folder_stale: false,
@@ -900,8 +908,31 @@ impl ChatPane {
                         "{folder}\nWhere tools and /task runs work. Click to change it."
                     ));
                 if badge.clicked() {
-                    self.folder_edit = Some(folder);
+                    self.folder_edit = Some(folder.clone());
                     self.folder_focus = true;
+                }
+                // Option 1 of the folder sync: the terminal's folder, on
+                // request only, so a cd in a shell never moves the tools.
+                let there = self.terminal_folder.clone();
+                let differs = there.as_ref().is_some_and(|t| *t != folder);
+                let tip = match &there {
+                    Some(t) if differs => format!("Work in the terminal's folder: {t}"),
+                    Some(_) => "The terminal is in this folder already.".into(),
+                    None => "The terminal hasn't said which folder it's in: its shell \
+                             isn't zsh or bash, or TAI_SHELL_INTEGRATION=0."
+                        .into(),
+                };
+                let take = ui
+                    .add_enabled(!busy && differs, egui::Button::new("Use terminal's"))
+                    .on_hover_text(&tip)
+                    .on_disabled_hover_text(&tip);
+                if take.clicked()
+                    && let Some(path) = there
+                {
+                    let asked = client.clone();
+                    self.job(ui.ctx(), "chat-folder", move || {
+                        Done::Folder(asked.set_working_dir(&path), true)
+                    });
                 }
             }
         });

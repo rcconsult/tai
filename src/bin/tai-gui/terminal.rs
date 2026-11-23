@@ -335,6 +335,15 @@ impl TerminalPane {
         Ok(true)
     }
 
+    /// The folder the shell last reported (OSC 7, which tai's shell
+    /// integration makes zsh and bash send), if it has.
+    pub fn folder(&self) -> Option<std::path::PathBuf> {
+        self.terminal
+            .pwd()
+            .ok()
+            .and_then(crate::shell_integration::reported_dir)
+    }
+
     /// Take the focus next frame.
     pub fn focus(&mut self) {
         self.want_focus = true;
@@ -1350,6 +1359,23 @@ fn key_for(k: egui::Key) -> Option<(Key, char)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// tai's shell integration reports the folder with OSC 7, which the
+    /// terminal keeps for `folder`.
+    #[test]
+    fn a_reported_folder_is_kept() {
+        let mut terminal = Terminal::new(80, 24).unwrap();
+        terminal.vt_write(b"\x1b]7;kitty-shell-cwd://host/usr/local\x07");
+        assert_eq!(
+            terminal
+                .pwd()
+                .ok()
+                .and_then(crate::shell_integration::reported_dir),
+            Some(std::path::PathBuf::from("/usr/local")),
+            "{:?}",
+            terminal.pwd()
+        );
+    }
 
     /// A command from ppxai's `run_shell` is typed, never run: no newline,
     /// no escape sequence, no other control key gets through.

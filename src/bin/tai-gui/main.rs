@@ -43,6 +43,9 @@ mod pty;
 mod pty_input;
 #[path = "../../selection.rs"]
 mod selection;
+#[path = "../../shell_integration.rs"]
+#[cfg_attr(windows, allow(dead_code))]
+mod shell_integration;
 #[path = "../../shortcuts.rs"]
 #[allow(dead_code)]
 mod shortcuts;
@@ -153,6 +156,16 @@ impl TabViewer for Panes<'_> {
                     ui.label("No image.");
                 }
             },
+        }
+    }
+
+    // A terminal's tab shows its shell's folder on hover.
+    fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        if let Tab::Terminal(i) = *tab
+            && let Some(Some(terminal)) = self.terminals.get(i)
+            && let Some(folder) = terminal.folder()
+        {
+            response.clone().on_hover_text(folder.to_string_lossy());
         }
     }
 
@@ -544,6 +557,15 @@ impl eframe::App for App {
                 },
             );
         }
+        // The chat can take the folder of the terminal that last had the
+        // focus.
+        let folder = self
+            .terminals
+            .get(self.last_terminal)
+            .and_then(Option::as_ref)
+            .filter(|t| !t.exited())
+            .and_then(TerminalPane::folder);
+        self.chat.set_terminal_folder(folder);
         let mut panes = Panes {
             terminals: &mut self.terminals,
             chat: &mut self.chat,
