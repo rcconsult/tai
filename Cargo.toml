@@ -102,6 +102,11 @@ arboard = { version = "3.7.0", default-features = false }
 # winit and wgpu already pull in.
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFString", "CFURL"] }
 objc2-core-text = { version = "0.3.2", default-features = false, features = ["std", "CTFont", "CTFontDescriptor", "CTFontManager"] }
+# tai-gui: Cmd+Q closes the window, so a busy terminal is asked about
+# (src/bin/tai-gui/macos_quit.rs). The objc2 family winit already uses.
+objc2 = { version = "0.6.5", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray"] }
 
 # fontconfig for finding system fonts on Linux (ADR 0012); links
 # libfontconfig, so the build needs libfontconfig-dev.
