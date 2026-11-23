@@ -233,6 +233,21 @@ impl TabViewer for Panes<'_> {
     }
 }
 
+/// Quit: Cmd+Q on macOS and Ctrl+Shift+Q elsewhere, as in Ghostty
+/// (src/config/Config.zig at 108cacb1). egui's own quit shortcut,
+/// Command+Q, is Ctrl+Q off macOS, which belongs to the terminal (vim's
+/// block selection, emacs' quoted insert, micro's quit), and egui checks it
+/// only after the panes have sent it on; so it's turned off at startup and
+/// this one is taken before any pane sees the keys (popos-tai).
+const QUIT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    if cfg!(target_os = "macos") {
+        egui::Modifiers::COMMAND
+    } else {
+        egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT)
+    },
+    egui::Key::Q,
+);
+
 /// The chord that zooms the focused pane to the whole window and back, as
 /// in WezTerm (Ctrl+Shift+Z) and tmux (prefix z). Ctrl on every platform,
 /// as WezTerm does on macOS, since Cmd+Shift+Z is Redo there.
@@ -784,6 +799,10 @@ impl eframe::App for App {
         if ui.input_mut(zoom_chord) {
             self.toggle_zoom();
         }
+        // A close request, which asks first when a terminal is busy.
+        if ui.input_mut(|i| i.consume_shortcut(&QUIT)) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.menu_bar(ui);
 
         for (path, tab) in self.dock.iter_all_tabs() {
@@ -1009,6 +1028,8 @@ fn main() -> eframe::Result {
                 }],
             ));
             images::install(&cc.egui_ctx);
+            // tai-gui takes its own quit chord (QUIT).
+            cc.egui_ctx.options_mut(|o| o.quit_shortcuts.clear());
             let terminal = fonts::Coverage::new()
                 .map_err(Into::into)
                 .and_then(|coverage| TerminalPane::new(coverage, cc.egui_ctx.clone(), None))
