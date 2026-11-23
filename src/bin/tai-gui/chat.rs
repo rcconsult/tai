@@ -765,6 +765,18 @@ impl ChatPane {
                 // a new line. Taken before the text box sees the key.
                 let send = focused
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                // Tab completes a slash command or its subcommand, as in
+                // Claude Code and Codex. Elsewhere it moves the focus as
+                // before.
+                if focused
+                    && self.input.starts_with('/')
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+                    && let Some(roster) = &self.roster
+                    && let Some(done) = complete(&self.input, roster)
+                {
+                    self.input = done;
+                    cursor_to_end(ui.ctx(), input_id, &self.input);
+                }
                 // Escape stops the answer, as in the web app, unless a
                 // consent is waiting: that needs an answer, not a stop. The
                 // input keeps the focus.
@@ -1322,13 +1334,7 @@ impl ChatPane {
         if let Some(text) = chosen {
             self.input = text;
             ui.memory_mut(|m| m.request_focus(input_id));
-            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), input_id) {
-                let end = egui::text::CCursor::new(self.input.chars().count());
-                state
-                    .cursor
-                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
-                state.store(ui.ctx(), input_id);
-            }
+            cursor_to_end(ui.ctx(), input_id, &self.input);
         }
     }
 
@@ -2273,11 +2279,65 @@ pub fn is_web_link(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://")
 }
 
+/// Put the text box's cursor after its text.
+fn cursor_to_end(ctx: &egui::Context, id: egui::Id, text: &str) {
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let end = egui::text::CCursor::new(text.chars().count());
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(end)));
+        state.store(ctx, id);
+    }
+}
+
+/// Tab completion of `input`: `/na` to a command's name, or `/name su` to
+/// one of its subcommands, from ppxai's roster. One match completes with a
+/// space after it; several complete as far as they agree, as a shell does.
+/// None when there's nothing to add.
+fn complete(input: &str, roster: &ppxai::Roster) -> Option<String> {
+    let typed = input.strip_prefix('/')?;
+    let (done, candidates, prefix): (String, Vec<&str>, &str) = match typed.split_once(' ') {
+        None => {
+            let prefix = typed;
+            let lower = prefix.to_ascii_lowercase();
+            let names = roster
+                .commands
+                .iter()
+                .filter(|c| !c.hidden && c.name.starts_with(&lower))
+                .map(|c| c.name.as_str())
+                .collect();
+            ("/".into(), names, prefix)
+        }
+        Some((name, rest)) if !rest.contains(char::is_whitespace) => {
+            let spec = roster.resolve(name)?;
+            let subs = spec
+                .subcommands
+                .iter()
+                .filter(|s| s.starts_with(rest))
+                .map(String::as_str)
+                .collect();
+            (format!("/{name} "), subs, rest)
+        }
+        Some(_) => return None,
+    };
+    let first = *candidates.first()?;
+    let common = candidates
+        .iter()
+        .fold(first.len(), |n, c| n.min(common_prefix(first, c)));
+    let completed = if candidates.len() == 1 {
+        format!("{done}{first} ")
+    } else {
+        format!("{done}{}", &first[..common])
+    };
+    (completed.len() > done.len() + prefix.len()).then_some(completed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Block, Entry, Family, LIST_CAP, Live, blocks, command, common_prefix, finish, is_web_link,
-        link_citations, nest, redact, runs_table, source_name, tool_summary, truncate, unquote,
+        Block, Entry, Family, LIST_CAP, Live, blocks, command, common_prefix, complete, finish,
+        is_web_link, link_citations, nest, redact, runs_table, source_name, tool_summary, truncate,
+        unquote,
     };
     use crate::grammar::ListFlags;
     use crate::ppxai::{ChatEvent, CommandSpec, Source, ToolKind, ToolStep};
@@ -2500,6 +2560,48 @@ mod tests {
         assert_eq!(command("/usr/bin is a path"), None);
         assert_eq!(command("/"), None);
         assert_eq!(command("hello /run"), None);
+    }
+
+    #[test]
+    fn tab_completes_commands_and_subcommands() {
+        let spec = |name: &str, subs: &[&str], hidden: bool| CommandSpec {
+            name: name.into(),
+            aliases: vec![],
+            description: String::new(),
+            usage: String::new(),
+            hidden,
+            client_dispatch: false,
+            client_action: None,
+            sensitive: vec![],
+            subcommands: subs.iter().map(|s| s.to_string()).collect(),
+        };
+        let roster = crate::ppxai::Roster {
+            commands: vec![
+                spec("terminal", &[], false),
+                spec("tools", &["enable", "disable", "list"], false),
+                spec("token", &["set", "status"], false),
+                spec("tokenize", &[], true),
+                spec("model", &[], false),
+            ],
+        };
+        let c = |input: &str| complete(input, &roster);
+        // One match completes, with a space; hidden commands don't count.
+        assert_eq!(c("/te").as_deref(), Some("/terminal "));
+        assert_eq!(c("/TE").as_deref(), Some("/terminal "));
+        assert_eq!(c("/tok").as_deref(), Some("/token "));
+        // Several complete as far as they agree, then stop.
+        assert_eq!(c("/t"), None, "nothing to add");
+        assert_eq!(c("/to"), None);
+        assert_eq!(c("/tok"), Some("/token ".into()));
+        assert_eq!(c("/m").as_deref(), Some("/model "));
+        assert_eq!(c("/x"), None);
+        // Subcommands.
+        assert_eq!(c("/tools e").as_deref(), Some("/tools enable "));
+        assert_eq!(c("/token s"), None);
+        assert_eq!(c("/token st").as_deref(), Some("/token status "));
+        assert_eq!(c("/tools enable x"), None);
+        assert_eq!(c("/nope a"), None);
+        assert_eq!(c("plain"), None);
     }
 
     #[test]
