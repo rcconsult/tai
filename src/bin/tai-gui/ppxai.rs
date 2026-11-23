@@ -649,6 +649,13 @@ pub enum SideEffect {
         command: Option<String>,
         name: Option<String>,
     },
+    /// `open_editor` (`/edit`): the file to edit, at a line and column
+    /// when given.
+    Edit {
+        path: String,
+        line: Option<u32>,
+        column: Option<u32>,
+    },
     /// `refresh_command_roster`: `/reload` changed the commands.
     RefreshRoster,
     /// `copy_to_clipboard`.
@@ -713,6 +720,14 @@ impl SideEffect {
                 command: string("command"),
                 name: string("name"),
             },
+            "open_editor" => {
+                let number = |key: &str| v[key].as_u64().and_then(|n| u32::try_from(n).ok());
+                Self::Edit {
+                    path: string("filepath")?,
+                    line: number("line"),
+                    column: number("column"),
+                }
+            }
             "refresh_command_roster" => Self::RefreshRoster,
             // The checks of ppxai's parse_quick_pick: no command or no
             // usable item can't resume, so it's left out.
@@ -2010,7 +2025,9 @@ mod tests {
                 {"kind":"copy_to_clipboard","text":"t"},
                 {"kind":"notify","level":"warn","message":"careful"},
                 {"kind":"set_theme","theme":"dark"},
-                {"kind":"show_image","filepath":"/w/a.png"}]}));
+                {"kind":"show_image","filepath":"/w/a.png"},
+                {"kind":"open_editor","filepath":"/w/a.rs","line":12},
+                {"kind":"open_editor","line":3}]}));
         assert_eq!(
             effects.state,
             StateSync {
@@ -2040,6 +2057,11 @@ mod tests {
                     error: false
                 },
                 SideEffect::ShowImage("/w/a.png".into()),
+                SideEffect::Edit {
+                    path: "/w/a.rs".into(),
+                    line: Some(12),
+                    column: None
+                },
             ]
         );
         let md = outcome(serde_json::json!({"result": {"type":"MarkdownResult",

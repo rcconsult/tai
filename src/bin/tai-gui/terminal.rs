@@ -201,8 +201,9 @@ pub struct TerminalPane {
     encoder_for: Option<([bool; MOUSE_MODES.len()], mouse::EncoderSize)>,
     /// Take the focus next frame: a command was typed for the user.
     want_focus: bool,
-    /// A command to type once a new shell has drawn its prompt.
-    pending_command: Option<String>,
+    /// A command to type once a new shell has drawn its prompt, and
+    /// whether to run it.
+    pending_command: Option<(String, bool)>,
     /// When output last arrived, to tell a prompt that has settled.
     last_output: Option<Instant>,
     ctx: egui::Context,
@@ -341,13 +342,13 @@ impl TerminalPane {
         })
     }
 
-    /// Type `command` at the shell's prompt, without running it, and take
-    /// the focus. A shell that sends prompt marks gets it only at its
+    /// Type `command` at the shell's prompt and take the focus; it runs
+    /// only when `run` is set, for a command tai-gui built itself. A shell that sends prompt marks gets it only at its
     /// prompt; for one that doesn't, not while a full-screen program has
     /// the terminal, where the keys would go to it (ADR 0013 decision 7).
     /// Returns false when it wasn't typed. A shell that hasn't drawn its
     /// prompt yet gets it once it has.
-    pub fn type_command(&mut self, command: &str) -> Result<bool> {
+    pub fn type_command(&mut self, command: &str, run: bool) -> Result<bool> {
         let line = typed_command(command);
         if line.is_empty() || self.exited() {
             return Ok(false);
@@ -356,7 +357,7 @@ impl TerminalPane {
         if (self.last_output.is_none() && prompt == Prompt::Unknown)
             || self.pending_command.is_some()
         {
-            self.pending_command = Some(line);
+            self.pending_command = Some((line, run));
             self.want_focus = true;
             self.ctx.request_repaint_after(PROMPT_SETTLE);
             return Ok(true);
@@ -372,6 +373,10 @@ impl TerminalPane {
         let bytes = shortcuts::encode_paste(&line, bracketed)?;
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
         self.pty.write(&bytes);
+        if run {
+            // Enter, after the paste has ended.
+            self.pty.write(b"\r");
+        }
         self.want_focus = true;
         Ok(true)
     }
@@ -459,8 +464,8 @@ impl TerminalPane {
         if self.pending_command.is_some() {
             match self.last_output {
                 Some(at) if now >= at + PROMPT_SETTLE => {
-                    if let Some(line) = self.pending_command.take()
-                        && let Err(e) = self.type_command(&line)
+                    if let Some((line, run)) = self.pending_command.take()
+                        && let Err(e) = self.type_command(&line, run)
                     {
                         tracing::warn!("typing a command: {e}");
                     }

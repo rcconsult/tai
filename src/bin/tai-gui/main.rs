@@ -52,6 +52,7 @@ mod shortcuts;
 
 mod aliases;
 mod chat;
+mod editor;
 mod engine;
 mod gpu;
 mod grammar;
@@ -326,6 +327,9 @@ struct App {
     confirm_close: Option<TermId>,
     /// The rename box a terminal tab's menu opened.
     renaming: Option<Rename>,
+    /// Terminals opened for `/edit`'s editor, which close once their shell
+    /// exits (editor.rs types `&& exit` after the editor).
+    editors: Vec<TermId>,
     /// The busy terminals' titles, while the question before quitting is
     /// up.
     confirm_quit: Option<Vec<String>>,
@@ -350,6 +354,7 @@ impl App {
     /// alias no terminal holds gets a new terminal.
     fn open_terminal(&mut self, request: chat::TerminalRequest, ctx: &egui::Context) {
         let (id, new) = match request.name.as_deref().map(Alias::parse) {
+            _ if request.new => (self.terminals.add(None, None, None), true),
             Some(Err(why)) => {
                 self.chat.note(format!("No terminal opened: {why}."));
                 return;
@@ -368,6 +373,9 @@ impl App {
             },
         };
         self.last_terminal = Some(id);
+        if request.run && new {
+            self.editors.push(id);
+        }
         let running = self.terminals.pane(id).is_some_and(|t| !t.exited());
         if !running && !self.start_terminal(id, request.cwd.as_deref(), ctx) {
             // A new terminal that didn't start doesn't keep its alias.
@@ -381,7 +389,7 @@ impl App {
             return;
         };
         match request.command {
-            Some(command) => match terminal.type_command(&command) {
+            Some(command) => match terminal.type_command(&command, request.run) {
                 Ok(true) => {}
                 Ok(false) => self.chat.note(format!(
                     "{title} isn't at its prompt, so this wasn't typed there: `{command}`"
@@ -789,6 +797,20 @@ impl eframe::App for App {
                 self.last_place.insert(*tab, place);
             }
         }
+        // An editor's terminal closes once its shell has exited; one where
+        // the editor didn't start stays, with the shell's error.
+        let done: Vec<TermId> = self
+            .editors
+            .iter()
+            .copied()
+            .filter(|&id| self.terminals.pane(id).is_none_or(TerminalPane::exited))
+            .collect();
+        self.editors.retain(|id| !done.contains(id));
+        for id in done {
+            if self.terminals.contains(id) {
+                self.end_terminal(id);
+            }
+        }
         // The chat can take the folder of the terminal that last had the
         // focus.
         let folder = self
@@ -1001,6 +1023,7 @@ fn main() -> eframe::Result {
                 terminal_place: None,
                 confirm_close: None,
                 renaming: None,
+                editors: Vec::new(),
                 confirm_quit: None,
                 quit_confirmed: false,
                 #[cfg(target_os = "macos")]
