@@ -28,6 +28,8 @@ mod discovery;
 #[path = "../../fonts.rs"]
 #[allow(dead_code)]
 mod fonts;
+#[path = "../../grapheme.rs"]
+mod grapheme;
 #[path = "../../identity.rs"]
 mod identity;
 #[cfg(unix)]

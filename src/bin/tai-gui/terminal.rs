@@ -255,6 +255,10 @@ impl TerminalPane {
 
         let mut terminal = Terminal::new(cols, rows)?;
         terminal.set_scrollback_max_lines(Some(1000))?;
+        // Grapheme clustering, mode 2027, only when asked for (grapheme.rs).
+        if crate::grapheme::clustering() {
+            terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
+        }
         // ConPTY keeps its own screen and can't take scrollback back, so on
         // Windows a resize mustn't pull scrollback into the active screen
         // (docs/lessons/from-libghostty-projects.md, section 1).
