@@ -429,7 +429,10 @@ it in `f7c6acee`, "feat(agent): runs know their conversation; a result
 merges once (ADR 0018)" (`docs/decisions/0018-runs-know-their-conversation.md`;
 fence test `tests/test_run_session_contract.py`). tai's client for it is
 `src/bin/tai-gui/ppxai.rs`, and `contract_against_a_live_server` there
-checks it against ppxai `bac85e6e`. No view uses it yet.
+checks it against ppxai `bac85e6e`. No view uses it yet. (2026-11-23:
+the test now pins ppxai `e3ae990b`, "feat(web): web images in an answer
+wait for the user's yes", and passes against it; the fence test is
+unchanged between the two.)
 - **Which session:** the conversation name (`session_…`, the saved
   chat), not the `X-Session-Id` engine slot.
 - **A session's runs:** `RunMetaResponse` gains `session_id`. On
