@@ -20,6 +20,7 @@ use eframe::egui;
 use libghostty_vt::{
     Terminal,
     color::Rgb,
+    effect::SemanticPromptKind,
     key::{self, Key},
     mode::Mode,
     mouse,
@@ -123,10 +124,26 @@ impl Dimensions {
     }
 }
 
+/// Where the shell is, from its OSC 133 prompt marks (ADR 0013 decision
+/// 7). tai's shell integration makes zsh and bash send them; other shells
+/// may (PowerShell with a prompt theme that does), or never do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prompt {
+    /// No mark yet: the shell doesn't send them, or hasn't drawn a prompt.
+    Unknown,
+    /// Drawing its prompt (OSC 133 A), or a command has ended (D).
+    Drawing,
+    /// At its prompt, reading a command line (B).
+    Input,
+    /// Running a command (C).
+    Running,
+}
+
 pub struct TerminalPane {
     terminal: Terminal<'static, 'static>,
     pty: Rc<Pty>,
     child: Child,
+    prompt: Rc<Cell<Prompt>>,
     grid_size: Rc<Cell<(u16, u16)>>,
     cell_pixels: Rc<Cell<(u32, u32)>>,
     dims: Dimensions,
@@ -231,6 +248,7 @@ impl TerminalPane {
             }
         });
         let pty = Rc::new(pty);
+        let prompt = Rc::new(Cell::new(Prompt::Unknown));
         let grid_size = Rc::new(Cell::new((cols, rows)));
         let cell_pixels = Rc::new(Cell::new(dims.cell_pixels()));
 
@@ -261,12 +279,26 @@ impl TerminalPane {
                     })
                 }
             })?
-            .on_xtversion(|_t| Some("tai"))?;
+            .on_xtversion(|_t| Some("tai"))?
+            .on_semantic_prompt({
+                let prompt = Rc::clone(&prompt);
+                // A panic here aborts, so a kind these bindings don't know
+                // is ignored.
+                move |_t, event| match event.kind() {
+                    Ok(SemanticPromptKind::PromptStart | SemanticPromptKind::CommandEnd) => {
+                        prompt.set(Prompt::Drawing)
+                    }
+                    Ok(SemanticPromptKind::InputStart) => prompt.set(Prompt::Input),
+                    Ok(SemanticPromptKind::OutputStart) => prompt.set(Prompt::Running),
+                    _ => {}
+                }
+            })?;
 
         Ok(Self {
             terminal,
             pty,
             child,
+            prompt,
             grid_size,
             cell_pixels,
             dims,
@@ -310,21 +342,30 @@ impl TerminalPane {
     }
 
     /// Type `command` at the shell's prompt, without running it, and take
-    /// the focus. Not while a full-screen program has the terminal, where
-    /// the keys would go to it: returns false then. A shell that hasn't
-    /// drawn its prompt yet gets it once it has.
+    /// the focus. A shell that sends prompt marks gets it only at its
+    /// prompt; for one that doesn't, not while a full-screen program has
+    /// the terminal, where the keys would go to it (ADR 0013 decision 7).
+    /// Returns false when it wasn't typed. A shell that hasn't drawn its
+    /// prompt yet gets it once it has.
     pub fn type_command(&mut self, command: &str) -> Result<bool> {
         let line = typed_command(command);
         if line.is_empty() || self.exited() {
             return Ok(false);
         }
-        if self.last_output.is_none() || self.pending_command.is_some() {
+        let prompt = self.prompt.get();
+        if (self.last_output.is_none() && prompt == Prompt::Unknown)
+            || self.pending_command.is_some()
+        {
             self.pending_command = Some(line);
             self.want_focus = true;
             self.ctx.request_repaint_after(PROMPT_SETTLE);
             return Ok(true);
         }
-        if self.terminal.active_screen()? == Screen::Alternate {
+        let at_prompt = match prompt {
+            Prompt::Unknown => self.terminal.active_screen()? != Screen::Alternate,
+            known => known == Prompt::Input,
+        };
+        if !at_prompt {
             return Ok(false);
         }
         let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
@@ -351,6 +392,39 @@ impl TerminalPane {
 
     pub fn exited(&self) -> bool {
         !matches!(self.child, Child::Active(_))
+    }
+
+    /// Whether closing would stop something the user may want (ADR 0013
+    /// decision 2): a command or full-screen program is running, or the
+    /// shell sends no prompt marks, so tai can't tell.
+    pub fn busy(&self) -> bool {
+        if self.exited() {
+            return false;
+        }
+        match self.prompt.get() {
+            Prompt::Unknown | Prompt::Running => true,
+            Prompt::Drawing | Prompt::Input => {
+                self.terminal.active_screen().ok() == Some(Screen::Alternate)
+            }
+        }
+    }
+
+    /// End the shell, off the UI thread: on Unix, dropping a running child
+    /// sends SIGHUP and waits up to a second for it (`pty_unix.rs`).
+    pub fn close(mut self) {
+        // What's left in the pane's place: a child already reaped, which
+        // dropping leaves alone.
+        #[cfg(unix)]
+        let reaped = Child::Reaped(nix::sys::wait::WaitStatus::StillAlive);
+        #[cfg(windows)]
+        let reaped = Child::Reaped(portable_pty::ExitStatus::with_exit_code(0));
+        let child = std::mem::replace(&mut self.child, reaped);
+        drop(self);
+        std::thread::Builder::new()
+            .name("tai-close-terminal".into())
+            .spawn(move || drop(child))
+            .map_err(|e| tracing::warn!("ending the shell on a thread: {e}"))
+            .ok();
     }
 
     /// Feed the child's output to the terminal. Runs every frame, whether
