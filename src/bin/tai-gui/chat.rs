@@ -347,11 +347,16 @@ fn degraded(reasons: &[String]) -> String {
 pub struct TerminalRequest {
     /// Where a new terminal starts; one that's running stays where it is.
     pub cwd: Option<String>,
-    /// Typed at the prompt, not run: the user presses Enter.
+    /// Typed at the prompt; the user presses Enter unless `run`.
     pub command: Option<String>,
     /// The terminal's alias (ADR 0013), as ppxai sent it; None for the
     /// terminal that last had the focus.
     pub name: Option<String>,
+    /// Run the command, not just type it: only for a command tai-gui
+    /// builds itself (`/edit`'s editor), never one ppxai sent (ADR 0013).
+    pub run: bool,
+    /// In a new terminal, whatever `name` says.
+    pub new: bool,
 }
 
 /// A finished call the pane shows the outcome of.
@@ -1750,7 +1755,30 @@ impl ChatPane {
                                         crate::images::request_open(&path)
                                     }
                                     SideEffect::Terminal { cwd, command, name } => {
-                                        self.terminals.push(TerminalRequest { cwd, command, name })
+                                        self.terminals.push(TerminalRequest {
+                                            cwd,
+                                            command,
+                                            name,
+                                            run: false,
+                                            new: false,
+                                        })
+                                    }
+                                    // /edit: the editor in a new terminal,
+                                    // in the file's folder (editor.rs).
+                                    SideEffect::Edit { path, line, column } => {
+                                        let editor = crate::editor::configured();
+                                        let cwd = Path::new(&path)
+                                            .parent()
+                                            .map(|p| p.to_string_lossy().into_owned());
+                                        self.terminals.push(TerminalRequest {
+                                            cwd,
+                                            command: Some(crate::editor::command(
+                                                &editor, &path, line, column,
+                                            )),
+                                            name: None,
+                                            run: true,
+                                            new: true,
+                                        })
                                     }
                                     SideEffect::RefreshRoster => {
                                         if let Some(asked) = self.client.clone() {
