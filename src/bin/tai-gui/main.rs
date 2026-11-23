@@ -14,7 +14,9 @@
 //! also turn on full validation, so measure in release.
 
 use eframe::egui;
-use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer, tab_viewer::OnCloseResponse};
+use egui_dock::{
+    DockArea, DockState, NodeIndex, Style, TabStyle, TabViewer, tab_viewer::OnCloseResponse,
+};
 
 // Modules shared with the macroquad build. Each is compiled into both
 // binaries; tai-gui uses only part of some.
@@ -220,6 +222,16 @@ impl TabViewer for Panes<'_> {
         !matches!(tab, Tab::Terminal(_))
     }
 
+    // Without the dock's margin around it, so the terminal's padding,
+    // which takes a full-screen app's colours, reaches the tab's edges.
+    fn tab_style_override(&self, tab: &Tab, global: &TabStyle) -> Option<TabStyle> {
+        matches!(tab, Tab::Terminal(_)).then(|| {
+            let mut style = global.clone();
+            style.tab_body.inner_margin = egui::Margin::ZERO;
+            style
+        })
+    }
+
     // Every pane scrolls itself.
     fn scroll_bars(&self, _tab: &Tab) -> [bool; 2] {
         [false, false]
@@ -360,8 +372,9 @@ struct App {
     /// The rename box a terminal tab's menu opened.
     renaming: Option<Rename>,
     /// Terminals opened for `/edit`'s editor, which close once their shell
-    /// exits (editor.rs types `&& exit` after the editor).
-    editors: Vec<TermId>,
+    /// exits (editor.rs types `&& exit` after the editor), each with the
+    /// terminal that had the focus before it, which gets it back.
+    editors: Vec<(TermId, Option<TermId>)>,
     /// The busy terminals' titles, while the question before quitting is
     /// up.
     confirm_quit: Option<Vec<String>>,
@@ -387,6 +400,7 @@ impl App {
     /// started, is started again in the folder the request names; an
     /// alias no terminal holds gets a new terminal.
     fn open_terminal(&mut self, request: chat::TerminalRequest, ctx: &egui::Context) {
+        let before = self.last_terminal.filter(|id| self.terminals.contains(*id));
         let (id, new) = match request.name.as_deref().map(Alias::parse) {
             _ if request.new => (self.terminals.add(None, None, None), true),
             Some(Err(why)) => {
@@ -408,7 +422,7 @@ impl App {
         };
         self.last_terminal = Some(id);
         if request.run && new {
-            self.editors.push(id);
+            self.editors.push((id, before));
         }
         let running = self.terminals.pane(id).is_some_and(|t| !t.exited());
         if !running && !self.start_terminal(id, request.cwd.as_deref(), ctx) {
@@ -858,16 +872,25 @@ impl eframe::App for App {
         }
         // An editor's terminal closes once its shell has exited; one where
         // the editor didn't start stays, with the shell's error.
-        let done: Vec<TermId> = self
+        // The terminal that had the focus before comes back, not whichever
+        // tab egui_dock brings forward in the editor's place.
+        let done: Vec<(TermId, Option<TermId>)> = self
             .editors
             .iter()
             .copied()
-            .filter(|&id| self.terminals.pane(id).is_none_or(TerminalPane::exited))
+            .filter(|&(id, _)| self.terminals.pane(id).is_none_or(TerminalPane::exited))
             .collect();
-        self.editors.retain(|id| !done.contains(id));
-        for id in done {
+        self.editors.retain(|e| !done.contains(e));
+        for (id, before) in done {
             if self.terminals.contains(id) {
                 self.end_terminal(id);
+                if let Some(back) = before.filter(|b| self.terminals.contains(*b)) {
+                    if let Some(terminal) = self.terminals.pane_mut(back) {
+                        terminal.focus();
+                    }
+                    self.last_terminal = Some(back);
+                    self.focus_tab(Tab::Terminal(back));
+                }
             }
         }
         // The chat can take the folder of the terminal that last had the

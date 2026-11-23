@@ -27,7 +27,7 @@ use libghostty_vt::{
     point::{Coordinate, Point},
     render::{CellIterator, Dirty, RenderState, RowIterator},
     report::SizeReportSize,
-    screen::{CellWide, Screen},
+    screen::{CellWide, RowSemanticPrompt, Screen},
     selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
     terminal::ScrollViewport,
 };
@@ -980,6 +980,12 @@ impl TerminalPane {
                 let cached = &mut self.rows[index];
                 cached.bg.clear();
                 cached.text.clear();
+                cached.edge.clear();
+                let prompt = !matches!(
+                    row.raw_row()?.semantic_prompt(),
+                    Ok(RowSemanticPrompt::None) | Err(_)
+                );
+                let mut extend_cells = Vec::new();
                 let mut cell_it = self.cell_it.update(row)?;
                 let mut x = PADDING;
                 let mut col: u16 = 0;
@@ -1006,6 +1012,7 @@ impl TerminalPane {
                     let selected = cell.is_selected()?;
                     let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
                     let bg = cell.bg_color()?;
+                    extend_cells.push((bg, (graphemes > 0).then(|| text.chars().next()).flatten()));
                     let mut has_bg = bg.is_some();
                     let mut bg = bg.unwrap_or(colors.background);
                     let mut bold = false;
@@ -1017,6 +1024,7 @@ impl TerminalPane {
                         }
                         bold = style.bold;
                     }
+                    cached.edge.push(rgba(bg));
                     // Selected cells are drawn in reverse video, as in the
                     // macroquad build (walk_row in src/main.rs).
                     if selected {
@@ -1076,6 +1084,7 @@ impl TerminalPane {
                         dims,
                     );
                 }
+                cached.extend = extends(prompt, &extend_cells, colors.background);
                 row.set_dirty(false)?;
             }
             y += dims.cell_height;
@@ -1096,6 +1105,11 @@ impl TerminalPane {
             [0.0, 0.0, dims.width, dims.height],
             rgba(colors.background),
         ));
+        out.extend(
+            padding_rects(&self.rows, dims, rgba(colors.background))
+                .into_iter()
+                .map(|(rect, color)| Instance::solid(rect, color)),
+        );
         for row in &self.rows {
             out.extend_from_slice(&row.bg);
         }
@@ -1234,6 +1248,76 @@ fn draw_badge(ui: &egui::Ui, rect: egui::Rect, text: &str) {
 struct RowInstances {
     bg: Vec<Instance>,
     text: Vec<Instance>,
+    /// Each cell's background, the default one included, for the padding.
+    edge: Vec<[u8; 4]>,
+    /// Whether the padding above or below may take this row's colours.
+    extend: bool,
+}
+
+/// The padding around the grid in the colours of the nearest cells, as
+/// Ghostty's `window-padding-color = extend` draws it (src/renderer/
+/// generic.zig and shaders.metal at 108cacb1): a full-screen app with its
+/// own background, such as Helix, then fills the pane without a frame in
+/// the terminal's default colour. The sides always take the edge cells'
+/// colours; the top and bottom only when the nearest row allows it
+/// (`extends`). Colours equal to the default `background` are skipped, as
+/// the pane is already that colour.
+fn padding_rects(
+    rows: &[RowInstances],
+    dims: Dimensions,
+    background: [u8; 4],
+) -> Vec<([f32; 4], [u8; 4])> {
+    let (cw, ch) = (dims.cell_width, dims.cell_height);
+    let mut out = Vec::new();
+    // One strip of the padding above or below a row, in runs of one colour.
+    let strip = |edge: &[[u8; 4]], y: f32, h: f32, out: &mut Vec<([f32; 4], [u8; 4])>| {
+        let mut run: Option<(f32, [u8; 4])> = None;
+        for (c, &color) in edge.iter().enumerate() {
+            let start = if c == 0 { 0.0 } else { PADDING + c as f32 * cw };
+            if let Some((x, held)) = run
+                && held != color
+            {
+                out.push(([x, y, start - x, h], held));
+                run = None;
+            }
+            run.get_or_insert((start, color));
+        }
+        if let Some((x, held)) = run {
+            out.push(([x, y, dims.width - x, h], held));
+        }
+    };
+    let mut y = PADDING;
+    for row in rows {
+        if let (Some(&first), Some(&last)) = (row.edge.first(), row.edge.last()) {
+            out.push(([0.0, y, PADDING, ch], first));
+            let right = PADDING + row.edge.len() as f32 * cw;
+            out.push(([right, y, dims.width - right, ch], last));
+        }
+        y += ch;
+    }
+    if let Some(top) = rows.first().filter(|r| r.extend) {
+        strip(&top.edge, 0.0, PADDING, &mut out);
+    }
+    if let Some(bottom) = rows.last().filter(|r| r.extend) {
+        strip(&bottom.edge, y, dims.height - y, &mut out);
+    }
+    out.retain(|(rect, color)| *color != background && rect[2] > 0.0 && rect[3] > 0.0);
+    out
+}
+
+/// Whether the padding may take a row's colours (Ghostty's
+/// `neverExtendBg`, src/renderer/row.zig): not a prompt row, and no cell
+/// with the default background or a powerline glyph, which is drawn to fit
+/// its cell exactly.
+fn extends(prompt: bool, cells: &[(Option<Rgb>, Option<char>)], background: Rgb) -> bool {
+    !prompt
+        && cells.iter().all(|&(bg, first)| {
+            bg.is_some_and(|bg| bg != background) && !first.is_some_and(is_powerline)
+        })
+}
+
+fn is_powerline(c: char) -> bool {
+    matches!(c as u32, 0xE0B0..=0xE0C8 | 0xE0CA | 0xE0CC..=0xE0D2 | 0xE0D4)
 }
 
 /// Where and how one cell's glyph is drawn.
@@ -1450,6 +1534,52 @@ fn key_for(k: egui::Key) -> Option<(Key, char)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full-screen app's background reaches the pane's edges (Ghostty's
+    /// `window-padding-color = extend`); a shell's default one doesn't
+    /// draw, and a row with a default cell keeps the top or bottom plain.
+    #[test]
+    fn the_padding_takes_the_edge_cells_colours() {
+        let dims = Dimensions {
+            width: 2.0 * PADDING + 30.0 + 4.0,
+            height: 2.0 * PADDING + 40.0 + 7.0,
+            cell_width: 10.0,
+            cell_height: 20.0,
+            baseline: 15.0,
+            font_size: 13,
+            dpi_scale: 1.0,
+        };
+        let (bg, a, b) = ([0, 0, 0, 255], [1, 1, 1, 255], [2, 2, 2, 255]);
+        let row = |edge: [[u8; 4]; 3], extend| RowInstances {
+            edge: edge.to_vec(),
+            extend,
+            ..Default::default()
+        };
+        let p = PADDING;
+        let right = p + 30.0;
+        // Top: a, a, b in two runs; bottom row has a default cell.
+        let rows = [row([a, a, b], true), row([b, a, bg], false)];
+        assert_eq!(
+            padding_rects(&rows, dims, bg),
+            vec![
+                ([0.0, p, p, 20.0], a),
+                ([right, p, p + 4.0, 20.0], b),
+                ([0.0, p + 20.0, p, 20.0], b),
+                ([0.0, 0.0, p + 20.0, p], a),
+                ([p + 20.0, 0.0, dims.width - p - 20.0, p], b),
+            ]
+        );
+        let shell = [row([bg, bg, bg], false), row([bg, bg, bg], false)];
+        assert!(padding_rects(&shell, dims, bg).is_empty());
+
+        let black = Rgb { r: 0, g: 0, b: 0 };
+        let blue = Some(Rgb { r: 0, g: 0, b: 9 });
+        assert!(extends(false, &[(blue, None), (blue, Some('x'))], black));
+        assert!(!extends(true, &[(blue, None)], black), "a prompt row");
+        assert!(!extends(false, &[(blue, None), (None, None)], black));
+        assert!(!extends(false, &[(Some(black), None)], black));
+        assert!(!extends(false, &[(blue, Some('\u{e0b0}'))], black));
+    }
 
     /// tai's shell integration reports the folder with OSC 7, which the
     /// terminal keeps for `folder`. Unix only, like `reported_dir`'s test.
