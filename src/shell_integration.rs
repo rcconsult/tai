@@ -170,6 +170,10 @@ fn percent_decode(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Unix paths only: tai's shell integration covers zsh and bash, and on
+    /// Windows cmd and PowerShell report no folder. A Windows path in
+    /// OSC 7 (`file://host/C:/x`) isn't read yet.
+    #[cfg(unix)]
     #[test]
     fn a_reported_folder_is_read_from_either_url() {
         assert_eq!(

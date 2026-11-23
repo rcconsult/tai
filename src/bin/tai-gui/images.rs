@@ -776,9 +776,14 @@ mod tests {
     #[test]
     fn a_local_path_is_in_the_working_folder_and_opens_in_preview() {
         let (out, hosts) = run("![plot](out/plot.png)", Web::Ask);
+        // The Preview link holds the path as the platform joins it.
+        let shown = Path::new("/work").join("out/plot.png");
         assert_eq!(
             out,
-            "![plot](<file:///work/out/plot.png>) [open in Preview](<tai-image:/work/out/plot.png>)"
+            format!(
+                "![plot](<file:///work/out/plot.png>) [open in Preview](<tai-image:{}>)",
+                shown.display()
+            )
         );
         assert!(hosts.is_empty());
         // A path with a space is written in <…>, or it isn't an image.
