@@ -209,6 +209,16 @@ impl<P> Terminals<P> {
         self.entries.values_mut().filter_map(|e| e.pane.as_mut())
     }
 
+    /// The titles of the terminals whose pane passes `test`, in the order
+    /// they were created.
+    pub fn titles_where(&self, test: impl Fn(&P) -> bool) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.pane.as_ref().is_some_and(&test))
+            .map(|(&id, _)| self.title(id))
+            .collect()
+    }
+
     /// Close a terminal, freeing its aliases; returns its pane.
     pub fn remove(&mut self, id: TermId) -> Option<P> {
         self.entries.remove(&id).and_then(|e| e.pane)
@@ -226,6 +236,17 @@ impl<P> Terminals<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titles_where_lists_matching_panes_in_order() {
+        let mut t = Terminals::default();
+        t.add(None, None, Some(true));
+        t.add(None, Some("build".into()), Some(false));
+        t.add(None, None, Some(true));
+        t.add(None, Some("gone".into()), None::<bool>);
+        assert_eq!(t.titles_where(|&busy| busy), ["Terminal", "Terminal 3"]);
+        assert!(t.titles_where(|_| false).is_empty());
+    }
 
     #[test]
     fn aliases_are_numbers_or_names_with_a_letter() {

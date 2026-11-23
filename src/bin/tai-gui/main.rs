@@ -324,6 +324,11 @@ struct App {
     confirm_close: Option<TermId>,
     /// The rename box a terminal tab's menu opened.
     renaming: Option<Rename>,
+    /// The busy terminals' titles, while the question before quitting is
+    /// up.
+    confirm_quit: Option<Vec<String>>,
+    /// The user said quit: the next close request goes through.
+    quit_confirmed: bool,
     chat: chat::ChatPane,
     runs: runs::RunsPane,
     engine: engine::Engine,
@@ -511,8 +516,40 @@ impl App {
         }
     }
 
-    /// The question before a busy terminal closes, and the rename box.
+    /// The questions before a busy terminal closes and before quitting,
+    /// and the rename box.
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(busy) = &self.confirm_quit {
+            let mut answer = None;
+            let modal = egui::Modal::new(egui::Id::new("confirm-quit")).show(ctx, |ui| {
+                ui.strong("Quit tai?");
+                ui.label(format!(
+                    "These terminals may be running a command: {}. Quitting \
+                     ends their shells and everything running in them.",
+                    busy.join(", ")
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Quit").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+            if modal.should_close() && answer.is_none() {
+                answer = Some(false);
+            }
+            match answer {
+                Some(true) => {
+                    self.confirm_quit = None;
+                    self.quit_confirmed = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Some(false) => self.confirm_quit = None,
+                None => {}
+            }
+        }
         if let Some(id) = self.confirm_close {
             let title = self.terminals.title(id);
             let mut answer = None;
@@ -706,6 +743,17 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let started = std::time::Instant::now();
+        // Quitting with a busy terminal asks first, as closing its tab
+        // does; Ghostty's confirm-close-surface covers quitting too
+        // (src/config/Config.zig at 108cacb1).
+        if !self.quit_confirmed && ui.ctx().input(|i| i.viewport().close_requested()) {
+            let busy = self.terminals.titles_where(TerminalPane::busy);
+            if !busy.is_empty() {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_quit = Some(busy);
+            }
+        }
         // Read the shells' output even while their tabs are hidden.
         for terminal in self.terminals.panes_mut() {
             // The pty's reader wakes egui when output arrives. A frame
@@ -944,6 +992,8 @@ fn main() -> eframe::Result {
                 terminal_place: None,
                 confirm_close: None,
                 renaming: None,
+                confirm_quit: None,
+                quit_confirmed: false,
                 chat: chat::ChatPane::new(),
                 runs: runs::RunsPane::default(),
                 hidden: Vec::new(),
