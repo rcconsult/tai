@@ -1,7 +1,9 @@
 # ADR 0013: Reach a terminal by its number or name, and type a command into it
 
-- **Status:** Proposed 2026-11-23. Waits for the owner's review, and for
-  ppxai's agreement on its half ([change request](../upstream/ppxai-terminals-by-alias.md)).
+- **Status:** Proposed 2026-11-23. The owner settled the open points on
+  2026-11-23 (ask before closing a busy terminal; type only at a prompt).
+  ppxai agreed to its half ([change request](../upstream/ppxai-terminals-by-alias.md)),
+  which ppxai records as its ADR 0020. Accepted when the code lands.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host, from the owner's answers on 2026-11-23 and the macOS session's
   notes on steps 1–3.
@@ -63,12 +65,12 @@ answer wait for the user's yes"):
    - **Closing a terminal's tab ends its shell** and closes the terminal.
      This replaces step 1's rule that a closed tab hides a running shell
      (and that the first terminal is never removed).
-     - **Proposed, for the owner:** when the shell isn't at its prompt
-       (a build, an editor, ssh), ask before closing, as Ghostty's
-       `confirm-close-surface` does (default true, skipped when shell
-       integration says nothing is running; Ghostty
-       `src/config/Config.zig` at `108cacb1`). That needs decision 7's
-       prompt marks; without them, as with PowerShell and cmd, always ask.
+     - **Ask before closing** when the shell isn't at its prompt (a
+       build, an editor, ssh), as Ghostty's `confirm-close-surface` does
+       (default true, skipped when shell integration says nothing is
+       running; Ghostty `src/config/Config.zig` at `108cacb1`). This uses
+       decision 7's prompt marks; without them, as with PowerShell and
+       cmd, always ask. An exited shell closes without asking.
      - Ending the shell doesn't block the window. On Unix, dropping a
        child sends SIGHUP and waits up to 1 s before SIGKILL
        (`src/pty_unix.rs`), so a closed terminal is dropped on a thread of
@@ -107,7 +109,7 @@ answer wait for the user's yes"):
    with OSC 133), how consent looks, the alternate screen, and how this
    sits beside ppxai's own `run_shell` tool. It needs its own ADR, since it
    changes what ADR 0001 assumes.
-7. **Proposed, for the owner: type only at a shell prompt.** Today
+7. **Type only at a shell prompt.** Today
    `run_shell` refuses only while a full-screen program holds the
    alternate screen (`type_command`, `src/bin/tai-gui/terminal.rs`); a
    program on the main screen (python, ssh, `cat`, a `read` prompt) still

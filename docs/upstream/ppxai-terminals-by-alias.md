@@ -100,3 +100,14 @@ owner.
 - **Order:** Python and VS Code first. The web app needs a new
   `TerminalView.typeText` that writes to the PTY websocket without a
   newline, the biggest piece, done last.
+
+## The owner's answers (2026-11-23)
+
+- **Go** for ppxai's half.
+- **The VS Code code-block "Run" button** (`chatPanel.ts`,
+  `runCommandInTerminal`) follows the same rule: it types the command and
+  leaves Enter to the user.
+- **Record the type-don't-run rule in ppxai ADR 0020**, once for all
+  clients, and point the `SideEffect` docstring at it.
+- On tai's side: ask before closing a busy terminal, and type only at a
+  shell prompt (OSC 133); both are in ADR 0013.
