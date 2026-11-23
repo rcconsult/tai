@@ -62,6 +62,7 @@ mod macos_quit;
 mod ppxai;
 mod runs;
 mod terminal;
+mod textview;
 
 use aliases::{Alias, TermId};
 // The pty modules size the pseudo terminal from `crate::Dimensions`.
@@ -91,6 +92,8 @@ enum Tab {
     /// An image opened from an answer or by `/show`, by its index in
     /// `App::images`.
     Image(usize),
+    /// A text file `/show` opened, by its index in `App::texts`.
+    Text(usize),
 }
 
 impl Tab {
@@ -101,6 +104,7 @@ impl Tab {
             Tab::Terminal(id) => terminals.title(id),
             Tab::Preview => "Preview".into(),
             Tab::Image(_) => "Image".into(),
+            Tab::Text(_) => "File".into(),
         }
     }
 }
@@ -130,6 +134,7 @@ struct Panes<'a> {
     runs: &'a mut runs::RunsPane,
     engine: &'a engine::Engine,
     images: &'a [std::path::PathBuf],
+    texts: &'a [textview::TextFile],
     /// Tabs closed this frame; the app keeps them to show again.
     closed: Vec<Tab>,
     /// Terminals closed this frame, whose shells end.
@@ -156,6 +161,11 @@ impl TabViewer for Panes<'_> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Image".into())
                 .into(),
+            Tab::Text(i) => self
+                .texts
+                .get(*i)
+                .map_or_else(|| "File".into(), textview::TextFile::title)
+                .into(),
             tab => tab.title(self.terminals).into(),
         }
     }
@@ -174,6 +184,12 @@ impl TabViewer for Panes<'_> {
                 Some(path) => images::show_file(ui, path),
                 None => {
                     ui.label("No image.");
+                }
+            },
+            Tab::Text(i) => match self.texts.get(*i) {
+                Some(file) => file.ui(ui),
+                None => {
+                    ui.label("No file.");
                 }
             },
         }
@@ -218,8 +234,9 @@ impl TabViewer for Panes<'_> {
 
     fn on_close(&mut self, tab: &mut Tab) -> OnCloseResponse {
         match *tab {
-            // An image tab just closes; answers and /show open it again.
-            Tab::Image(_) => {}
+            // An image or file tab just closes; answers and /show open it
+            // again.
+            Tab::Image(_) | Tab::Text(_) => {}
             // A busy terminal asks first, as Ghostty's
             // confirm-close-surface does.
             Tab::Terminal(id) if self.terminals.pane(id).is_some_and(TerminalPane::busy) => {
@@ -358,6 +375,8 @@ struct App {
     engine: engine::Engine,
     /// The images opened in tabs, which `Tab::Image` indexes.
     images: Vec<std::path::PathBuf>,
+    /// The text files `/show` opened, which `Tab::Text` indexes.
+    texts: Vec<textview::TextFile>,
 }
 
 impl App {
@@ -502,7 +521,28 @@ impl App {
                 self.images.len() - 1
             }
         };
-        let tab = Tab::Image(i);
+        self.show_in_preview(Tab::Image(i));
+    }
+
+    /// Show a text file `/show` opened in the Preview stack, in its own
+    /// tab; a file shown again gets its tab back, with the new text.
+    fn open_text(&mut self, file: textview::TextFile) {
+        let i = match self.texts.iter().position(|f| f.path == file.path) {
+            Some(i) => {
+                self.texts[i] = file;
+                i
+            }
+            None => {
+                self.texts.push(file);
+                self.texts.len() - 1
+            }
+        };
+        self.show_in_preview(Tab::Text(i));
+    }
+
+    /// Put `tab` in the Preview stack, or where Preview last was, unless
+    /// it's open already, and bring it forward.
+    fn show_in_preview(&mut self, tab: Tab) {
         if self.dock.find_tab(&tab).is_none() {
             let preview = self
                 .dock
@@ -844,6 +884,7 @@ impl eframe::App for App {
             runs: &mut self.runs,
             engine: &self.engine,
             images: &self.images,
+            texts: &self.texts,
             closed: Vec::new(),
             ended: Vec::new(),
             confirm: None,
@@ -898,6 +939,9 @@ impl eframe::App for App {
         }
         for request in self.chat.take_terminals() {
             self.open_terminal(request, ui.ctx());
+        }
+        for file in self.chat.take_viewers() {
+            self.open_text(file);
         }
         // Answers are model output, and a Markdown link can name any
         // scheme: file:, or a Windows protocol handler. Only web links open
@@ -1057,6 +1101,7 @@ fn main() -> eframe::Result {
                 stats: FrameStats::new(),
                 engine: engine::Engine::start(cc.egui_ctx.clone()),
                 images: Vec::new(),
+                texts: Vec::new(),
             }))
         }),
     );

@@ -558,6 +558,18 @@ pub struct CommandOutcome {
     pub state: StateSync,
     /// The envelope's side effects that tai-gui acts on, in order.
     pub effects: Vec<SideEffect>,
+    /// A `FileViewResult`'s file and text (`/show` of a text file), which
+    /// an `open_viewer` side effect shows.
+    pub file: Option<FileText>,
+}
+
+/// A file's text as ppxai read it.
+#[derive(Debug, PartialEq)]
+pub struct FileText {
+    pub path: String,
+    pub text: String,
+    /// ppxai's name for its language, such as `python`.
+    pub language: Option<String>,
 }
 
 impl CommandOutcome {
@@ -577,6 +589,19 @@ impl CommandOutcome {
                 .flatten()
                 .filter_map(SideEffect::parse)
                 .collect(),
+            file: (v["result"]["type"] == "FileViewResult")
+                .then(|| {
+                    let r = &v["result"];
+                    Some(FileText {
+                        path: r["filepath"]
+                            .as_str()
+                            .filter(|p| !p.is_empty())?
+                            .to_string(),
+                        text: r["content"].as_str().unwrap_or_default().to_string(),
+                        language: r["language"].as_str().map(str::to_string),
+                    })
+                })
+                .flatten(),
         }
     }
 }
@@ -640,6 +665,9 @@ impl StateSync {
 pub enum SideEffect {
     /// `show_image`: `/show` of an image.
     ShowImage(String),
+    /// `open_viewer`: `/show` of a text file, whose text is the
+    /// result's (`CommandOutcome::file`).
+    View(String),
     /// `open_terminal` (`/terminal`), or `run_shell` with the command to
     /// type into it. `cwd` is where a new terminal starts; `name` is the
     /// terminal's alias (ADR 0013), None for the one that last had the
@@ -710,6 +738,7 @@ impl SideEffect {
         };
         Some(match v["kind"].as_str()? {
             "show_image" => Self::ShowImage(string("filepath")?),
+            "open_viewer" => Self::View(string("filepath")?),
             "open_terminal" => Self::Terminal {
                 cwd: string("cwd"),
                 command: None,
@@ -1579,9 +1608,9 @@ mod tests {
     };
 
     use super::{
-        Answer, ChatEvent, Client, CommandOutcome, Consent, MergeError, Model, Provider, Providers,
-        Roster, Run, RunFilter, SideEffect, Source, Sse, StateSync, ToolKind, ToolStep, detail,
-        encode, json, resume_args, sse_line,
+        Answer, ChatEvent, Client, CommandOutcome, Consent, FileText, MergeError, Model, Provider,
+        Providers, Roster, Run, RunFilter, SideEffect, Source, Sse, StateSync, ToolKind, ToolStep,
+        detail, encode, json, resume_args, sse_line,
     };
 
     // The shapes below are the ones ppxai's fence pins
@@ -1990,6 +2019,29 @@ mod tests {
         assert_eq!(resume_args("fix it", " add tests "), "fix it — add tests");
         assert_eq!(resume_args("", "add tests"), "add tests");
         assert_eq!(resume_args(" fix it ", "  "), "fix it");
+    }
+
+    #[test]
+    fn a_file_view_carries_its_text() {
+        let shown = CommandOutcome::parse(&serde_json::json!({
+            "result": {"type":"FileViewResult","status":"success",
+                "message":"Displaying a.py (0.1 KB, 2 lines)","filepath":"/w/a.py",
+                "content":"x = 1\n","language":"python","read_only":true},
+            "side_effects": [{"kind":"open_viewer","filepath":"/w/a.py"}]}));
+        assert_eq!(
+            shown.file,
+            Some(FileText {
+                path: "/w/a.py".into(),
+                text: "x = 1\n".into(),
+                language: Some("python".into()),
+            })
+        );
+        assert_eq!(shown.effects, vec![SideEffect::View("/w/a.py".into())]);
+        assert_eq!(shown.markdown, "**Displaying a.py (0.1 KB, 2 lines)**");
+        // Other results carry no file.
+        let other = CommandOutcome::parse(&serde_json::json!({
+            "result": {"type":"NotificationResult","message":"m","filepath":"/w/a"}}));
+        assert_eq!(other.file, None);
     }
 
     #[test]

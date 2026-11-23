@@ -732,6 +732,7 @@ dependencies = [
  "itertools",
  "log",
  "profiling",
+ "syntect",
 ]
 
 [[package]]
@@ -3304,6 +3305,7 @@ dependencies = [
  "eframe",
  "egui_commonmark",
  "egui_dock",
+ "egui_extras",
  "getrandom 0.4.3",
  "icy_sixel",
  "image 0.25.10",
