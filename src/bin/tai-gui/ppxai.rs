@@ -1489,7 +1489,7 @@ mod tests {
     };
 
     // The shapes below are the ones ppxai's fence pins
-    // (tests/test_run_session_contract.py at e3ae990b).
+    // (tests/test_run_session_contract.py at 0fad3066).
 
     #[test]
     fn a_run_reads_its_conversation_and_merge_time() {
@@ -1928,8 +1928,9 @@ mod tests {
     /// It needs a ppxai-server with `--owned`, ADR 0018 and unique
     /// conversation names (feature/v1.19.5 at bac85e6e, "fix(session): two
     /// conversations started in the same second get distinct names", or
-    /// later; `TAI_PPXAI_SERVER` picks it). It last passed against e3ae990b,
-    /// "feat(web): web images in an answer wait for the user's yes". It
+    /// later; `TAI_PPXAI_SERVER` picks it). It last passed against 0fad3066,
+    /// "fix(terminal): /terminal with a command says it was sent, not
+    /// typed". It
     /// needs a provider that answers, and `execution.collect` not set to
     /// "no". It starts one tool-free run.
     #[test]

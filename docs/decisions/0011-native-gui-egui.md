@@ -432,7 +432,9 @@ fence test `tests/test_run_session_contract.py`). tai's client for it is
 checks it against ppxai `bac85e6e`. No view uses it yet. (2026-11-23:
 the test now pins ppxai `e3ae990b`, "feat(web): web images in an answer
 wait for the user's yes", and passes against it; the fence test is
-unchanged between the two.)
+unchanged between the two. Later on 2026-11-23 it moved to `0fad3066`,
+"fix(terminal): /terminal with a command says it was sent, not typed",
+with the fence test unchanged again.)
 - **Which session:** the conversation name (`session_…`, the saved
   chat), not the `X-Session-Id` engine slot.
 - **A session's runs:** `RunMetaResponse` gains `session_id`. On
