@@ -56,6 +56,8 @@ mod engine;
 mod gpu;
 mod grammar;
 mod images;
+#[cfg(target_os = "macos")]
+mod macos_quit;
 mod ppxai;
 mod runs;
 mod terminal;
@@ -329,6 +331,9 @@ struct App {
     confirm_quit: Option<Vec<String>>,
     /// The user said quit: the next close request goes through.
     quit_confirmed: bool,
+    /// macOS: the app menu's Quit now closes the window (macos_quit.rs).
+    #[cfg(target_os = "macos")]
+    quit_rerouted: bool,
     chat: chat::ChatPane,
     runs: runs::RunsPane,
     engine: engine::Engine,
@@ -743,6 +748,10 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let started = std::time::Instant::now();
+        #[cfg(target_os = "macos")]
+        if !self.quit_rerouted {
+            self.quit_rerouted = macos_quit::quit_closes_the_window();
+        }
         // Quitting with a busy terminal asks first, as closing its tab
         // does; Ghostty's confirm-close-surface covers quitting too
         // (src/config/Config.zig at 108cacb1).
@@ -994,6 +1003,8 @@ fn main() -> eframe::Result {
                 renaming: None,
                 confirm_quit: None,
                 quit_confirmed: false,
+                #[cfg(target_os = "macos")]
+                quit_rerouted: false,
                 chat: chat::ChatPane::new(),
                 runs: runs::RunsPane::default(),
                 hidden: Vec::new(),
