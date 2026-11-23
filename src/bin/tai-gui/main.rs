@@ -50,6 +50,7 @@ mod shell_integration;
 #[allow(dead_code)]
 mod shortcuts;
 
+mod aliases;
 mod chat;
 mod engine;
 mod gpu;
@@ -59,8 +60,11 @@ mod ppxai;
 mod runs;
 mod terminal;
 
+use aliases::{Alias, TermId};
 // The pty modules size the pseudo terminal from `crate::Dimensions`.
 use terminal::{Dimensions, TerminalPane};
+
+type Terminals = aliases::Terminals<TerminalPane>;
 
 /// The UI's proportional font (fonts/README.md). Only tai-gui uses it.
 const INTER_BYTES: &[u8] = include_bytes!("../../../fonts/Inter-Regular.ttf");
@@ -78,8 +82,8 @@ fn indirect_validation_off_by_default() -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
     Chat,
-    /// A terminal, by its index in `App::terminals`.
-    Terminal(usize),
+    /// A terminal, by its internal ID (ADR 0013).
+    Terminal(TermId),
     Preview,
     /// An image opened from an answer or by `/show`, by its index in
     /// `App::images`.
@@ -87,37 +91,49 @@ enum Tab {
 }
 
 impl Tab {
-    fn title(self) -> String {
+    /// The tab's title; a terminal's comes from its aliases.
+    fn title(self, terminals: &Terminals) -> String {
         match self {
             Tab::Chat => "Chat".into(),
-            Tab::Terminal(0) => "Terminal".into(),
-            Tab::Terminal(i) => format!("Terminal {}", i + 1),
+            Tab::Terminal(id) => terminals.title(id),
             Tab::Preview => "Preview".into(),
             Tab::Image(_) => "Image".into(),
         }
     }
 }
 
-/// The starting layout: chat on the left; terminal and preview stacked on
-/// the right, so rotating between them can be tried.
-fn initial_layout() -> DockState<Tab> {
+/// The starting layout: chat on the left; the first terminal and preview
+/// stacked on the right, so rotating between them can be tried.
+fn initial_layout(first: TermId) -> DockState<Tab> {
     let mut dock = DockState::new(vec![Tab::Chat]);
     dock.main_surface_mut().split_right(
         NodeIndex::root(),
         0.45,
-        vec![Tab::Terminal(0), Tab::Preview],
+        vec![Tab::Terminal(first), Tab::Preview],
     );
     dock
 }
 
+/// What a terminal tab's right-click menu asked for.
+enum TabAction {
+    Rename(TermId),
+    Close(TermId),
+}
+
 struct Panes<'a> {
-    terminals: &'a mut [Option<TerminalPane>],
+    terminals: &'a mut Terminals,
     chat: &'a mut chat::ChatPane,
     runs: &'a mut runs::RunsPane,
     engine: &'a engine::Engine,
     images: &'a [std::path::PathBuf],
     /// Tabs closed this frame; the app keeps them to show again.
     closed: Vec<Tab>,
+    /// Terminals closed this frame, whose shells end.
+    ended: Vec<TermId>,
+    /// A terminal whose tab was closed while it was busy: the app asks
+    /// first.
+    confirm: Option<TermId>,
+    action: Option<TabAction>,
 }
 
 impl TabViewer for Panes<'_> {
@@ -136,13 +152,13 @@ impl TabViewer for Panes<'_> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Image".into())
                 .into(),
-            tab => tab.title().into(),
+            tab => tab.title(self.terminals).into(),
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         match tab {
-            Tab::Terminal(i) => match self.terminals.get_mut(*i).and_then(Option::as_mut) {
+            Tab::Terminal(id) => match self.terminals.pane_mut(*id) {
                 Some(terminal) => terminal.ui(ui),
                 None => {
                     ui.label("The terminal didn't start; see the log.");
@@ -161,11 +177,25 @@ impl TabViewer for Panes<'_> {
 
     // A terminal's tab shows its shell's folder on hover.
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
-        if let Tab::Terminal(i) = *tab
-            && let Some(Some(terminal)) = self.terminals.get(i)
+        if let Tab::Terminal(id) = *tab
+            && let Some(terminal) = self.terminals.pane(id)
             && let Some(folder) = terminal.folder()
         {
             response.clone().on_hover_text(folder.to_string_lossy());
+        }
+    }
+
+    // A terminal's tab is renamed from its right-click menu.
+    fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Tab, _path: egui_dock::NodePath) {
+        if let Tab::Terminal(id) = *tab {
+            if ui.button("Rename…").clicked() {
+                self.action = Some(TabAction::Rename(id));
+                ui.close();
+            }
+            if ui.button("Close").clicked() {
+                self.action = Some(TabAction::Close(id));
+                ui.close();
+            }
         }
     }
 
@@ -179,8 +209,9 @@ impl TabViewer for Panes<'_> {
         [false, false]
     }
 
-    // Closing a tab hides it: its pane lives on in the app (a terminal's
-    // shell keeps running) and View > Show puts it back.
+    // Closing chat's or preview's tab hides it: its pane lives on in the
+    // app and View > Show puts it back. Closing a terminal's tab ends its
+    // shell (ADR 0013 decision 2).
     fn is_closeable(&self, _tab: &Tab) -> bool {
         true
     }
@@ -189,20 +220,13 @@ impl TabViewer for Panes<'_> {
         match *tab {
             // An image tab just closes; answers and /show open it again.
             Tab::Image(_) => {}
-            // A terminal whose shell has exited goes, apart from the first,
-            // which `/terminal` starts again.
-            Tab::Terminal(i)
-                if i > 0
-                    && self
-                        .terminals
-                        .get(i)
-                        .and_then(Option::as_ref)
-                        .is_none_or(TerminalPane::exited) =>
-            {
-                if let Some(slot) = self.terminals.get_mut(i) {
-                    *slot = None;
-                }
+            // A busy terminal asks first, as Ghostty's
+            // confirm-close-surface does.
+            Tab::Terminal(id) if self.terminals.pane(id).is_some_and(TerminalPane::busy) => {
+                self.confirm = Some(id);
+                return OnCloseResponse::Ignore;
             }
+            Tab::Terminal(id) => self.ended.push(id),
             tab => self.closed.push(tab),
         }
         OnCloseResponse::Close
@@ -272,6 +296,15 @@ impl FrameStats {
     }
 }
 
+/// A terminal tab's rename box.
+struct Rename {
+    id: TermId,
+    text: String,
+    error: Option<String>,
+    /// The text box has taken the focus once.
+    focused: bool,
+}
+
 struct App {
     stats: Option<FrameStats>,
     dock: DockState<Tab>,
@@ -282,11 +315,18 @@ struct App {
     last_place: std::collections::HashMap<Tab, egui_dock::NodePath>,
     /// The pane shown over the whole window, if one is zoomed.
     zoomed: Option<Tab>,
-    /// The terminals, which `Tab::Terminal` indexes. A slot is None when
-    /// its shell didn't start, or its tab closed after the shell exited.
-    terminals: Vec<Option<TerminalPane>>,
+    /// The terminals by ID, with their aliases. A pane is None when its
+    /// shell didn't start.
+    terminals: Terminals,
     /// The terminal that last had the focus, where `/terminal` goes.
-    last_terminal: usize,
+    last_terminal: Option<TermId>,
+    /// Where a terminal tab was last seen, so a new one goes there when
+    /// every terminal has closed.
+    terminal_place: Option<egui_dock::NodePath>,
+    /// A busy terminal whose tab was closed, waiting for the user's yes.
+    confirm_close: Option<TermId>,
+    /// The rename box a terminal tab's menu opened.
+    renaming: Option<Rename>,
     chat: chat::ChatPane,
     runs: runs::RunsPane,
     engine: engine::Engine,
@@ -295,71 +335,89 @@ struct App {
 }
 
 impl App {
-    /// `/terminal`, or a command to type into a terminal (ppxai's
-    /// `open_terminal` and `run_shell`), for the terminal that last had
-    /// the focus. A running shell is brought forward where it is; one that
-    /// has exited, or never started, is started again in the folder the
-    /// request names.
+    /// `/terminal [alias]`, or a command to type into a terminal (ppxai's
+    /// `open_terminal` and `run_shell`), for the terminal the alias names,
+    /// or the one that last had the focus (ADR 0013 decision 3). A running
+    /// shell is brought forward where it is; one that has exited, or never
+    /// started, is started again in the folder the request names; an
+    /// alias no terminal holds gets a new terminal.
     fn open_terminal(&mut self, request: chat::TerminalRequest, ctx: &egui::Context) {
-        // A terminal whose tab was closed for good falls back to the first.
-        let i = match self.terminals.get(self.last_terminal) {
-            Some(Some(_)) => self.last_terminal,
-            _ => 0,
+        let (id, new) = match request.name.as_deref().map(Alias::parse) {
+            Some(Err(why)) => {
+                self.chat.note(format!("No terminal opened: {why}."));
+                return;
+            }
+            Some(Ok(alias)) => match self.terminals.find(&alias) {
+                Some(id) => (id, false),
+                None => (self.terminals.add_for(&alias, None), true),
+            },
+            None => match self
+                .last_terminal
+                .filter(|id| self.terminals.contains(*id))
+                .or_else(|| self.terminals.first())
+            {
+                Some(id) => (id, false),
+                None => (self.terminals.add(None, None, None), true),
+            },
         };
-        self.last_terminal = i;
-        let running = self
-            .terminals
-            .get(i)
-            .and_then(Option::as_ref)
-            .is_some_and(|t| !t.exited());
-        if !running && !self.start_terminal(i, request.cwd.as_deref(), ctx) {
+        self.last_terminal = Some(id);
+        let running = self.terminals.pane(id).is_some_and(|t| !t.exited());
+        if !running && !self.start_terminal(id, request.cwd.as_deref(), ctx) {
+            // A new terminal that didn't start doesn't keep its alias.
+            if new {
+                self.terminals.remove(id);
+            }
             return;
         }
-        let Some(Some(terminal)) = self.terminals.get_mut(i) else {
+        let title = self.terminals.title(id);
+        let Some(terminal) = self.terminals.pane_mut(id) else {
             return;
         };
         match request.command {
             Some(command) => match terminal.type_command(&command) {
                 Ok(true) => {}
                 Ok(false) => self.chat.note(format!(
-                    "A program is running in the terminal, so this wasn't typed there: `{command}`"
+                    "{title} isn't at its prompt, so this wasn't typed there: `{command}`"
                 )),
                 Err(e) => {
                     tracing::warn!("typing a command: {e}");
-                    self.chat.note(format!("Run in the terminal: `{command}`"));
+                    self.chat.note(format!("Run in {title}: `{command}`"));
                 }
             },
             None => terminal.focus(),
         }
-        self.focus_tab(Tab::Terminal(i));
+        self.focus_tab(Tab::Terminal(id));
     }
 
     /// View > New terminal: a shell in the conversation's folder, in a tab
     /// beside the terminal that last had the focus.
     fn new_terminal(&mut self, ctx: &egui::Context) {
-        let i = self.terminals.len();
-        self.terminals.push(None);
+        let id = self.terminals.add(None, None, None);
         let folder = self.chat.folder().map(str::to_string);
-        if self.start_terminal(i, folder.as_deref(), ctx)
-            && let Some(Some(terminal)) = self.terminals.get_mut(i)
-        {
-            terminal.focus();
-            self.focus_tab(Tab::Terminal(i));
+        if !self.start_terminal(id, folder.as_deref(), ctx) {
+            self.terminals.remove(id);
+            return;
         }
+        if let Some(terminal) = self.terminals.pane_mut(id) {
+            terminal.focus();
+        }
+        self.focus_tab(Tab::Terminal(id));
     }
 
-    /// Start a shell in slot `i`, in `cwd` or tai-gui's own folder. Says
-    /// so in the chat when it fails.
-    fn start_terminal(&mut self, i: usize, cwd: Option<&str>, ctx: &egui::Context) -> bool {
+    /// Start a shell for terminal `id`, in `cwd` or tai-gui's own folder.
+    /// Says so in the chat when it fails.
+    fn start_terminal(&mut self, id: TermId, cwd: Option<&str>, ctx: &egui::Context) -> bool {
         let cwd = cwd.map(std::path::Path::new);
         match fonts::Coverage::new()
             .map_err(Into::into)
             .and_then(|coverage| TerminalPane::new(coverage, ctx.clone(), cwd))
         {
             Ok(terminal) => {
-                if let Some(slot) = self.terminals.get_mut(i) {
-                    *slot = Some(terminal);
+                // A restarted shell's old pane, exited, goes with it.
+                if let Some(old) = self.terminals.remove_pane(id) {
+                    old.close();
                 }
+                self.terminals.set_pane(id, terminal);
                 true
             }
             Err(e) => {
@@ -375,14 +433,20 @@ impl App {
     /// the dock at all.
     fn focus_tab(&mut self, tab: Tab) {
         if self.dock.find_tab(&tab).is_none() && !self.hidden.contains(&tab) {
-            let beside = [Tab::Terminal(self.last_terminal), Tab::Terminal(0)]
-                .iter()
-                .find_map(|t| self.dock.find_tab(t))
+            let last = self.last_terminal.filter(|id| Tab::Terminal(*id) != tab);
+            let beside = last
+                .and_then(|id| self.dock.find_tab(&Tab::Terminal(id)))
+                .or_else(|| {
+                    self.dock
+                        .iter_all_tabs()
+                        .find(|(_, t)| matches!(t, Tab::Terminal(_)) && **t != tab)
+                        .and_then(|(_, t)| self.dock.find_tab(t))
+                })
                 .map(|p| egui_dock::NodePath {
                     surface: p.surface,
                     node: p.node,
                 })
-                .or_else(|| self.last_place.get(&Tab::Terminal(0)).copied());
+                .or(self.terminal_place);
             match beside.and_then(|path| self.dock.leaf_mut(path).ok()) {
                 Some(leaf) => leaf.append_tab(tab),
                 None => self.dock.push_to_first_leaf(tab),
@@ -427,6 +491,119 @@ impl App {
             _ = self.dock.set_active_tab(path);
         }
         self.zoomed = None;
+    }
+
+    /// Close a terminal: its tab goes, its shell ends off the UI thread and
+    /// its aliases are free again.
+    fn end_terminal(&mut self, id: TermId) {
+        if let Some(path) = self.dock.find_tab(&Tab::Terminal(id)) {
+            self.dock.remove_tab(path);
+        }
+        if let Some(pane) = self.terminals.remove(id) {
+            // Dropping the pane closes the pseudo console on the UI
+            // thread; logged to see that it doesn't hold the window.
+            let started = std::time::Instant::now();
+            pane.close();
+            tracing::info!("closed a terminal in {:?}", started.elapsed());
+        }
+        if self.zoomed == Some(Tab::Terminal(id)) {
+            self.zoomed = None;
+        }
+        if self.last_terminal == Some(id) {
+            self.last_terminal = None;
+        }
+    }
+
+    /// Close a terminal's tab as its close button does: a busy one asks
+    /// first.
+    fn close_terminal(&mut self, id: TermId) {
+        if self.terminals.pane(id).is_some_and(TerminalPane::busy) {
+            self.confirm_close = Some(id);
+        } else {
+            self.end_terminal(id);
+        }
+    }
+
+    /// The question before a busy terminal closes, and the rename box.
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(id) = self.confirm_close {
+            let title = self.terminals.title(id);
+            let mut answer = None;
+            let modal = egui::Modal::new(egui::Id::new("confirm-close-terminal")).show(ctx, |ui| {
+                ui.strong(format!("Close {title}?"));
+                ui.label(
+                    "Its shell may be running a command. Closing ends the shell \
+                     and everything running in it.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Close").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+            if modal.should_close() && answer.is_none() {
+                answer = Some(false);
+            }
+            match answer {
+                Some(true) => {
+                    self.confirm_close = None;
+                    self.end_terminal(id);
+                }
+                Some(false) => self.confirm_close = None,
+                None => {}
+            }
+        }
+        if let Some(rename) = &mut self.renaming {
+            let title = self.terminals.title(rename.id);
+            let mut done = None;
+            let modal = egui::Modal::new(egui::Id::new("rename-terminal")).show(ctx, |ui| {
+                ui.strong(format!("Rename {title}"));
+                ui.weak(
+                    "A name (lowercase letters, digits and -, with a letter), \
+                     or a number to renumber it; empty takes the name away.",
+                );
+                let edit = ui.text_edit_singleline(&mut rename.text);
+                if !rename.focused {
+                    edit.request_focus();
+                    rename.focused = true;
+                }
+                let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if let Some(error) = &rename.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Rename").clicked() || entered {
+                        done = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        done = Some(false);
+                    }
+                });
+            });
+            if modal.should_close() && done.is_none() {
+                done = Some(false);
+            }
+            match done {
+                Some(true) => {
+                    let text = rename.text.trim();
+                    let done = match Alias::parse(text) {
+                        _ if text.is_empty() => self.terminals.rename(rename.id, None),
+                        Ok(Alias::Number(n)) => self.terminals.renumber(rename.id, n),
+                        Ok(Alias::Name(name)) => self.terminals.rename(rename.id, Some(&name)),
+                        Err(why) => Err(why),
+                    };
+                    match done {
+                        Ok(()) => self.renaming = None,
+                        Err(why) => rename.error = Some(why),
+                    }
+                }
+                Some(false) => self.renaming = None,
+                None => {}
+            }
+        }
     }
 
     /// Zoom the focused pane, or the first tab when none has focus yet;
@@ -505,7 +682,8 @@ impl App {
                     }
                     let mut shown = None;
                     for (i, tab) in self.hidden.iter().enumerate() {
-                        if ui.button(format!("Show {}", tab.title())).clicked() {
+                        let title = tab.title(&self.terminals);
+                        if ui.button(format!("Show {title}")).clicked() {
                             shown = Some(i);
                             ui.close();
                         }
@@ -519,7 +697,7 @@ impl App {
                 if let Some(tab) = self.zoomed {
                     ui.weak(format!(
                         "{} zoomed: Ctrl+Shift+Z restores the layout",
-                        tab.title()
+                        tab.title(&self.terminals)
                     ));
                 }
             });
@@ -534,7 +712,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let started = std::time::Instant::now();
         // Read the shells' output even while their tabs are hidden.
-        for terminal in self.terminals.iter_mut().flatten() {
+        for terminal in self.terminals.panes_mut() {
             // The pty's reader wakes egui when output arrives. A frame
             // reads only so much of it (terminal.rs, PARSE_BUDGET), so
             // after a read, come back for the rest.
@@ -549,20 +727,21 @@ impl eframe::App for App {
         self.menu_bar(ui);
 
         for (path, tab) in self.dock.iter_all_tabs() {
-            self.last_place.insert(
-                *tab,
-                egui_dock::NodePath {
-                    surface: path.surface,
-                    node: path.node,
-                },
-            );
+            let place = egui_dock::NodePath {
+                surface: path.surface,
+                node: path.node,
+            };
+            if matches!(tab, Tab::Terminal(_)) {
+                self.terminal_place = Some(place);
+            } else {
+                self.last_place.insert(*tab, place);
+            }
         }
         // The chat can take the folder of the terminal that last had the
         // focus.
         let folder = self
-            .terminals
-            .get(self.last_terminal)
-            .and_then(Option::as_ref)
+            .last_terminal
+            .and_then(|id| self.terminals.pane(id))
             .filter(|t| !t.exited())
             .and_then(TerminalPane::folder);
         self.chat.set_terminal_folder(folder);
@@ -573,6 +752,9 @@ impl eframe::App for App {
             engine: &self.engine,
             images: &self.images,
             closed: Vec::new(),
+            ended: Vec::new(),
+            confirm: None,
+            action: None,
         };
         if let Some(mut tab) = self.zoomed {
             // The dock keeps its layout; the zoomed pane is drawn alone.
@@ -587,9 +769,31 @@ impl eframe::App for App {
                 .show_inside(ui, &mut panes);
         }
         let closed = std::mem::take(&mut panes.closed);
+        let ended = std::mem::take(&mut panes.ended);
+        let confirm = panes.confirm.take();
+        let action = panes.action.take();
         self.hidden.extend(closed);
-        if let Some((_, Tab::Terminal(i))) = self.dock.find_active_focused() {
-            self.last_terminal = *i;
+        for id in ended {
+            self.end_terminal(id);
+        }
+        if confirm.is_some() {
+            self.confirm_close = confirm;
+        }
+        match action {
+            Some(TabAction::Rename(id)) => {
+                self.renaming = Some(Rename {
+                    id,
+                    text: self.terminals.name(id).unwrap_or_default().to_string(),
+                    error: None,
+                    focused: false,
+                })
+            }
+            Some(TabAction::Close(id)) => self.close_terminal(id),
+            None => {}
+        }
+        self.dialogs(ui.ctx());
+        if let Some((_, Tab::Terminal(id))) = self.dock.find_active_focused() {
+            self.last_terminal = Some(*id);
         }
         // Runs started in chat open in the preview, and what the run pane
         // did goes into the transcript.
@@ -639,8 +843,8 @@ impl eframe::App for App {
         self.runs.stop();
         tracing::info!("exit: stopping the engine");
         self.engine.stop();
-        tracing::info!("exit: closing the terminal");
-        self.terminals.clear();
+        tracing::info!("exit: closing the terminals");
+        drop(self.terminals.drain());
         tracing::info!("exit: done");
     }
 }
@@ -740,10 +944,15 @@ fn main() -> eframe::Result {
                 .and_then(|coverage| TerminalPane::new(coverage, cc.egui_ctx.clone(), None))
                 .map_err(|e| tracing::error!("the terminal didn't start: {e}"))
                 .ok();
+            let mut terminals = Terminals::default();
+            let first = terminals.add(None, None, terminal);
             Ok(Box::new(App {
-                dock: initial_layout(),
-                terminals: vec![terminal],
-                last_terminal: 0,
+                dock: initial_layout(first),
+                terminals,
+                last_terminal: Some(first),
+                terminal_place: None,
+                confirm_close: None,
+                renaming: None,
                 chat: chat::ChatPane::new(),
                 runs: runs::RunsPane::default(),
                 hidden: Vec::new(),
@@ -772,17 +981,23 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tab, initial_layout};
+    use super::{Tab, Terminals, initial_layout};
 
     #[test]
     fn terminals_are_numbered_after_the_first() {
-        assert_eq!(Tab::Terminal(0).title(), "Terminal");
-        assert_eq!(Tab::Terminal(1).title(), "Terminal 2");
+        let mut terminals = Terminals::default();
+        let (a, b) = (
+            terminals.add(None, None, None),
+            terminals.add(None, None, None),
+        );
+        assert_eq!(Tab::Terminal(a).title(&terminals), "Terminal");
+        assert_eq!(Tab::Terminal(b).title(&terminals), "Terminal 2");
     }
 
     #[test]
     fn layout_has_chat_beside_a_terminal_and_preview_stack() {
-        let dock = initial_layout();
+        let first = Terminals::default().add(None, None, None);
+        let dock = initial_layout(first);
         let stacks: Vec<Vec<Tab>> = dock
             .main_surface()
             .iter()
@@ -790,7 +1005,7 @@ mod tests {
             .collect();
         assert_eq!(
             stacks,
-            vec![vec![Tab::Chat], vec![Tab::Terminal(0), Tab::Preview]]
+            vec![vec![Tab::Chat], vec![Tab::Terminal(first), Tab::Preview]]
         );
     }
 }

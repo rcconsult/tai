@@ -641,10 +641,13 @@ pub enum SideEffect {
     /// `show_image`: `/show` of an image.
     ShowImage(String),
     /// `open_terminal` (`/terminal`), or `run_shell` with the command to
-    /// type into it. `cwd` is where a new terminal starts.
+    /// type into it. `cwd` is where a new terminal starts; `name` is the
+    /// terminal's alias (ADR 0013), None for the one that last had the
+    /// focus.
     Terminal {
         cwd: Option<String>,
         command: Option<String>,
+        name: Option<String>,
     },
     /// `refresh_command_roster`: `/reload` changed the commands.
     RefreshRoster,
@@ -667,10 +670,12 @@ impl SideEffect {
             "open_terminal" => Self::Terminal {
                 cwd: string("cwd"),
                 command: None,
+                name: string("name"),
             },
             "run_shell" => Self::Terminal {
                 cwd: string("cwd"),
                 command: string("command"),
+                name: string("name"),
             },
             "refresh_command_roster" => Self::RefreshRoster,
             "copy_to_clipboard" => Self::Copy(v["text"].as_str()?.to_string()),
@@ -1865,7 +1870,7 @@ mod tests {
                 {"type":"state_sync","data":{"model":"m2"}},
                 {"type":"working_dir_changed","data":{"path":"/w"}}],
             "side_effects": [{"kind":"open_terminal","cwd":"/w"},
-                {"kind":"run_shell","command":"ls -la","cwd":""},
+                {"kind":"run_shell","command":"ls -la","cwd":"","name":"build"},
                 {"kind":"refresh_command_roster","version":3},
                 {"kind":"copy_to_clipboard","text":"t"},
                 {"kind":"notify","level":"warn","message":"careful"},
@@ -1885,11 +1890,13 @@ mod tests {
             vec![
                 SideEffect::Terminal {
                     cwd: Some("/w".into()),
-                    command: None
+                    command: None,
+                    name: None
                 },
                 SideEffect::Terminal {
                     cwd: None,
-                    command: Some("ls -la".into())
+                    command: Some("ls -la".into()),
+                    name: Some("build".into())
                 },
                 SideEffect::RefreshRoster,
                 SideEffect::Copy("t".into()),

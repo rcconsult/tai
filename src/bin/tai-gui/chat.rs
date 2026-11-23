@@ -256,6 +256,9 @@ pub struct TerminalRequest {
     pub cwd: Option<String>,
     /// Typed at the prompt, not run: the user presses Enter.
     pub command: Option<String>,
+    /// The terminal's alias (ADR 0013), as ppxai sent it; None for the
+    /// terminal that last had the focus.
+    pub name: Option<String>,
 }
 
 /// A finished call the pane shows the outcome of.
@@ -1587,8 +1590,8 @@ impl ChatPane {
                                     SideEffect::ShowImage(path) => {
                                         crate::images::request_open(&path)
                                     }
-                                    SideEffect::Terminal { cwd, command } => {
-                                        self.terminals.push(TerminalRequest { cwd, command })
+                                    SideEffect::Terminal { cwd, command, name } => {
+                                        self.terminals.push(TerminalRequest { cwd, command, name })
                                     }
                                     SideEffect::RefreshRoster => {
                                         if let Some(asked) = self.client.clone() {
