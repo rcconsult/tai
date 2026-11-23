@@ -555,6 +555,9 @@ impl App {
                 let edit = ui.text_edit_singleline(&mut rename.text);
                 if !rename.focused {
                     edit.request_focus();
+                    // Selected, so a retry after a refusal replaces the
+                    // refused text instead of adding to it (popos-tai).
+                    select_all(ui.ctx(), edit.id, &rename.text);
                     rename.focused = true;
                 }
                 let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -584,7 +587,12 @@ impl App {
                     };
                     match done {
                         Ok(()) => self.renaming = None,
-                        Err(why) => rename.error = Some(why),
+                        Err(why) => {
+                            rename.error = Some(why);
+                            // Enter took the focus from the box: give it
+                            // back, so the next try can be typed.
+                            rename.focused = false;
+                        }
                     }
                 }
                 Some(false) => self.renaming = None,
@@ -960,6 +968,19 @@ fn main() -> eframe::Result {
         );
     }
     result
+}
+
+/// Select all of a text box's text. A box drawn for the first time has no
+/// state yet, and is left as egui makes it.
+fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let all = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(text.chars().count()),
+        );
+        state.cursor.set_char_range(Some(all));
+        state.store(ctx, id);
+    }
 }
 
 #[cfg(test)]
