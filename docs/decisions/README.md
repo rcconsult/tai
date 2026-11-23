@@ -18,8 +18,9 @@ Status is summarised; the record itself is authoritative.
 | [0010](0010-engine-link-loopback-tcp.md) | Reach ppxai-server over loopback TCP on every platform, then ppxai's strict mode | ✅ Accepted 2026-11-01 |
 | [0011](0011-native-gui-egui.md) | A Rust-native GUI on egui, with terminals as panes | ✅ Accepted 2026-11-01, after the prototype |
 | [0012](0012-cjk-font-fallback.md) | Ask the OS for fonts that tai lacks, and draw every glyph with skrifa; retire the immediate renderer | ✅ Accepted 2026-11-01 |
+| [0013](0013-terminals-by-alias.md) | Reach a terminal by its number or name, and type a command into it | 📝 Proposed 2026-11-23 |
 
-Numbering is sequential. The next record is `0013`.
+Numbering is sequential. The next record is `0014`.
 
 ## About these records
 
