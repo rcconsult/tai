@@ -1,9 +1,11 @@
 # ADR 0013: Reach a terminal by its number or name, and type a command into it
 
-- **Status:** Proposed 2026-11-23. The owner settled the open points on
-  2026-11-23 (ask before closing a busy terminal; type only at a prompt).
-  ppxai agreed to its half ([change request](../upstream/ppxai-terminals-by-alias.md)),
-  which ppxai records as its ADR 0020. Accepted when the code lands.
+- **Status:** Accepted 2026-11-23, when tai's half was merged. The owner
+  settled the open points that day (ask before closing a busy terminal;
+  type only at a prompt). ppxai's half ([change request](../upstream/ppxai-terminals-by-alias.md))
+  is its ADR 0020, at ppxai `6a6c10bf`, "feat(terminal): /terminal [alias]
+  [-- command]; a command is typed, never run". Tested by the owner on
+  Windows; Linux and macOS not yet.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host, from the owner's answers on 2026-11-23 and the macOS session's
   notes on steps 1–3.
