@@ -474,9 +474,15 @@ impl TerminalPane {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-        if std::mem::take(&mut self.want_focus)
-            || response.clicked()
-            || !ui.ctx().memory(|m| m.focused().is_some())
+        // Under a dialog (an egui Modal: the close question, the rename
+        // box), the terminal neither takes the keyboard nor reads keys:
+        // they'd reach the shell unseen. A one-line text box gives up the
+        // focus on Enter, which would otherwise hand it to the terminal.
+        let under_dialog = !ui.ctx().memory(|m| m.allows_interaction(ui.layer_id()));
+        if !under_dialog
+            && (std::mem::take(&mut self.want_focus)
+                || response.clicked()
+                || !ui.ctx().memory(|m| m.focused().is_some()))
         {
             response.request_focus();
         }
@@ -523,7 +529,7 @@ impl TerminalPane {
             });
         }
 
-        if response.has_focus() && !self.exited() {
+        if response.has_focus() && !under_dialog && !self.exited() {
             let (events, held) = ui.input(|i| (i.events.clone(), i.modifiers));
             for event in &events {
                 if let Err(e) = self.handle_event(event, held) {

@@ -857,6 +857,11 @@ impl ChatPane {
                                 ui.push_id(("failed", n), |ui| {
                                     let error = ui.visuals().error_fg_color;
                                     ui.visuals_mut().override_text_color = Some(error);
+                                    // ppxai bolds the message, and egui
+                                    // draws bold text in its strong colour
+                                    // (Visuals::strong_text_color), which
+                                    // the override doesn't change.
+                                    ui.visuals_mut().widgets.active.fg_stroke.color = error;
                                     CommonMarkViewer::new().show(ui, &mut self.markdown, markdown);
                                 });
                             }

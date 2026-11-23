@@ -584,7 +584,12 @@ impl App {
                     };
                     match done {
                         Ok(()) => self.renaming = None,
-                        Err(why) => rename.error = Some(why),
+                        Err(why) => {
+                            rename.error = Some(why);
+                            // Enter took the focus from the box: give it
+                            // back, so the next try can be typed.
+                            rename.focused = false;
+                        }
                     }
                 }
                 Some(false) => self.renaming = None,
