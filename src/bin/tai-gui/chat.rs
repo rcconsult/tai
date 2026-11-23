@@ -64,6 +64,9 @@ enum Entry {
     /// A line from tai or the engine, such as "Interrupted".
     Note(String),
     Error(String),
+    /// A ppxai command that failed: its result as Markdown, shown in the
+    /// error colour.
+    Failed(String),
 }
 
 /// An answer as the pane shows it.
@@ -827,6 +830,14 @@ impl ChatPane {
                             Entry::Error(why) => {
                                 ui.add_space(4.0);
                                 ui.colored_label(ui.visuals().error_fg_color, why);
+                            }
+                            Entry::Failed(markdown) => {
+                                ui.add_space(4.0);
+                                ui.push_id(("failed", n), |ui| {
+                                    let error = ui.visuals().error_fg_color;
+                                    ui.visuals_mut().override_text_color = Some(error);
+                                    CommonMarkViewer::new().show(ui, &mut self.markdown, markdown);
+                                });
                             }
                         }
                     }
@@ -1606,7 +1617,7 @@ impl ChatPane {
                                 }
                             }
                             if outcome.error {
-                                self.entries.push(Entry::Error(outcome.markdown));
+                                self.entries.push(Entry::Failed(outcome.markdown));
                             } else if !outcome.markdown.is_empty() {
                                 self.entries.push(Entry::Answer(Reply {
                                     blocks: blocks(&outcome.markdown),
