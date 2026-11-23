@@ -1361,7 +1361,8 @@ mod tests {
     use super::*;
 
     /// tai's shell integration reports the folder with OSC 7, which the
-    /// terminal keeps for `folder`.
+    /// terminal keeps for `folder`. Unix only, like `reported_dir`'s test.
+    #[cfg(unix)]
     #[test]
     fn a_reported_folder_is_kept() {
         let mut terminal = Terminal::new(80, 24).unwrap();
