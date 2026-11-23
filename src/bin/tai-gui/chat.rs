@@ -67,6 +67,93 @@ enum Entry {
     /// A ppxai command that failed: its result as Markdown, shown in the
     /// error colour.
     Failed(String),
+    /// A command that needs a choice or a reply before it goes on
+    /// (`prompt_quick_pick`, `prompt_text`), shown in the conversation as
+    /// the web app does.
+    Question(Question),
+}
+
+/// A command's question and what's been answered.
+struct Question {
+    ask: Ask,
+    command: String,
+    /// How many answered questions led to the command that asked this.
+    depth: usize,
+    /// Answered: it no longer takes a choice or a reply.
+    answered: bool,
+}
+
+impl Question {
+    /// Draw the question; returns the args to resume the command with
+    /// once it's answered. It takes an answer while `ready`.
+    fn ui(&mut self, ui: &mut egui::Ui, ready: bool) -> Option<String> {
+        let open = ready && !self.answered;
+        match &mut self.ask {
+            Ask::Pick { title, items } => {
+                ui.strong(title.as_str());
+                let mut chosen = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (label, value) in items.iter() {
+                        let button = ui.add_enabled(open, egui::Button::new(label.as_str()));
+                        if button.on_hover_text(value.as_str()).clicked() {
+                            chosen = Some(value.clone());
+                        }
+                    }
+                });
+                chosen
+            }
+            Ask::Text {
+                heading,
+                question,
+                original,
+                placeholder,
+                reply,
+                focused,
+            } => {
+                ui.strong(heading.as_str());
+                if let Some(question) = question {
+                    ui.label(question.as_str());
+                }
+                let mut send = false;
+                ui.horizontal(|ui| {
+                    let edit = ui.add_enabled(
+                        !self.answered,
+                        egui::TextEdit::singleline(reply).hint_text(placeholder.as_str()),
+                    );
+                    // It takes the focus when it appears, as the web app's
+                    // autofocus does.
+                    if !*focused && !self.answered {
+                        edit.request_focus();
+                        *focused = true;
+                    }
+                    // A singleline box gives up the focus on Enter.
+                    send = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let has_reply = !reply.trim().is_empty();
+                    send |= ui
+                        .add_enabled(open && has_reply, egui::Button::new("Send"))
+                        .clicked();
+                    send &= open && has_reply;
+                });
+                send.then(|| ppxai::resume_args(original, reply))
+            }
+        }
+    }
+}
+
+enum Ask {
+    Pick {
+        title: String,
+        items: Vec<(String, String)>,
+    },
+    Text {
+        heading: String,
+        question: Option<String>,
+        original: String,
+        placeholder: String,
+        reply: String,
+        /// The reply box has taken the focus once.
+        focused: bool,
+    },
 }
 
 /// An answer as the pane shows it.
@@ -126,6 +213,9 @@ pub struct ChatPane {
     roster: Option<ppxai::Roster>,
     /// A slash command running on the server.
     running: bool,
+    /// How many answered questions led to the command running now; a
+    /// typed command is 0 (`ppxai::MAX_PROMPT_RESUME_DEPTH`).
+    prompt_depth: usize,
     /// Runs to open in the run pane; the app hands them over.
     opened: Vec<crate::runs::Open>,
     /// Terminals commands asked for; the app hands them over.
@@ -696,6 +786,7 @@ impl ChatPane {
             jobs: Vec::new(),
             roster: None,
             running: false,
+            prompt_depth: 0,
             input_focused: false,
             opened: Vec::new(),
             picker: Picker::default(),
@@ -745,6 +836,7 @@ impl ChatPane {
             });
         }
         let busy = self.turn.is_some() || self.running;
+        let ready = client.is_some() && !busy;
 
         egui::Panel::bottom("chat-input")
             .resizable(false)
@@ -789,7 +881,6 @@ impl ChatPane {
                     self.stop(ui.ctx());
                     ui.memory_mut(|m| m.request_focus(input_id));
                 }
-                let ready = client.is_some() && !busy;
                 let slash = self.input.starts_with('/');
                 let typed = ui.add(
                     egui::TextEdit::multiline(&mut self.input)
@@ -835,18 +926,19 @@ impl ChatPane {
                              tools; the Preview pane shows their runs.",
                         );
                     }
-                    for (n, entry) in self.entries.iter().enumerate() {
+                    let mut resume = None;
+                    for (n, entry) in self.entries.iter_mut().enumerate() {
                         match entry {
                             Entry::Prompt(text) => {
                                 ui.add_space(8.0);
-                                ui.label(egui::RichText::new(text).strong());
+                                ui.label(egui::RichText::new(text.as_str()).strong());
                             }
                             Entry::Answer(reply) => {
                                 show_reply(ui, &mut self.markdown, n, reply, false);
                             }
                             Entry::Note(text) => {
                                 ui.add_space(4.0);
-                                ui.weak(egui::RichText::new(text).italics());
+                                ui.weak(egui::RichText::new(text.as_str()).italics());
                             }
                             Entry::Error(why) => {
                                 ui.add_space(4.0);
@@ -865,7 +957,27 @@ impl ChatPane {
                                     CommonMarkViewer::new().show(ui, &mut self.markdown, markdown);
                                 });
                             }
+                            Entry::Question(question) => {
+                                ui.add_space(4.0);
+                                if let Some(args) = ui
+                                    .push_id(("question", n), |ui| question.ui(ui, ready))
+                                    .inner
+                                {
+                                    question.answered = true;
+                                    resume = Some((
+                                        format!("/{} {args}", question.command)
+                                            .trim_end()
+                                            .to_string(),
+                                        question.depth + 1,
+                                    ));
+                                }
+                            }
                         }
+                    }
+                    if let Some((line, depth)) = resume
+                        && let Some(client) = client.clone()
+                    {
+                        self.resume(line, depth, client, ui.ctx());
                     }
                     let mut stop = false;
                     if let Some(turn) = &mut self.turn {
@@ -1041,9 +1153,27 @@ impl ChatPane {
         }
     }
 
+    /// Answer a command's question by running it again with the answer as
+    /// its args, the way a typed command goes, as the web app does. A
+    /// command that keeps asking is stopped after
+    /// `ppxai::MAX_PROMPT_RESUME_DEPTH` questions in a row, as ppxai's
+    /// Textual client does (`tui/app.py`, `_resume_after_prompt`).
+    fn resume(&mut self, line: String, depth: usize, client: Client, ctx: &egui::Context) {
+        if depth >= ppxai::MAX_PROMPT_RESUME_DEPTH {
+            self.entries.push(Entry::Error(format!(
+                "Stopped after {} questions in a row; run the command again to go on.",
+                ppxai::MAX_PROMPT_RESUME_DEPTH
+            )));
+            return;
+        }
+        self.submit(line, client, ctx);
+        self.prompt_depth = depth;
+    }
+
     /// Send the input where it goes: a message to the conversation, or a
     /// slash command where ppxai's roster routes it.
     fn submit(&mut self, input: String, client: Client, ctx: &egui::Context) {
+        self.prompt_depth = 0;
         let Some((name, args)) = command(&input) else {
             return self.chat(input, client, ctx);
         };
@@ -1610,6 +1740,7 @@ impl ChatPane {
                             }
                             self.apply_state(outcome.state, ctx, false);
                             let mut notes = Vec::new();
+                            let mut questions = Vec::new();
                             for effect in outcome.effects {
                                 match effect {
                                     // /show <image>: the web app opens it in
@@ -1634,6 +1765,35 @@ impl ChatPane {
                                     } else {
                                         Entry::Note(message)
                                     }),
+                                    SideEffect::Pick {
+                                        title,
+                                        command,
+                                        items,
+                                    } => questions.push(Question {
+                                        ask: Ask::Pick { title, items },
+                                        command,
+                                        depth: self.prompt_depth,
+                                        answered: false,
+                                    }),
+                                    SideEffect::Ask {
+                                        heading,
+                                        question,
+                                        command,
+                                        original,
+                                        placeholder,
+                                    } => questions.push(Question {
+                                        ask: Ask::Text {
+                                            heading,
+                                            question,
+                                            original,
+                                            placeholder,
+                                            reply: String::new(),
+                                            focused: false,
+                                        },
+                                        command,
+                                        depth: self.prompt_depth,
+                                        answered: false,
+                                    }),
                                 }
                             }
                             if outcome.error {
@@ -1646,6 +1806,9 @@ impl ChatPane {
                                 }));
                             }
                             self.entries.extend(notes);
+                            // Last, under the result that explains them.
+                            self.entries
+                                .extend(questions.into_iter().map(Entry::Question));
                         }
                         Err(why) => self.entries.push(Entry::Error(why)),
                     }

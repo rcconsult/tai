@@ -655,6 +655,42 @@ pub enum SideEffect {
     Copy(String),
     /// `notify`: a message, an error when `error` is set.
     Notify { message: String, error: bool },
+    /// `prompt_quick_pick`: the command needs one of `items` (label,
+    /// value) to go on, and the chosen value is its next args: the client
+    /// runs `/<command> <value>` (ppxai ADR 0001's stateless resume).
+    Pick {
+        title: String,
+        command: String,
+        items: Vec<(String, String)>,
+    },
+    /// `prompt_text`: the command needs a reply to go on. The client runs
+    /// `/<command> <args>` with `resume_args(original, reply)`.
+    Ask {
+        /// The title, else the question.
+        heading: String,
+        /// The question, when there's a title above it.
+        question: Option<String>,
+        command: String,
+        original: String,
+        placeholder: String,
+    },
+}
+
+/// How many questions in a row a command may ask before the client stops
+/// answering (ppxai `commands/results.py`, `MAX_PROMPT_RESUME_DEPTH`):
+/// each resume is a fresh command, so one that always asks would loop.
+pub const MAX_PROMPT_RESUME_DEPTH: usize = 5;
+
+/// The args a `prompt_text` reply resumes with: the original args and the
+/// reply joined by an em dash, the wire contract handlers split on (ppxai
+/// `commands/results.py`, `prompt_text_resume_args`).
+pub fn resume_args(original: &str, reply: &str) -> String {
+    let (original, reply) = (original.trim(), reply.trim());
+    match (original.is_empty(), reply.is_empty()) {
+        (_, true) => original.to_string(),
+        (true, false) => reply.to_string(),
+        (false, false) => format!("{original} — {reply}"),
+    }
 }
 
 impl SideEffect {
@@ -678,6 +714,45 @@ impl SideEffect {
                 name: string("name"),
             },
             "refresh_command_roster" => Self::RefreshRoster,
+            // The checks of ppxai's parse_quick_pick: no command or no
+            // usable item can't resume, so it's left out.
+            "prompt_quick_pick" => {
+                let items: Vec<_> = v["items"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|item| {
+                        let value = item["value"].as_str()?.to_string();
+                        let label = item["label"]
+                            .as_str()
+                            .filter(|l| !l.is_empty())
+                            .map_or_else(|| value.clone(), str::to_string);
+                        Some((label, value))
+                    })
+                    .collect();
+                if items.is_empty() {
+                    return None;
+                }
+                Self::Pick {
+                    title: string("title").unwrap_or_else(|| "Pick one".into()),
+                    command: resume_command(v)?,
+                    items,
+                }
+            }
+            // As the web app shows it (web/shared/side-effects.js): the
+            // title, else the question, with the question under a title.
+            "prompt_text" => {
+                let (title, question) = (string("title"), string("question"));
+                Self::Ask {
+                    heading: title
+                        .clone()
+                        .or(question.clone())
+                        .unwrap_or_else(|| "More detail needed".into()),
+                    question: title.and(question),
+                    command: resume_command(v)?,
+                    original: string("original_args").unwrap_or_default(),
+                    placeholder: string("placeholder").unwrap_or_default(),
+                }
+            }
             "copy_to_clipboard" => Self::Copy(v["text"].as_str()?.to_string()),
             "notify" => {
                 let level = v["level"].as_str().unwrap_or("info");
@@ -700,6 +775,12 @@ impl SideEffect {
             _ => return None,
         })
     }
+}
+
+/// A prompt's `command_to_resume`, None when it's missing or blank.
+fn resume_command(v: &Value) -> Option<String> {
+    let command = v["command_to_resume"].as_str()?.trim();
+    (!command.is_empty()).then(|| command.to_string())
 }
 
 /// A `CommandResult.to_dict()` as Markdown (ppxai `commands/results.py`),
@@ -1485,7 +1566,7 @@ mod tests {
     use super::{
         Answer, ChatEvent, Client, CommandOutcome, Consent, MergeError, Model, Provider, Providers,
         Roster, Run, RunFilter, SideEffect, Source, Sse, StateSync, ToolKind, ToolStep, detail,
-        encode, json, sse_line,
+        encode, json, resume_args, sse_line,
     };
 
     // The shapes below are the ones ppxai's fence pins
@@ -1840,6 +1921,60 @@ mod tests {
         assert_eq!(token.sensitive, ["set"]);
         assert_eq!(token.subcommands, ["set", "status"]);
         assert!(roster.resolve("nosuch").is_none());
+    }
+
+    #[test]
+    fn prompts_parse_as_ppxai_checks_them() {
+        let effects = |list: serde_json::Value| {
+            CommandOutcome::parse(&serde_json::json!({"result": {}, "side_effects": list})).effects
+        };
+        assert_eq!(
+            effects(serde_json::json!([
+                {"kind":"prompt_quick_pick","title":"3 files match","command_to_resume":" show ",
+                 "items":[{"label":"a.txt","value":"/w/a.txt"},{"value":"/w/b.txt"},
+                          {"label":"no value"},"junk"]},
+                {"kind":"prompt_text","title":"Too vague","question":"What should it do?",
+                 "command_to_resume":"auto","original_args":"fix it","placeholder":"e.g. x"},
+                {"kind":"prompt_text","question":"Which?","command_to_resume":"edit"}
+            ])),
+            vec![
+                SideEffect::Pick {
+                    title: "3 files match".into(),
+                    command: "show".into(),
+                    items: vec![
+                        ("a.txt".into(), "/w/a.txt".into()),
+                        ("/w/b.txt".into(), "/w/b.txt".into()),
+                    ],
+                },
+                SideEffect::Ask {
+                    heading: "Too vague".into(),
+                    question: Some("What should it do?".into()),
+                    command: "auto".into(),
+                    original: "fix it".into(),
+                    placeholder: "e.g. x".into(),
+                },
+                SideEffect::Ask {
+                    heading: "Which?".into(),
+                    question: None,
+                    command: "edit".into(),
+                    original: String::new(),
+                    placeholder: String::new(),
+                },
+            ]
+        );
+        // What can't resume is left out: no command, a blank one, no items.
+        assert!(
+            effects(serde_json::json!([
+                {"kind":"prompt_quick_pick","items":[{"value":"a"}]},
+                {"kind":"prompt_quick_pick","command_to_resume":"show","items":[]},
+                {"kind":"prompt_quick_pick","command_to_resume":"show","items":[{"label":"x"}]},
+                {"kind":"prompt_text","command_to_resume":"  ","question":"q"}
+            ]))
+            .is_empty()
+        );
+        assert_eq!(resume_args("fix it", " add tests "), "fix it — add tests");
+        assert_eq!(resume_args("", "add tests"), "add tests");
+        assert_eq!(resume_args(" fix it ", "  "), "fix it");
     }
 
     #[test]
