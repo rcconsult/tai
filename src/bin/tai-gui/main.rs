@@ -114,10 +114,11 @@ fn initial_layout(first: TermId) -> DockState<Tab> {
     dock
 }
 
-/// What a terminal tab's right-click menu asked for.
+/// What a terminal tab's right-click menu asked for. egui_dock's own
+/// menu items follow tai's: Eject, and Close, which goes through
+/// `on_close` as the tab's close button does.
 enum TabAction {
     Rename(TermId),
-    Close(TermId),
 }
 
 struct Panes<'a> {
@@ -187,15 +188,11 @@ impl TabViewer for Panes<'_> {
 
     // A terminal's tab is renamed from its right-click menu.
     fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Tab, _path: egui_dock::NodePath) {
-        if let Tab::Terminal(id) = *tab {
-            if ui.button("Rename…").clicked() {
-                self.action = Some(TabAction::Rename(id));
-                ui.close();
-            }
-            if ui.button("Close").clicked() {
-                self.action = Some(TabAction::Close(id));
-                ui.close();
-            }
+        if let Tab::Terminal(id) = *tab
+            && ui.button("Rename…").clicked()
+        {
+            self.action = Some(TabAction::Rename(id));
+            ui.close();
         }
     }
 
@@ -514,16 +511,6 @@ impl App {
         }
     }
 
-    /// Close a terminal's tab as its close button does: a busy one asks
-    /// first.
-    fn close_terminal(&mut self, id: TermId) {
-        if self.terminals.pane(id).is_some_and(TerminalPane::busy) {
-            self.confirm_close = Some(id);
-        } else {
-            self.end_terminal(id);
-        }
-    }
-
     /// The question before a busy terminal closes, and the rename box.
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(id) = self.confirm_close {
@@ -779,17 +766,13 @@ impl eframe::App for App {
         if confirm.is_some() {
             self.confirm_close = confirm;
         }
-        match action {
-            Some(TabAction::Rename(id)) => {
-                self.renaming = Some(Rename {
-                    id,
-                    text: self.terminals.name(id).unwrap_or_default().to_string(),
-                    error: None,
-                    focused: false,
-                })
-            }
-            Some(TabAction::Close(id)) => self.close_terminal(id),
-            None => {}
+        if let Some(TabAction::Rename(id)) = action {
+            self.renaming = Some(Rename {
+                id,
+                text: self.terminals.name(id).unwrap_or_default().to_string(),
+                error: None,
+                focused: false,
+            });
         }
         self.dialogs(ui.ctx());
         if let Some((_, Tab::Terminal(id))) = self.dock.find_active_focused() {

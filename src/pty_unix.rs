@@ -117,10 +117,22 @@ impl Pty {
                 // Give the shell default signal handling. Ignored signals
                 // survive exec, so if whatever launched tai ignored SIGINT
                 // (a background job does), Ctrl+C would never interrupt
-                // anything in the shell.
+                // anything in the shell, and under nohup (SIGHUP ignored) a
+                // command would outlive its closed terminal (popos-tai).
+                // Ghostty resets the same ones (src/pty.zig `childPreExec`
+                // at 108cacb1), plus the job-control signals here.
                 for sig in [
+                    signal::Signal::SIGHUP,
                     signal::Signal::SIGINT,
                     signal::Signal::SIGQUIT,
+                    signal::Signal::SIGTERM,
+                    signal::Signal::SIGALRM,
+                    signal::Signal::SIGABRT,
+                    signal::Signal::SIGBUS,
+                    signal::Signal::SIGFPE,
+                    signal::Signal::SIGILL,
+                    signal::Signal::SIGSEGV,
+                    signal::Signal::SIGTRAP,
                     signal::Signal::SIGTSTP,
                     signal::Signal::SIGTTIN,
                     signal::Signal::SIGTTOU,
