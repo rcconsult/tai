@@ -767,7 +767,9 @@ impl ChatPane {
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
                 // Tab completes a slash command or its subcommand, as in
                 // Claude Code and Codex. Elsewhere it moves the focus as
-                // before.
+                // before. egui turns Tab into a focus move before this runs
+                // unless the focused text box asks for Tab (`lock_focus`
+                // below; egui memory/mod.rs `begin_pass` at 0.36.2).
                 if focused
                     && self.input.starts_with('/')
                     && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
@@ -788,9 +790,13 @@ impl ChatPane {
                     ui.memory_mut(|m| m.request_focus(input_id));
                 }
                 let ready = client.is_some() && !busy;
+                let slash = self.input.starts_with('/');
                 let typed = ui.add(
                     egui::TextEdit::multiline(&mut self.input)
                         .id(input_id)
+                        // Keeps Tab for completion; it's taken above, so
+                        // no tab character is inserted.
+                        .lock_focus(slash)
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
                         .hint_text(if client.is_none() {
