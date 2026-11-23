@@ -256,6 +256,10 @@ struct Live {
     reply: Reply,
     /// What the engine says it's doing, until the answer starts.
     activity: Option<String>,
+    /// How the last tool step ended, until the next step starts: ppxai's
+    /// "Step N: processing X result..." line comes straight after
+    /// `tool_group_end` and would hide it, so it's kept beside that line.
+    step_end: Option<String>,
     /// Consent requests waiting for the user, oldest first.
     consents: VecDeque<Consent>,
     tokens: Option<u64>,
@@ -304,7 +308,10 @@ impl Live {
             ChatEvent::Status(text) => self.reply.notes.push(text),
             ChatEvent::Info(text) => {
                 if self.reply.text.is_empty() {
-                    self.activity = Some(text);
+                    self.activity = Some(match &self.step_end {
+                        Some(end) => format!("{end} · {text}"),
+                        None => text,
+                    });
                 }
             }
             ChatEvent::Warning(text) => self.reply.notes.push(format!("Warning: {text}")),
@@ -319,17 +326,20 @@ impl Live {
             // The tool loop's progress, beside the spinner, as the web
             // app's tool-group strip reads (web/app.js, onToolGroupStart).
             ChatEvent::StepStart { step, calls } => {
+                self.step_end = None;
                 self.activity = Some(format!(
                     "Step {step}: {calls} tool{}",
                     if calls == 1 { "" } else { "s" }
                 ))
             }
             ChatEvent::StepEnd { step, tools, ok } => {
-                self.activity = Some(format!(
+                let end = format!(
                     "Step {step}: {} {}",
                     tools.join(", "),
                     if ok { "✓" } else { "✗" }
-                ))
+                );
+                self.activity = Some(end.clone());
+                self.step_end = Some(end);
             }
             // As the web app's context badge (showContextInjected).
             ChatEvent::Attached {
@@ -2752,6 +2762,31 @@ mod tests {
             },
         ]);
         assert_eq!(l.activity, None);
+        // A step's end stays beside ppxai's next info line, until the next
+        // step starts.
+        let steps = live(vec![
+            ChatEvent::StepStart { step: 1, calls: 1 },
+            ChatEvent::StepEnd {
+                step: 1,
+                tools: vec!["read_file".into()],
+                ok: false,
+            },
+            ChatEvent::Info("Step 2: processing read_file result...".into()),
+        ]);
+        assert_eq!(
+            steps.activity.as_deref(),
+            Some("Step 1: read_file ✗ · Step 2: processing read_file result...")
+        );
+        let next = live(vec![
+            ChatEvent::StepEnd {
+                step: 1,
+                tools: vec!["a".into()],
+                ok: true,
+            },
+            ChatEvent::StepStart { step: 2, calls: 2 },
+            ChatEvent::Info("thinking".into()),
+        ]);
+        assert_eq!(next.activity.as_deref(), Some("thinking"));
         let out = finish(l, false, Some("p"));
         assert_eq!(out.len(), 1);
         let Entry::Answer(reply) = &out[0].0 else {
