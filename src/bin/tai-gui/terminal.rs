@@ -349,9 +349,15 @@ impl TerminalPane {
     /// Returns false when it wasn't typed. A shell that hasn't drawn its
     /// prompt yet gets it once it has.
     pub fn type_command(&mut self, command: &str, run: bool) -> Result<bool> {
-        let line = typed_command(command);
+        let mut line = typed_command(command);
         if line.is_empty() || self.exited() {
             return Ok(false);
+        }
+        // A command tai-gui runs itself (`/edit`'s editor) starts with a
+        // space, which keeps it out of the history of a shell told to
+        // (bash HISTCONTROL=ignorespace, zsh HIST_IGNORE_SPACE).
+        if run && !line.starts_with(' ') {
+            line.insert(0, ' ');
         }
         let prompt = self.prompt.get();
         if (self.last_output.is_none() && prompt == Prompt::Unknown)
