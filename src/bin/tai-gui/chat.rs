@@ -207,6 +207,10 @@ pub struct ChatPane {
     folder_focus: bool,
     /// A command ran that may have moved the folder (`/cd`): look again.
     folder_stale: bool,
+    /// How full the conversation's context is; None until ppxai says.
+    context: Option<ppxai::ContextInfo>,
+    /// The conversation changed: ask how full it is again.
+    context_stale: bool,
     /// Calls in flight whose answers the pane shows.
     jobs: Vec<Arc<Mutex<Option<Done>>>>,
     /// ppxai's slash commands; None until they've loaded.
@@ -312,6 +316,39 @@ impl Live {
             ChatEvent::Throttled(why) => self.error = Some(why),
             ChatEvent::Degraded(reasons) => self.reply.notes.push(degraded(&reasons)),
             ChatEvent::Stopped(why) => self.reply.notes.push(format!("Stopped early: {why}")),
+            // The tool loop's progress, beside the spinner, as the web
+            // app's tool-group strip reads (web/app.js, onToolGroupStart).
+            ChatEvent::StepStart { step, calls } => {
+                self.activity = Some(format!(
+                    "Step {step}: {calls} tool{}",
+                    if calls == 1 { "" } else { "s" }
+                ))
+            }
+            ChatEvent::StepEnd { step, tools, ok } => {
+                self.activity = Some(format!(
+                    "Step {step}: {} {}",
+                    tools.join(", "),
+                    if ok { "✓" } else { "✗" }
+                ))
+            }
+            // As the web app's context badge (showContextInjected).
+            ChatEvent::Attached {
+                source,
+                language,
+                size,
+                truncated,
+            } => {
+                let mut about: Vec<String> = language.into_iter().collect();
+                about.extend(size.map(|n| format!("{n} chars")));
+                if truncated {
+                    about.push("cut".into());
+                }
+                self.reply.notes.push(if about.is_empty() {
+                    format!("Attached {source}")
+                } else {
+                    format!("Attached {source} ({})", about.join(", "))
+                });
+            }
             ChatEvent::Display(path) => match crate::images::shown_markdown(&path) {
                 Some(markdown) => {
                     self.activity = None;
@@ -324,6 +361,28 @@ impl Live {
             },
         }
     }
+}
+
+/// The context meter, as the web app's badge: amber from 80%, red from
+/// 100% (web/app.js, `updateContextInfo`).
+fn context_meter(ui: &mut egui::Ui, info: &ppxai::ContextInfo) {
+    let visuals = ui.visuals();
+    let color = if info.percent >= 100.0 {
+        visuals.error_fg_color
+    } else if info.percent >= 80.0 {
+        visuals.warn_fg_color
+    } else {
+        visuals.weak_text_color()
+    };
+    let mut tip = format!(
+        "Context: {:.1}%\n{} / {} tokens",
+        info.percent, info.tokens, info.limit
+    );
+    if info.attached > 0 {
+        tip.push_str(&format!("\n{} attached file(s)", info.attached));
+    }
+    ui.label(egui::RichText::new(info.label()).color(color))
+        .on_hover_text(tip);
 }
 
 /// How a turn whose tools were cut short says so, from ppxai's
@@ -374,6 +433,7 @@ enum Done {
     /// The conversation's working directory, and whether to say it changed.
     Folder(Result<String, String>, bool),
     Roster(Result<ppxai::Roster, String>),
+    Context(Result<ppxai::ContextInfo, String>),
     /// A slash command, by its roster name.
     Command(String, Result<ppxai::CommandOutcome, String>),
     /// A consent answer, an interrupt: shown only when it fails.
@@ -795,6 +855,8 @@ impl ChatPane {
             folder_edit: None,
             folder_focus: false,
             folder_stale: false,
+            context: None,
+            context_stale: false,
             jobs: Vec::new(),
             roster: None,
             running: false,
@@ -822,6 +884,7 @@ impl ChatPane {
                     self.job(ui.ctx(), "chat-commands", move || {
                         Done::Roster(asked.commands())
                     });
+                    self.context_stale = true;
                     // The conversation works where tai-gui was started, as
                     // a terminal would; ppxai's own default is the home
                     // folder. Started from a launcher (cwd `/`), keep it.
@@ -845,6 +908,14 @@ impl ChatPane {
             self.folder_stale = false;
             self.job(ui.ctx(), "chat-folder", move || {
                 Done::Folder(asked.working_dir().map(Option::unwrap_or_default), false)
+            });
+        }
+        if self.context_stale
+            && let Some(asked) = client.clone()
+        {
+            self.context_stale = false;
+            self.job(ui.ctx(), "chat-context", move || {
+                Done::Context(asked.context_info())
             });
         }
         let busy = self.turn.is_some() || self.running;
@@ -1157,7 +1228,12 @@ impl ChatPane {
                 });
             }
             State::Ready(link) => {
-                ui.weak(format!("ppxai-server {} at {}", link.version, link.base));
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(format!("ppxai-server {} at {}", link.version, link.base));
+                    if let Some(info) = &self.context {
+                        context_meter(ui, info);
+                    }
+                });
             }
             State::Failed(why) => {
                 ui.colored_label(ui.visuals().error_fg_color, format!("Engine: {why}"));
@@ -1721,6 +1797,9 @@ impl ChatPane {
                     }
                 }
                 Done::Roster(Ok(roster)) => self.roster = Some(roster),
+                Done::Context(Ok(info)) => self.context = Some(info),
+                // The meter is a hint: it stays as it was.
+                Done::Context(Err(why)) => tracing::warn!("chat: context info: {why}"),
                 Done::Roster(Err(why)) => {
                     tracing::warn!("chat: commands: {why}");
                     self.entries.push(Entry::Error(format!(
@@ -1743,6 +1822,7 @@ impl ChatPane {
                 Done::Command(name, outcome) => {
                     self.running = false;
                     self.folder_stale = true;
+                    self.context_stale = true;
                     match outcome {
                         Ok(outcome) => {
                             if outcome.ok && RESETS_TRANSCRIPT.contains(&name.as_str()) {
@@ -1903,6 +1983,7 @@ impl ChatPane {
         };
         let stopped = turn.stop.load(Ordering::Relaxed);
         self.turn = None;
+        self.context_stale = true;
         let (provider, _) = self.picker.choice();
         for (entry, text) in finish(live, stopped, provider.as_deref()) {
             if let Some(text) = text {
