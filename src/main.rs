@@ -62,6 +62,7 @@ mod cells;
 mod clipboard;
 mod discovery;
 mod fonts;
+mod grapheme;
 mod identity;
 mod locale;
 mod placeholders;
@@ -254,6 +255,11 @@ async fn main() -> Result<()> {
         .set_kitty_image_from_file_allowed(true)?
         .set_kitty_image_temp_file_dir(Some(&std::env::temp_dir()))?
         .set_kitty_image_from_shared_mem_allowed(true)?;
+
+    // Grapheme clustering, mode 2027, only when asked for (grapheme.rs).
+    if grapheme::clustering() {
+        terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
+    }
 
     // Whether DA1 lists Sixel (ADR 0009). tai translates Sixel either way.
     let advertise_sixel = std::env::var("TAI_SIXEL").as_deref() == Ok("1");
