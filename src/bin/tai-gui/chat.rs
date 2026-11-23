@@ -220,6 +220,8 @@ pub struct ChatPane {
     opened: Vec<crate::runs::Open>,
     /// Terminals commands asked for; the app hands them over.
     terminals: Vec<TerminalRequest>,
+    /// Files `/show` opened in a viewer; the app hands them over.
+    viewers: Vec<crate::textview::TextFile>,
     /// The folder of the terminal that last had the focus, when its shell
     /// has reported one; the app sets it every frame.
     terminal_folder: Option<String>,
@@ -771,6 +773,10 @@ impl ChatPane {
         std::mem::take(&mut self.terminals)
     }
 
+    pub fn take_viewers(&mut self) -> Vec<crate::textview::TextFile> {
+        std::mem::take(&mut self.viewers)
+    }
+
     pub fn note(&mut self, text: String) {
         self.entries.push(Entry::Note(text));
     }
@@ -784,6 +790,7 @@ impl ChatPane {
             tools: None,
             folder: None,
             terminals: Vec::new(),
+            viewers: Vec::new(),
             terminal_folder: None,
             folder_edit: None,
             folder_focus: false,
@@ -1746,6 +1753,7 @@ impl ChatPane {
                             self.apply_state(outcome.state, ctx, false);
                             let mut notes = Vec::new();
                             let mut questions = Vec::new();
+                            let file = outcome.file;
                             for effect in outcome.effects {
                                 match effect {
                                     // /show <image>: the web app opens it in
@@ -1754,6 +1762,22 @@ impl ChatPane {
                                     SideEffect::ShowImage(path) => {
                                         crate::images::request_open(&path)
                                     }
+                                    // /show <text file>: the web app opens
+                                    // a read-only code view; here, a tab in
+                                    // the Preview stack, with the text
+                                    // ppxai read.
+                                    SideEffect::View(path) => match &file {
+                                        Some(f) if f.path == path => {
+                                            self.viewers.push(crate::textview::TextFile::new(
+                                                &f.path,
+                                                &f.text,
+                                                f.language.as_deref(),
+                                            ))
+                                        }
+                                        _ => notes.push(Entry::Error(format!(
+                                            "ppxai asked to show {path} without its text"
+                                        ))),
+                                    },
                                     SideEffect::Terminal { cwd, command, name } => {
                                         self.terminals.push(TerminalRequest {
                                             cwd,
