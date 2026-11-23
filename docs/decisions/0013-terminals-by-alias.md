@@ -78,7 +78,10 @@ answer wait for the user's yes"):
        console is checked when this is built.
    - **A terminal can be named or renamed from its tab** (right-click), as
      well as from `/terminal`. The same rules apply; a name taken by
-     another terminal is refused.
+     another terminal is refused. Typing a number there renumbers the
+     terminal, if no other terminal holds that number (found in the
+     owner's first test: closing Terminal 2 and giving Terminal 3 the
+     free number).
 3. **`/terminal [alias] [-- command]`**, in ppxai's command, is how a user
    reaches one:
    - `/terminal`: as now, the terminal that last had the focus, or the

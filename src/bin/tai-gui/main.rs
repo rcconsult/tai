@@ -561,7 +561,10 @@ impl App {
             let mut done = None;
             let modal = egui::Modal::new(egui::Id::new("rename-terminal")).show(ctx, |ui| {
                 ui.strong(format!("Rename {title}"));
-                ui.weak("Lowercase letters, digits and -, with a letter; empty for none.");
+                ui.weak(
+                    "A name (lowercase letters, digits and -, with a letter), \
+                     or a number to renumber it; empty takes the name away.",
+                );
                 let edit = ui.text_edit_singleline(&mut rename.text);
                 if !rename.focused {
                     edit.request_focus();
@@ -586,8 +589,13 @@ impl App {
             match done {
                 Some(true) => {
                     let text = rename.text.trim();
-                    let name = (!text.is_empty()).then_some(text);
-                    match self.terminals.rename(rename.id, name) {
+                    let done = match Alias::parse(text) {
+                        _ if text.is_empty() => self.terminals.rename(rename.id, None),
+                        Ok(Alias::Number(n)) => self.terminals.renumber(rename.id, n),
+                        Ok(Alias::Name(name)) => self.terminals.rename(rename.id, Some(&name)),
+                        Err(why) => Err(why),
+                    };
+                    match done {
                         Ok(()) => self.renaming = None,
                         Err(why) => rename.error = Some(why),
                     }

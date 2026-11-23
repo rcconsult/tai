@@ -144,6 +144,23 @@ impl<P> Terminals<P> {
         Ok(())
     }
 
+    /// Give a terminal another number. A number another terminal holds is
+    /// refused.
+    pub fn renumber(&mut self, id: TermId, number: u32) -> Result<(), String> {
+        if number == 0 {
+            return Err("a terminal number is 1 or more".into());
+        }
+        if self.by_number(number).is_some_and(|other| other != id) {
+            return Err(format!("another terminal has number {number}"));
+        }
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .ok_or_else(|| "that terminal has closed".to_string())?;
+        entry.number = number;
+        Ok(())
+    }
+
     /// The tab's title: the name, else "Terminal N", and number 1 is
     /// "Terminal".
     pub fn title(&self, id: TermId) -> String {
@@ -273,5 +290,21 @@ mod tests {
         t.remove(a);
         assert_eq!(t.find(&Alias::Name("build".into())), None);
         assert_eq!(t.rename(b, Some("build")), Ok(()));
+    }
+
+    #[test]
+    fn a_terminal_takes_a_free_number() {
+        let mut t = Terminals::<()>::default();
+        let a = t.add(None, None, None);
+        let b = t.add(None, None, None);
+        let c = t.add(None, None, None);
+        t.remove(b);
+        assert!(t.renumber(c, 1).is_err(), "number 1 is taken");
+        assert!(t.renumber(c, 0).is_err());
+        assert_eq!(t.renumber(c, 2), Ok(()));
+        assert_eq!(t.title(c), "Terminal 2");
+        assert_eq!(t.find(&Alias::Number(2)), Some(c));
+        assert_eq!(t.find(&Alias::Number(3)), None);
+        assert_eq!(t.renumber(a, 1), Ok(()), "its own number again");
     }
 }
