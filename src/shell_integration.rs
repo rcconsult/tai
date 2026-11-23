@@ -166,14 +166,14 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-#[cfg(test)]
+// Both tests are Unix only (see below).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// Unix paths only: tai's shell integration covers zsh and bash, and on
     /// Windows cmd and PowerShell report no folder. A Windows path in
     /// OSC 7 (`file://host/C:/x`) isn't read yet.
-    #[cfg(unix)]
     #[test]
     fn a_reported_folder_is_read_from_either_url() {
         assert_eq!(
@@ -198,7 +198,6 @@ mod tests {
     }
 
     /// The scripts must parse: a syntax error would break the user's shell.
-    #[cfg(unix)]
     #[test]
     fn the_scripts_parse() {
         for (shell, script) in [("zsh", ZSHENV), ("bash", BASH_RC)] {
