@@ -3,7 +3,8 @@
 //!
 //! - Before an answer is drawn, `prepare` rewrites its images. A local
 //!   path is resolved against the conversation's working folder and gets
-//!   an "open in Preview" link after it. A web image is drawn only once the
+//!   an "open in Preview" link after it. On Windows, a path on a network
+//!   share is never read (`on_this_machine`). A web image is drawn only once the
 //!   user allowed web images for this conversation; until then it's a link
 //!   with its alt text, and its host is listed for the consent bar.
 //! - `BytesLoader` reads `file://` URIs and fetches `https://` ones. It
@@ -243,7 +244,7 @@ fn replacement(
     }
     let path = resolve(dest.strip_prefix("file://").unwrap_or(dest), workdir);
     let shown = path.to_string_lossy();
-    if shown.contains(['<', '>', '\n']) {
+    if shown.contains(['<', '>', '\n']) || !on_this_machine(&path) {
         return format!("*{label}*");
     }
     let uri = file_uri(&path);
@@ -271,6 +272,40 @@ fn resolve(path: &str, workdir: Option<&Path>) -> PathBuf {
     match workdir {
         Some(dir) if path.is_relative() => dir.join(path),
         _ => path,
+    }
+}
+
+/// Whether reading `path` stays on this machine. On Windows, reading a
+/// path that names a network share (`\\host\share`, `//host/share`,
+/// `\\?\UNC\…`) connects to that host over SMB and offers it the user's
+/// NTLM credentials, and an answer's image path is model output. So only
+/// drive paths are read there, and anything else is refused: a relative
+/// path under a working folder on a share too.
+fn on_this_machine(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        // `\??\UNC\host\share` goes to the NT object manager as it is, a
+        // share, though Rust parses it as a rooted path.
+        let text = path.as_os_str().to_string_lossy();
+        if text.starts_with(r"\??\") || text.starts_with("/??/") {
+            return false;
+        }
+        // A path without a drive takes it from the current folder, which
+        // may be on a share, so decide on the full path. `absolute` only
+        // parses (GetFullPathNameW); it doesn't touch the file.
+        let Ok(full) = std::path::absolute(path) else {
+            return false;
+        };
+        matches!(
+            full.components().next(),
+            Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
     }
 }
 
@@ -477,6 +512,11 @@ fn fetch(uri: &str) -> Result<Vec<u8>, String> {
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {
+    // Checked here too: the Preview stack's links lead here without
+    // `replacement`.
+    if !on_this_machine(path) {
+        return Err("not on this machine".into());
+    }
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("not a file".into());
@@ -791,6 +831,44 @@ mod tests {
         assert!(out.contains("<file:///tmp/a b.png>"), "{out}");
         let (out, _) = run("![x](data:image/png;base64,AAAA)", Web::Allowed);
         assert_eq!(out, "*image: x*");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_network_path_is_never_read_on_windows() {
+        // Markdown takes `\\` for one backslash, so an answer names
+        // `\\host\share` as `\\\\host\\share`.
+        for dest in [
+            r"\\\\attacker.example\\share\\a.png",
+            "//attacker.example/share/a.png",
+            "<file:////attacker.example/share/a.png>",
+            r"\\\\?\\UNC\\attacker.example\\share\\a.png",
+            r"\\\\.\\pipe\\x.png",
+            r"\\??\\UNC\\attacker.example\\share\\a.png",
+            "/??/UNC/attacker.example/share/a.png",
+        ] {
+            let (out, _) = run(&format!("![x]({dest})"), Web::Allowed);
+            assert_eq!(out, "*image: x*", "{dest}");
+        }
+        let share = Path::new(r"\\attacker.example\share\a.png");
+        assert_eq!(read_file(share), Err("not on this machine".into()));
+        assert_eq!(
+            uri_path(&file_uri(share)).map(|p| read_file(&p)),
+            Some(Err("not on this machine".into()))
+        );
+        let mut hosts = Vec::new();
+        let under_share = rewrite(
+            "![x](a.png)",
+            Web::Allowed,
+            Some(Path::new(r"\\attacker.example\share")),
+            &mut hosts,
+        );
+        assert_eq!(under_share, "*image: x*");
+        // Drive paths still are, and so is one rooted on the current drive.
+        let (out, _) = run(r"![x](C:\work\a.png)", Web::Ask);
+        assert!(out.starts_with("![x](<file:///C:/work/a.png>)"), "{out}");
+        assert!(on_this_machine(Path::new(r"\work\a.png")));
+        assert!(on_this_machine(Path::new(r"\\?\C:\work\a.png")));
     }
 
     #[test]
