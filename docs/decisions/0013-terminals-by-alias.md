@@ -50,8 +50,10 @@ answer wait for the user's yes"):
    a terminal through an alias.
 2. **A terminal has a number alias, and may have a name alias.**
    - The number is the lowest positive integer no live terminal holds,
-     taken when the terminal is created. The tab shows "Terminal N" (the
-     first stays "Terminal", as now) or the name when there is one.
+     taken when the terminal is created. The tab shows the name when
+     there is one, else "Terminal N", and number 1 is titled "Terminal".
+     Since any terminal can be closed, number 1 can be freed and taken
+     again.
    - A name follows Kubernetes' DNS label rule (RFC 1123): 1–63 characters,
      lowercase `a-z`, `0-9` and `-`, starting and ending with a letter or
      digit. Unlike Kubernetes, a name must contain a letter, so it can
@@ -61,6 +63,17 @@ answer wait for the user's yes"):
    - **Closing a terminal's tab ends its shell** and closes the terminal.
      This replaces step 1's rule that a closed tab hides a running shell
      (and that the first terminal is never removed).
+     - **Proposed, for the owner:** when the shell isn't at its prompt
+       (a build, an editor, ssh), ask before closing, as Ghostty's
+       `confirm-close-surface` does (default true, skipped when shell
+       integration says nothing is running; Ghostty
+       `src/config/Config.zig` at `108cacb1`). That needs decision 7's
+       prompt marks; without them, as with PowerShell and cmd, always ask.
+     - Ending the shell doesn't block the window. On Unix, dropping a
+       child sends SIGHUP and waits up to 1 s before SIGKILL
+       (`src/pty_unix.rs`), so a closed terminal is dropped on a thread of
+       its own. On Windows the kill doesn't wait; closing the pseudo
+       console is checked when this is built.
    - **A terminal can be named or renamed from its tab** (right-click), as
      well as from `/terminal`. The same rules apply; a name taken by
      another terminal is refused.
@@ -69,15 +82,16 @@ answer wait for the user's yes"):
    - `/terminal`: as now, the terminal that last had the focus, or the
      first.
    - `/terminal 2`: the terminal with number 2; if none, a new terminal
-     that takes number 2.
+     that takes number 2, which can leave gaps (1, 2, 7).
    - `/terminal build`: the terminal named `build`; if none, a new one
      with that name and the next free number.
    - In each case a running terminal is shown and focused; an exited one
      restarts in place; a new one starts in the chat's folder.
-   - `/terminal build -- npm test`: the same, then the command is typed at
-     its prompt. **It isn't run:** the terminal pane takes the focus and
-     the user presses Enter. One line, control characters dropped, and not
-     while a full-screen program has the terminal, as `run_shell` does now.
+   - `/terminal build -- npm test`: the same, then the command is typed
+     into it. **It isn't run:** the terminal pane takes the focus and the
+     user presses Enter. One line, control characters dropped. Where it's
+     typed is decision 7. `/terminal -- npm test` types into the terminal
+     that last had the focus.
    - An alias that breaks the rules is refused with a message saying why.
 4. **ppxai carries the alias and stores nothing.** `open_terminal` and
    `run_shell` gain an optional `name` (a string: a number alias is
@@ -93,6 +107,15 @@ answer wait for the user's yes"):
    with OSC 133), how consent looks, the alternate screen, and how this
    sits beside ppxai's own `run_shell` tool. It needs its own ADR, since it
    changes what ADR 0001 assumes.
+7. **Proposed, for the owner: type only at a shell prompt.** Today
+   `run_shell` refuses only while a full-screen program holds the
+   alternate screen (`type_command`, `src/bin/tai-gui/terminal.rs`); a
+   program on the main screen (python, ssh, `cat`, a `read` prompt) still
+   gets the text. tai's shell integration for zsh and bash would send
+   OSC 133 prompt marks, and tai would type only right after a prompt
+   mark, refusing otherwise with a line in the chat. Shells without the
+   integration (PowerShell, cmd) keep today's alternate-screen rule. The
+   same marks serve decision 2's close question and step 3.
 
 ## With herdr
 
@@ -108,10 +131,10 @@ at `89e88b0`; Linux and macOS not yet.
   - Aliases name **tai's** terminals. `/terminal build` brings forward
     the tai tab that runs herdr; it can't reach a herdr pane.
   - `/terminal build -- cmd` into that terminal is **not typed**: herdr
-    holds the alternate screen, and tai types only at a shell prompt (the
-    rule `run_shell` follows now). Otherwise the keys would go to
-    whichever herdr pane has the focus. herdr's own CLI (`herdr pane run`)
-    reaches its panes.
+    holds the alternate screen, and tai doesn't type into a full-screen
+    program (the rule `run_shell` follows now). Otherwise the keys would
+    go to whichever herdr pane has the focus. herdr's own CLI
+    (`herdr pane run`) reaches its panes.
   - Closing the tab (decision 2) ends the shell and the herdr client, not
     herdr's sessions.
   - The names don't clash: tai's aliases and herdr's names (agent names
@@ -128,6 +151,22 @@ at `89e88b0`; Linux and macOS not yet.
   pane and read the output back (`pane run`, `pane read`,
   `pane wait-output`). Step 3's ADR should study it, as ADR 0011 does for
   herdr's server.
+
+## What changes in tai-gui
+
+Step 1's code that this replaces, from the macOS session's review:
+
+- `Tab::Terminal(usize)` is a slot index titled from `i + 1`; it becomes
+  `Tab::Terminal(id)`, with a map from ID to pane and the two aliases.
+  `App.last_terminal` becomes an ID.
+- `on_close` in `main.rs` hides a running terminal and keeps the first;
+  closing now ends and drops any terminal, off the UI thread.
+- `focus_tab` puts a new terminal tab beside the last terminal. With every
+  terminal closable it needs a fallback when none is left: the stack the
+  first terminal started in.
+- View > Show no longer lists hidden terminals; `initial_layout` starts
+  with the first terminal's ID.
+- Rename uses egui_dock 0.21.1's `TabViewer::context_menu`.
 
 ## Why this and not the alternatives
 
