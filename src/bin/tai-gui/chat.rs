@@ -654,6 +654,11 @@ impl ChatPane {
     }
 
     /// A line in the transcript, such as a run pane's "collected".
+    /// The conversation's working directory, once ppxai has said.
+    pub fn folder(&self) -> Option<&str> {
+        self.folder.as_deref()
+    }
+
     pub fn take_terminals(&mut self) -> Vec<TerminalRequest> {
         std::mem::take(&mut self.terminals)
     }

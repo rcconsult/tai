@@ -2,11 +2,19 @@
 //! ADR 0008) as WGSL, drawn in an egui paint callback (ADR 0011).
 //!
 //! One instanced draw per pane: backgrounds and the cursor as solid quads,
-//! then the glyphs from the shared atlas. egui sets the render pass's
+//! then the glyphs from the pane's atlas. Each pane has its own atlas
+//! texture, uniforms and instances (`PaneGpu`), since each keeps its own
+//! glyph atlas, and egui prepares every callback before it paints any. egui sets the render pass's
 //! viewport to the callback's rect, so instances are in logical points from
 //! the rect's top-left corner.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use eframe::{
     egui,
@@ -63,11 +71,38 @@ fn fs(in: Out) -> @location(0) vec4f {
 }
 "#;
 
-/// The GPU objects, kept in egui-wgpu's callback resources.
+/// A terminal pane's key to its GPU objects. Dropping it frees them.
+pub struct PaneId(pub u64);
+
+static NEXT_PANE: AtomicU64 = AtomicU64::new(0);
+/// Panes gone since the last prepare, whose GPU objects can go.
+static RETIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+impl PaneId {
+    pub fn new() -> Self {
+        Self(NEXT_PANE.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Drop for PaneId {
+    fn drop(&mut self) {
+        if let Ok(mut retired) = RETIRED.lock() {
+            retired.push(self.0);
+        }
+    }
+}
+
+/// The GPU objects, kept in egui-wgpu's callback resources: shared ones,
+/// and each pane's.
 pub struct CellPass {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    panes: HashMap<u64, PaneGpu>,
+}
+
+/// One pane's GPU objects.
+struct PaneGpu {
     uniforms: wgpu::Buffer,
     atlas: Option<(wgpu::Texture, (u32, u32))>,
     bind_group: Option<wgpu::BindGroup>,
@@ -75,6 +110,25 @@ pub struct CellPass {
     /// Instances `instances` holds, and how many the last frame drew.
     capacity: usize,
     count: u32,
+}
+
+impl PaneGpu {
+    fn new(device: &wgpu::Device) -> Self {
+        let capacity = 4096;
+        Self {
+            uniforms: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tai cells uniforms"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            atlas: None,
+            bind_group: None,
+            instances: CellPass::instance_buffer(device, capacity),
+            capacity,
+            count: 0,
+        }
+    }
 }
 
 impl CellPass {
@@ -159,24 +213,11 @@ impl CellPass {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tai cells uniforms"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let capacity = 4096;
-        let instances = Self::instance_buffer(device, capacity);
         render.renderer.write().callback_resources.insert(Self {
             pipeline,
             layout,
             sampler,
-            uniforms,
-            atlas: None,
-            bind_group: None,
-            instances,
-            capacity,
-            count: 0,
+            panes: HashMap::new(),
         });
     }
 
@@ -200,6 +241,8 @@ pub struct AtlasUpload {
 
 /// One frame of a terminal pane, handed to the paint callback.
 pub struct CellFrame {
+    /// The pane, by its `PaneId`.
+    pub pane: u64,
     pub view: egui::Vec2,
     pub instances: Arc<Vec<cells::Instance>>,
     pub atlas: Option<AtlasUpload>,
@@ -214,9 +257,18 @@ impl CallbackTrait for CellFrame {
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let Some(pass) = resources.get_mut::<CellPass>() else {
+        let Some(cells) = resources.get_mut::<CellPass>() else {
             return Vec::new();
         };
+        if let Ok(mut retired) = RETIRED.lock() {
+            for id in retired.drain(..) {
+                cells.panes.remove(&id);
+            }
+        }
+        let pass = cells
+            .panes
+            .entry(self.pane)
+            .or_insert_with(|| PaneGpu::new(device));
         if let Some(upload) = &self.atlas {
             let (w, h) = upload.size;
             if pass
@@ -241,7 +293,7 @@ impl CallbackTrait for CellFrame {
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                 pass.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("tai cells"),
-                    layout: &pass.layout,
+                    layout: &cells.layout,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -253,7 +305,7 @@ impl CallbackTrait for CellFrame {
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&pass.sampler),
+                            resource: wgpu::BindingResource::Sampler(&cells.sampler),
                         },
                     ],
                 }));
@@ -313,7 +365,10 @@ impl CallbackTrait for CellFrame {
         render_pass: &mut wgpu::RenderPass<'static>,
         resources: &CallbackResources,
     ) {
-        let Some(pass) = resources.get::<CellPass>() else {
+        let Some(cells) = resources.get::<CellPass>() else {
+            return;
+        };
+        let Some(pass) = cells.panes.get(&self.pane) else {
             return;
         };
         let Some(bind_group) = &pass.bind_group else {
@@ -322,7 +377,7 @@ impl CallbackTrait for CellFrame {
         if pass.count == 0 {
             return;
         }
-        render_pass.set_pipeline(&pass.pipeline);
+        render_pass.set_pipeline(&cells.pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.set_vertex_buffer(0, pass.instances.slice(..));
         render_pass.draw(0..6, 0..pass.count);

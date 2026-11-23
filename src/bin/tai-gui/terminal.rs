@@ -137,6 +137,8 @@ pub struct TerminalPane {
     key_encoder: key::Encoder<'static>,
     key_event: key::Event<'static>,
     atlas: GlyphAtlas,
+    /// This pane's GPU objects, its own as its atlas is (gpu.rs).
+    gpu: crate::gpu::PaneId,
     /// The last frame's instances, reused while nothing changed.
     instances: Arc<Vec<Instance>>,
     built_for: Option<(Dimensions, Option<(u16, u16)>)>,
@@ -275,6 +277,7 @@ impl TerminalPane {
             key_encoder: key::Encoder::new()?,
             key_event: key::Event::new()?,
             atlas: GlyphAtlas::new(crate::cells::ATLAS_MAX_HEIGHT),
+            gpu: crate::gpu::PaneId::new(),
             instances: Arc::new(Vec::new()),
             built_for: None,
             rows: Vec::new(),
@@ -513,6 +516,7 @@ impl TerminalPane {
             .add(eframe::egui_wgpu::Callback::new_paint_callback(
                 rect,
                 CellFrame {
+                    pane: self.gpu.0,
                     view: rect.size(),
                     instances: Arc::clone(&self.instances),
                     atlas,
