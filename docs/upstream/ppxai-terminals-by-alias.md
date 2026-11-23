@@ -62,10 +62,41 @@ terminal, restarts an exited one, types `run_shell` commands without
 running them, and focuses the terminal pane. tai also checks the alias,
 so a client that skips ppxai's check still can't create a bad one.
 
-## Questions for ppxai
+## ppxai's review (win32-ppxai, 2026-11-23, at `5bb39ad4`)
 
-1. Is `name` the field name you'd choose, or something else (`alias`,
-   `terminal`)?
-2. Does `--` collide with anything in ppxai's command parsing?
-3. Does the VS Code behaviour change need its own note in ppxai's
-   changelog or an ADR?
+Agreed, with these answers and corrections. Not started; waits for the
+owner.
+
+- **Field name:** `name`. VS Code's `createTerminal({name})` already uses
+  it, and `alias` means command aliases in ppxai's `CommandSpec`.
+- **`--`:** no collision. `handler.py` splits the command once
+  (`split(maxsplit=1)`) and the server route passes `args` raw
+  (`routes/commands.py`). The handler splits on the first ` -- ` (or a
+  leading `-- `) and keeps the rest verbatim, not shlex'd, so quotes and
+  pipes reach the shell untouched. An empty command after `--` is an
+  error.
+- **VS Code:** a CHANGELOG line is enough. No Python code emits
+  `run_shell` today, so `sendText(command, false)` changes no current
+  command. The code-block "Run" button (`chatPanel.ts`,
+  `runCommandInTerminal`) is a separate path, left alone unless the owner
+  wants the rule there too. A ppxai ADR (next free number 0020; ppxai's
+  own 0013 is the SSH hub) only if the owner wants the type-don't-run rule
+  recorded once for all clients; otherwise it goes in the `SideEffect`
+  docstring.
+- **Help only in the TUI** (item 2 above): the `ImportError` fallback
+  never fires, since `ppxai.tui.terminal` ships in every install; that's
+  why tai-gui sees the help. The branch goes on the context:
+  `ServerCommandContext` (any HTTP client) gets the notification, Rich and
+  Textual the help. `_help_client(context)` in `system.py` already splits
+  them.
+- **Client id:** `KNOWN_CLIENTS` is `{rich, textual, web, vscode}` and
+  the route answers 400 to others. tai-gui already sends `web`
+  (`COMMAND_CLIENT`, `src/bin/tai-gui/ppxai.rs`); adding `tai` there is a
+  separate decision.
+- **TUIs:** `alias -- command` errors like `alias`, since they have no
+  terminals. No new `client_action`, so the parity fence needs nothing.
+- **Validation:** one helper with one regex, imported by the tests:
+  `^(?:[0-9]+|(?=[a-z0-9-]*[a-z])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$`.
+- **Order:** Python and VS Code first. The web app needs a new
+  `TerminalView.typeText` that writes to the PTY websocket without a
+  newline, the biggest piece, done last.
