@@ -910,7 +910,10 @@ fn result_markdown(r: &Value) -> String {
                 parts.push(items.join("\n"));
             }
         }
-        "DirectoryTreeResult" => {
+        // A TreeResult is /show of JSON, YAML, TOML or HCL, among others;
+        // the web app shows it as it shows a directory tree
+        // (web/shared/result-renderer.js).
+        "DirectoryTreeResult" | "TreeResult" => {
             let mut lines = Vec::new();
             tree_lines(&r["root"], 0, &mut lines);
             if !lines.is_empty() {
@@ -941,8 +944,8 @@ fn result_markdown(r: &Value) -> String {
     parts.join("\n\n")
 }
 
-/// A `DirectoryTreeResult` node and its children, indented, at most 500
-/// lines: a tree of a home directory has thousands.
+/// A tree result's node and its children, indented, at most 500 lines: a
+/// tree of a home directory has thousands.
 fn tree_lines(node: &Value, depth: usize, out: &mut Vec<String>) {
     const MAX: usize = 500;
     let Some(label) = node["label"].as_str() else {
@@ -2123,6 +2126,17 @@ mod tests {
         let tree = outcome(serde_json::json!({"result": {"type":"DirectoryTreeResult",
             "message":"1 file","root":{"label":"d/","children":[{"label":"f","children":[]}]}}}));
         assert_eq!(tree.markdown, "```text\nd/\n  f\n```\n\n**1 file**");
+        // /show of a JSON file (ppxai commands/display.py, _dict_to_tree).
+        let data = outcome(serde_json::json!({"result": {"type":"TreeResult",
+            "message":"Displaying d.json (0.0 KB)","root":{"label":"d.json","children":[
+                {"label":"name: tai","children":[]},
+                {"label":"tags (2 items)","children":[{"label":"[0]: a","children":[]},
+                    {"label":"[1]: b","children":[]}]}]}}}));
+        assert_eq!(
+            data.markdown,
+            "```text\nd.json\n  name: tai\n  tags (2 items)\n    [0]: a\n    [1]: b\n```\n\n\
+             **Displaying d.json (0.0 KB)**"
+        );
     }
 
     #[test]
