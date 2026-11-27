@@ -2480,12 +2480,19 @@ impl SelectionState<'_> {
         Ok(())
     }
 
+    /// The window as the selection gesture measures it. The gesture
+    /// autoscrolls down only past `screen_height - 1`
+    /// (src/terminal/SelectionGesture.zig at 108cacb1), which Ghostty's
+    /// apprts reach because they report a drag outside the window. miniquad
+    /// reports nothing there on Windows or (popos-tai, under Xvfb) X11, so
+    /// the last pixel row would never count; a height one less makes it
+    /// count, as the top row does for up. screen_height only feeds that test.
     fn geometry(terminal: &Terminal<'_, '_>, dims: Dimensions) -> Result<Geometry> {
         Ok(Geometry {
             columns: terminal.cols()?.into(),
             cell_width: dims.cell_width as u32,
             padding_left: PADDING as u32,
-            screen_height: dims.window_height as u32,
+            screen_height: (dims.window_height as u32).saturating_sub(1),
         })
     }
 
