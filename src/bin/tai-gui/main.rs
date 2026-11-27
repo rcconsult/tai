@@ -53,6 +53,8 @@ mod shell_integration;
 #[path = "../../shortcuts.rs"]
 #[allow(dead_code)]
 mod shortcuts;
+#[path = "../../term/mod.rs"]
+mod term;
 
 mod aliases;
 mod chat;

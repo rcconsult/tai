@@ -26,7 +26,6 @@ use libghostty_vt::{
     mouse,
     point::{Coordinate, Point},
     render::{CellIterator, Dirty, RenderState, RowIterator},
-    report::SizeReportSize,
     screen::{CellWide, RowSemanticPrompt, Screen},
     selection::gesture::{
         Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
@@ -270,51 +269,33 @@ impl TerminalPane {
         let grid_size = Rc::new(Cell::new((cols, rows)));
         let cell_pixels = Rc::new(Cell::new(dims.cell_pixels()));
 
-        let mut terminal = Terminal::new(cols, rows)?;
-        terminal.set_scrollback_max_lines(Some(1000))?;
-        // Grapheme clustering, mode 2027, only when asked for (grapheme.rs).
-        if crate::grapheme::clustering() {
-            terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
-        }
-        // ConPTY keeps its own screen and can't take scrollback back, so on
-        // Windows a resize mustn't pull scrollback into the active screen
-        // (docs/lessons/from-libghostty-projects.md, section 1).
-        #[cfg(windows)]
-        terminal.set_resize_pull_scrollback(Some(false))?;
-        let (cell_w, cell_h) = dims.cell_pixels();
-        terminal.resize(cols, rows, cell_w, cell_h)?;
-        terminal
-            .on_pty_write({
+        // The options and the answers to programs' queries tai shares
+        // (src/term/setup.rs).
+        let mut terminal = crate::term::setup::new_terminal(cols, rows, dims.cell_pixels())?;
+        crate::term::setup::answer_queries(
+            &mut terminal,
+            {
                 let pty = Rc::clone(&pty);
-                move |_t, data| pty.reply(data)
-            })?
-            .on_size({
+                move |data| pty.reply(data)
+            },
+            {
                 let (gs, cp) = (Rc::clone(&grid_size), Rc::clone(&cell_pixels));
-                move |_t| {
-                    let (columns, rows) = gs.get();
-                    let (cell_width, cell_height) = cp.get();
-                    Some(SizeReportSize {
-                        rows,
-                        columns,
-                        cell_width,
-                        cell_height,
-                    })
+                move || (gs.get(), cp.get())
+            },
+        )?;
+        terminal.on_semantic_prompt({
+            let prompt = Rc::clone(&prompt);
+            // A panic here aborts, so a kind these bindings don't know
+            // is ignored.
+            move |_t, event| match event.kind() {
+                Ok(SemanticPromptKind::PromptStart | SemanticPromptKind::CommandEnd) => {
+                    prompt.set(Prompt::Drawing)
                 }
-            })?
-            .on_xtversion(|_t| Some("tai"))?
-            .on_semantic_prompt({
-                let prompt = Rc::clone(&prompt);
-                // A panic here aborts, so a kind these bindings don't know
-                // is ignored.
-                move |_t, event| match event.kind() {
-                    Ok(SemanticPromptKind::PromptStart | SemanticPromptKind::CommandEnd) => {
-                        prompt.set(Prompt::Drawing)
-                    }
-                    Ok(SemanticPromptKind::InputStart) => prompt.set(Prompt::Input),
-                    Ok(SemanticPromptKind::OutputStart) => prompt.set(Prompt::Running),
-                    _ => {}
-                }
-            })?;
+                Ok(SemanticPromptKind::InputStart) => prompt.set(Prompt::Input),
+                Ok(SemanticPromptKind::OutputStart) => prompt.set(Prompt::Running),
+                _ => {}
+            }
+        })?;
 
         Ok(Self {
             terminal,

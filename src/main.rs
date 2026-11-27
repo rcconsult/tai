@@ -37,17 +37,12 @@ use libghostty_vt::{
     alloc::Bytes,
     build_info,
     color::Rgb,
-    effect::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
-        PrimaryDeviceAttributes, SecondaryDeviceAttributes,
-    },
     key::{self, Key},
     kitty::graphics::{self, DecodePng, DecodedImage, Graphics, Layer, PlacementIterator},
     mode::Mode,
     mouse,
     point::{Coordinate, Point},
     render::{CellIteration, CellIterator, Colors, Dirty, RenderState, RowIterator},
-    report::SizeReportSize,
     screen::{CellWide, Screen},
     selection::gesture::{
         Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
@@ -73,6 +68,7 @@ mod placeholders;
 mod pty;
 mod pty_input;
 mod selection;
+mod term;
 // tai starts shells with it; only tai-gui reads the folder they report.
 #[allow(dead_code)]
 mod shell_integration;
@@ -298,8 +294,6 @@ async fn main() -> Result<()> {
     // screen and makes the shell redraw its prompt, so a run of size steps
     // is applied once, after the last one.
     let mut resize_due: Option<Instant> = None;
-    // Whether mode 2048 (in-band size reports) was set after the last read.
-    let mut in_band_resize = false;
 
     // Spawn a child shell connected to a pseudo-terminal. On Windows this
     // restricts tai's DLL search to its own folder and System32 (ADR 0007),
@@ -315,24 +309,11 @@ async fn main() -> Result<()> {
     #[allow(unsafe_code)]
     unsafe { graphics::set_png_decoder(Some(Box::new(PngDecoder))) }?;
 
-    // Create a ghostty virtual terminal with the computed grid and 1000
-    // lines of scrollback.  This holds all the parsed screen state (cells,
-    // cursor, styles, modes) but knows nothing about the pty or the window.
-    let mut terminal = Terminal::new(cols, rows)?;
-    terminal.set_scrollback_max_lines(Some(1000))?;
-    // ConPTY keeps its own screen and can't take scrollback back, so on
-    // Windows a resize mustn't pull scrollback into the active screen
-    // (docs/lessons/from-libghostty-projects.md, section 1).
-    #[cfg(windows)]
-    terminal.set_resize_pull_scrollback(Some(false))?;
-
-    // The terminal options don't include cell pixel dimensions, so
-    // issue an initial resize to set them.  Without this, Kitty
-    // graphics placement_rect would divide by zero cell sizes.
-    {
-        let (cell_w, cell_h) = dims.cell_pixels();
-        terminal.resize(cols, rows, cell_w, cell_h)?;
-    }
+    // Create a ghostty virtual terminal with the computed grid, with the
+    // options tai and tai-gui share (src/term/setup.rs). It holds all the
+    // parsed screen state (cells, cursor, styles, modes) but knows nothing
+    // about the pty or the window.
+    let mut terminal = term::setup::new_terminal(cols, rows, dims.cell_pixels())?;
 
     terminal
         // Enable Kitty graphics by setting a storage limit.  Without this the
@@ -346,82 +327,13 @@ async fn main() -> Result<()> {
         .set_kitty_image_temp_file_dir(Some(&std::env::temp_dir()))?
         .set_kitty_image_from_shared_mem_allowed(true)?;
 
-    // Grapheme clustering, mode 2027, only when asked for (grapheme.rs).
-    if grapheme::clustering() {
-        terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
-    }
-
-    // Whether DA1 lists Sixel (ADR 0009). tai translates Sixel either way.
-    let advertise_sixel = std::env::var("TAI_SIXEL").as_deref() == Ok("1");
-
-    // Register effects so the terminal can respond to VT queries (device
-    // attributes, mode reports, size queries, etc.) that programs like
-    // vim, tmux, and htop send during startup.  Without these, query
-    // sequences are silently dropped and those programs may hang or
-    // fall back to degraded behavior.
-    terminal
-        // write_pty effect — the terminal calls this whenever a VT sequence
-        // requires a response back to the application (device status reports,
-        // mode queries, device attributes, etc.).  Without this, programs like
-        // vim and tmux that probe terminal capabilities would hang.
-        .on_pty_write(|_t, data| pty.reply(data))?
-        // size effect — responds to XTWINOPS size queries (CSI 14/16/18 t)
-        // so programs can discover the terminal geometry in cells and pixels.
-        .on_size({
-            let gs = &grid_size;
-            let cp = &cell_pixels;
-            move |_term| {
-                let (columns, rows) = gs.get();
-                let (cell_width, cell_height) = cp.get();
-                Some(SizeReportSize {
-                    rows,
-                    columns,
-                    cell_width,
-                    cell_height,
-                })
-            }
-        })?
-        // device_attributes effect — responds to DA1/DA2/DA3 queries so
-        // terminal applications can identify the terminal's capabilities.
-        // We report VT220-level conformance with a modest feature set.
-        .on_device_attributes(move |_term| {
-            Some(DeviceAttributes {
-                // DA1: VT220-level with a few common features. Sixel only on
-                // request (ADR 0009): textual-image picks Sixel over Kitty
-                // placeholders whenever it's listed.
-                primary: PrimaryDeviceAttributes::new(
-                    ConformanceLevel::VT220,
-                    if advertise_sixel {
-                        &[
-                            DeviceAttributeFeature::COLUMNS_132,
-                            DeviceAttributeFeature::SIXEL,
-                            DeviceAttributeFeature::SELECTIVE_ERASE,
-                            DeviceAttributeFeature::ANSI_COLOR,
-                        ]
-                    } else {
-                        &[
-                            DeviceAttributeFeature::COLUMNS_132,
-                            DeviceAttributeFeature::SELECTIVE_ERASE,
-                            DeviceAttributeFeature::ANSI_COLOR,
-                        ]
-                    },
-                ),
-                // DA2: VT220-type, version 1, no ROM cartridge.
-                secondary: SecondaryDeviceAttributes {
-                    device_type: DeviceType::VT220,
-                    firmware_version: 1,
-                    rom_cartridge: 0,
-                },
-                // DA3: default unit id (0).
-                tertiary: Default::default(),
-            })
-        })?
-        // xtversion effect — responds to CSI > q with our application name.
-        .on_xtversion(|_term| Some("tai"))?
-        // color_scheme effect — responds to CSI ? 996 n.
-        // We don't have any API to query the OS color scheme, so we return
-        // false to silently ignore the query rather than guessing.
-        .on_color_scheme(|_term| None)?;
+    // Answer programs' queries: device attributes, sizes, XTVERSION and the
+    // rest, as tai-gui does (src/term/setup.rs).
+    term::setup::answer_queries(
+        &mut terminal,
+        |data| pty.reply(data),
+        || (grid_size.get(), cell_pixels.get()),
+    )?;
 
     // Create the objects used in rendering the terminal, including the
     // render state and various reusable iterators.
@@ -555,16 +467,6 @@ async fn main() -> Result<()> {
                         child.mark_exited();
                     }
                 }
-
-                // Send a size report when mode 2048 gets set, as Ghostty's
-                // app does (src/termio/stream_handler.zig, at a887df42);
-                // libghostty-vt only sends one on resize. Textual waits for
-                // it before it reads SGR-Pixels mouse reports as pixels.
-                let reports = terminal.mode(Mode::IN_BAND_RESIZE)?;
-                if reports && !in_band_resize {
-                    pty.reply(in_band_size_report(grid_size.get(), cell_pixels.get()).as_bytes());
-                }
-                in_band_resize = reports;
             }
             // Try to reap the child if it had already exited.
             //
@@ -1674,16 +1576,6 @@ impl EventHandler for KeyEvents {
 /// `ghosttyCharacters`, at a887df42).
 fn is_function_key_char(ch: char) -> bool {
     ('\u{f700}'..='\u{f8ff}').contains(&ch)
-}
-
-/// The mode 2048 size report, ESC [ 48 ; rows ; cols ; height ; width t,
-/// encoded like Ghostty's src/terminal/size_report.zig (at a887df42).
-fn in_band_size_report((cols, rows): (u16, u16), (cell_w, cell_h): (u32, u32)) -> String {
-    let (height, width) = (
-        u64::from(rows) * u64::from(cell_h),
-        u64::from(cols) * u64::from(cell_w),
-    );
-    format!("\x1b[48;{rows};{cols};{height};{width}t")
 }
 
 fn mods_from(keymods: KeyMods) -> key::Mods {
@@ -2881,27 +2773,6 @@ mod tests {
         assert_eq!((u32::from(w / cols), u32::from(h / rows)), d.cell_pixels());
         assert_eq!((w % cols, h % rows), (0, 0));
         assert!(f32::from(w) <= (800.0 - 2.0 * PADDING) * 2.0);
-    }
-
-    #[test]
-    fn in_band_size_report_matches_resize() {
-        use libghostty_vt::Terminal;
-        use std::{cell::RefCell, rc::Rc};
-        let mut terminal = Terminal::new(80, 24).unwrap();
-        terminal.set_scrollback_max_lines(Some(0)).unwrap();
-        let sent = Rc::new(RefCell::new(Vec::new()));
-        let s = sent.clone();
-        terminal
-            .on_pty_write(move |_t, data| s.borrow_mut().extend_from_slice(data))
-            .unwrap();
-        terminal.vt_write(b"\x1b[?2048h");
-        // Setting the mode sends nothing; tai has to.
-        assert!(sent.borrow().is_empty());
-        // libghostty-vt's own report on resize is what tai's must match.
-        terminal.resize(100, 30, 9, 18).unwrap();
-        let expected = super::in_band_size_report((100, 30), (9, 18));
-        assert_eq!(expected, "\x1b[48;30;100;540;900t");
-        assert_eq!(*sent.borrow(), expected.as_bytes());
     }
 
     /// The first row's cells after `line` is written, with grapheme
