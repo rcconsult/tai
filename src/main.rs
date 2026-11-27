@@ -48,7 +48,7 @@ use libghostty_vt::{
     point::{Coordinate, Point},
     render::{CellIteration, CellIterator, Colors, Dirty, RenderState, RowIterator},
     report::SizeReportSize,
-    screen::CellWide,
+    screen::{CellWide, Screen},
     selection::gesture::{
         Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
     },
@@ -167,6 +167,17 @@ fn wheel_notches(travel: f32) -> f32 {
         travel
     } else {
         travel / 10.0
+    }
+}
+
+/// The arrow key the wheel sends under alternate scroll, in the cursor key
+/// mode (DECCKM) the program set; tai-gui's `arrow_seq` is the same.
+fn arrow_seq(up: bool, application: bool) -> &'static [u8] {
+    match (up, application) {
+        (true, true) => b"\x1bOA",
+        (false, true) => b"\x1bOB",
+        (true, false) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
     }
 }
 
@@ -2177,8 +2188,9 @@ impl<'alloc> Input<'alloc> {
 
         // Scroll wheel handling.  When a mouse tracking mode is active the
         // wheel events are forwarded to the application as button 4/5
-        // press+release pairs.  Otherwise we scroll the viewport through
-        // the scrollback buffer so the user can review history.
+        // presses. On the alternate screen under alternate scroll they're
+        // arrow keys. Otherwise we scroll the viewport through the
+        // scrollback buffer so the user can review history.
         // Rows of travel, WHEEL_ROWS per notch as Ghostty's default
         // mouse-scroll-multiplier (src/config/Config.zig at 108cacb1), with
         // fractions carried to the next frame. Positive is up.
@@ -2202,6 +2214,21 @@ impl<'alloc> Input<'alloc> {
                     self.response.reserve(ENCODE_ROOM);
                     self.mouse_encoder
                         .encode_to_vec(&self.mouse_event, &mut self.response)?;
+                }
+            } else if terminal.active_screen()? == Screen::Alternate
+                && terminal.mode(Mode::ALT_SCROLL)?
+            {
+                // Alternate scroll (mode 1007, on by default): a program on
+                // the alternate screen that doesn't track the mouse, such
+                // as less, gets an arrow key per row, and the selection
+                // goes, as in Ghostty (src/Surface.zig at 108cacb1,
+                // scrollCallback). tai-gui does the same.
+                if terminal.selection()?.is_some() {
+                    terminal.set_selection(None)?;
+                }
+                let seq = arrow_seq(rows > 0, terminal.mode(Mode::DECCKM)?);
+                for _ in 0..rows.unsigned_abs() {
+                    self.response.extend_from_slice(seq);
                 }
             } else {
                 // Scroll the viewport through scrollback: negative is up,
@@ -2679,7 +2706,7 @@ mod pty;
 
 #[cfg(test)]
 mod tests {
-    use super::{Dimensions, Input, PADDING, WHEEL_ROWS, take_rows, wheel_notches};
+    use super::{Dimensions, Input, PADDING, WHEEL_ROWS, arrow_seq, take_rows, wheel_notches};
 
     #[test]
     fn a_wheel_notch_scrolls_three_rows_on_each_platform() {
@@ -2717,6 +2744,14 @@ mod tests {
         assert_eq!(take_rows(&mut pending, -0.75), 0);
         assert!((pending + 0.75).abs() < 1e-6);
         assert_eq!(take_rows(&mut pending, 0.0), 0);
+    }
+
+    #[test]
+    fn alternate_scroll_sends_the_arrow_for_the_cursor_key_mode() {
+        assert_eq!(arrow_seq(true, false), b"\x1b[A");
+        assert_eq!(arrow_seq(false, false), b"\x1b[B");
+        assert_eq!(arrow_seq(true, true), b"\x1bOA");
+        assert_eq!(arrow_seq(false, true), b"\x1bOB");
     }
 
     fn dims(window: (f32, f32), cell: (f32, f32), dpi_scale: f32) -> Dimensions {
