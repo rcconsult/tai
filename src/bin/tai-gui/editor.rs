@@ -149,9 +149,12 @@ mod tests {
 
     #[test]
     fn powershell_exits_only_after_a_clean_quit_without_and_and() {
-        for shell in [r"C:\Program Files\PowerShell\7\pwsh.exe", "powershell.exe"] {
+        // Joined, not written with backslashes: on Unix a backslash isn't a
+        // separator, so the stem would be the whole string (popos-tai).
+        let pwsh = Path::new("PowerShell").join("7").join("pwsh.exe");
+        for shell in [pwsh.as_path(), Path::new("powershell.exe")] {
             assert_eq!(
-                command("edit", "a.rs", Some(3), None, Path::new(shell)),
+                command("edit", "a.rs", Some(3), None, shell),
                 format!("edit {}; if ($?) {{ exit }}", quote("a.rs:3"))
             );
         }
@@ -162,7 +165,7 @@ mod tests {
                 "a.rs",
                 None,
                 None,
-                Path::new(r"C:\Windows\System32\cmd.exe")
+                &Path::new("System32").join("cmd.exe")
             ),
             format!("edit {} && exit", quote("a.rs"))
         );
