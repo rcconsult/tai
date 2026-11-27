@@ -229,6 +229,10 @@ fn take_rows(pending: &mut f32, rows: f32) -> isize {
     whole as isize
 }
 
+/// Presses closer together than this are a double or triple click; a
+/// Shift-click further from the last press extends the selection.
+const CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
 /// How often a selection drag past the window's top or bottom scrolls one
 /// row, as Ghostty's `selection_scroll_ms` (src/termio/Thread.zig at
 /// 108cacb1).
@@ -2190,7 +2194,7 @@ impl<'alloc> Input<'alloc> {
                         if mb == MouseButton::Left
                             && Self::selection_allowed_with_mods(terminal, mods)? =>
                     {
-                        self.selection.on_click(terminal, x, y, dims)?;
+                        self.selection.on_click(terminal, x, y, dims, mods)?;
                         continue;
                     }
                     _ => {}
@@ -2497,6 +2501,8 @@ struct SelectionState<'alloc> {
     /// When the last autoscroll tick ran, while a drag past the window's
     /// top or bottom scrolls it.
     last_autoscroll: Option<Instant>,
+    /// When the left button last pressed for a selection, for Shift-click.
+    last_press: Option<Instant>,
     start_time: Instant,
     /// The cursor last set, so it is only set again when it changes.
     cursor: Cell<Option<CursorIcon>>,
@@ -2507,7 +2513,7 @@ struct SelectionState<'alloc> {
 impl SelectionState<'_> {
     fn new() -> Result<Self> {
         let mut press_event = PressEvent::new()?;
-        press_event.set_repeat_interval(Duration::from_millis(500))?;
+        press_event.set_repeat_interval(CLICK_INTERVAL)?;
 
         Ok(Self {
             gesture: Gesture::new()?,
@@ -2516,6 +2522,7 @@ impl SelectionState<'_> {
             drag_event: DragEvent::new()?,
             autoscroll_event: AutoscrollTickEvent::new()?,
             last_autoscroll: None,
+            last_press: None,
             start_time: Instant::now(),
             cursor: Cell::new(None),
             held: false,
@@ -2538,7 +2545,23 @@ impl SelectionState<'_> {
         x: f32,
         y: f32,
         dims: Dimensions,
+        mods: key::Mods,
     ) -> Result<()> {
+        // Shift-click extends the selection there instead of starting a new
+        // one, as Ghostty's mouseButtonCallback does (src/Surface.zig at
+        // 108cacb1): with a selection, a click the gesture remembers, and
+        // that click longer ago than a double click, the press continues
+        // the old click's drag.
+        let since_press = self.last_press.map(|at| at.elapsed());
+        self.last_press = Some(Instant::now());
+        if mods.contains(key::Mods::SHIFT)
+            && terminal.selection()?.is_some()
+            && self.gesture.click_count(terminal)? > 0
+            && since_press.is_some_and(|since| since > CLICK_INTERVAL)
+        {
+            self.held = true;
+            return self.on_drag(terminal, x, y, dims, mods);
+        }
         let point = Input::mouse_viewport_point(terminal, dims)?;
         let grid_ref = terminal.grid_ref(point)?;
 
