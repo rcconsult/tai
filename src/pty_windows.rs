@@ -352,7 +352,7 @@ fn allow_ctrl_c() {
 /// Always an absolute path: given a bare name, portable-pty and
 /// CreateProcessW would also look in the current directory and next to
 /// tai.exe, so a planted pwsh.exe or cmd.exe there would run instead.
-fn default_shell() -> PathBuf {
+pub fn default_shell() -> PathBuf {
     let pwsh = std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
             .filter(|dir| dir.is_absolute())

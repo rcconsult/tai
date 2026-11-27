@@ -1887,7 +1887,11 @@ impl ChatPane {
                                         self.terminals.push(TerminalRequest {
                                             cwd,
                                             command: Some(crate::editor::command(
-                                                &editor, &path, line, column,
+                                                &editor,
+                                                &path,
+                                                line,
+                                                column,
+                                                &crate::editor::shell(),
                                             )),
                                             name: None,
                                             run: true,
