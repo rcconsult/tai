@@ -150,6 +150,42 @@ fn present_material() -> Result<Material> {
 /// Small padding from window edges
 const PADDING: f32 = 6.0;
 
+/// Rows one notch of a mouse wheel scrolls, Ghostty's default discrete
+/// mouse-scroll-multiplier.
+const WHEEL_ROWS: f32 = 3.0;
+
+/// Notches of a mouse wheel in miniquad's wheel travel, which differs by
+/// platform (miniquad 0.4.11 src/native): WM_MOUSEWHEEL's WHEEL_DELTA,
+/// 120, on Windows; on macOS a line delta times 10, or a trackpad's
+/// points; on Linux, X11 sends exactly 1 per button 4 or 5 press and
+/// Wayland surface pixels, about 10 per notch. tai can't tell X11 from
+/// Wayland, so a travel of exactly 1 counts as X11's notch.
+fn wheel_notches(travel: f32) -> f32 {
+    if cfg!(windows) {
+        travel / 120.0
+    } else if cfg!(target_os = "linux") && travel.abs() == 1.0 {
+        travel
+    } else {
+        travel / 10.0
+    }
+}
+
+/// Add `rows` of travel to `pending` and take the whole rows out, keeping
+/// the fraction for the next frame. A change of direction drops the
+/// fraction left from the other way.
+fn take_rows(pending: &mut f32, rows: f32) -> isize {
+    if rows == 0.0 {
+        return 0;
+    }
+    if pending.signum() != rows.signum() {
+        *pending = 0.0;
+    }
+    *pending += rows;
+    let whole = pending.trunc();
+    *pending -= whole;
+    whole as isize
+}
+
 /// How often a selection drag past the window's top or bottom scrolls one
 /// row, as Ghostty's `selection_scroll_ms` (src/termio/Thread.zig at
 /// 108cacb1).
@@ -1544,28 +1580,39 @@ enum KeyInput {
 }
 
 /// Collects the keyboard events macroquad replays to an input subscriber
-/// (`utils::repeat_all_miniquad_input`), in the order they happened.
+/// (`utils::repeat_all_miniquad_input`), in the order they happened, and
+/// the frame's wheel travel: macroquad's mouse_wheel() keeps only the
+/// frame's last wheel event, so notches that arrive together were lost.
 #[derive(Default)]
-struct KeyEvents(Vec<KeyInput>);
+struct KeyEvents {
+    keys: Vec<KeyInput>,
+    /// Vertical wheel travel in notches, each event converted on its own:
+    /// X11's notch is a travel of exactly 1, which a frame's sum isn't
+    /// once two arrive together (popos-tai).
+    wheel: f32,
+}
 
 impl EventHandler for KeyEvents {
     fn update(&mut self) {}
     fn draw(&mut self) {}
     fn key_down_event(&mut self, keycode: KeyCode, keymods: KeyMods, repeat: bool) {
-        self.0.push(KeyInput::Down {
+        self.keys.push(KeyInput::Down {
             keycode,
             mods: mods_from(keymods),
             repeat,
         });
     }
     fn key_up_event(&mut self, keycode: KeyCode, keymods: KeyMods) {
-        self.0.push(KeyInput::Up {
+        self.keys.push(KeyInput::Up {
             keycode,
             mods: mods_from(keymods),
         });
     }
     fn char_event(&mut self, character: char, _keymods: KeyMods, _repeat: bool) {
-        self.0.push(KeyInput::Char(character));
+        self.keys.push(KeyInput::Char(character));
+    }
+    fn mouse_wheel_event(&mut self, _x: f32, y: f32) {
+        self.wheel += wheel_notches(y);
     }
 }
 
@@ -1650,6 +1697,11 @@ struct Input<'alloc> {
     chars_before_keys: Option<bool>,
     /// On X11, characters waiting for the key press they belong to.
     lead_text: String,
+    /// This frame's wheel travel in notches, from the input stream.
+    wheel: f32,
+    /// Wheel travel not yet a whole row, as Ghostty's `pending_scroll_y`
+    /// (src/Surface.zig at 108cacb1, scrollCallback).
+    pending_rows: f32,
 }
 impl<'alloc> Input<'alloc> {
     fn new() -> Result<Self> {
@@ -1675,6 +1727,8 @@ impl<'alloc> Input<'alloc> {
                 Some(false)
             },
             lead_text: String::new(),
+            wheel: 0.0,
+            pending_rows: 0.0,
         })
     }
 
@@ -1698,11 +1752,11 @@ impl<'alloc> Input<'alloc> {
         let mut events = std::mem::take(&mut self.key_events);
         utils::repeat_all_miniquad_input(&mut events, self.input_subscriber);
         if self.chars_before_keys.is_none() {
-            self.chars_before_keys = Self::char_order(&events.0);
+            self.chars_before_keys = Self::char_order(&events.keys);
         }
         let chars_before_keys = self.chars_before_keys == Some(true);
         let order_unknown = self.chars_before_keys.is_none();
-        for event in events.0.drain(..) {
+        for event in events.keys.drain(..) {
             match event {
                 KeyInput::Down {
                     keycode,
@@ -1818,6 +1872,7 @@ impl<'alloc> Input<'alloc> {
         }
         self.flush_pending_key(terminal)?;
         self.flush_lead_text();
+        self.wheel = std::mem::take(&mut events.wheel);
         self.key_events = events;
 
         // A held font-size shortcut keeps stepping, as in Ghostty, until its
@@ -2124,33 +2179,34 @@ impl<'alloc> Input<'alloc> {
         // wheel events are forwarded to the application as button 4/5
         // press+release pairs.  Otherwise we scroll the viewport through
         // the scrollback buffer so the user can review history.
-        let (wheel_x, wheel_y) = mouse_wheel();
-        if wheel_x.abs() > 1e-6 || wheel_y.abs() > 1e-6 {
+        // Rows of travel, WHEEL_ROWS per notch as Ghostty's default
+        // mouse-scroll-multiplier (src/config/Config.zig at 108cacb1), with
+        // fractions carried to the next frame. Positive is up.
+        let notches = std::mem::take(&mut self.wheel);
+        let rows = take_rows(&mut self.pending_rows, notches * WHEEL_ROWS);
+        if rows != 0 {
             if terminal.is_mouse_tracking()? {
-                let scroll_btn = if wheel_y > 0.0 {
+                let scroll_btn = if rows > 0 {
                     mouse::Button::Four
                 } else {
                     mouse::Button::Five
                 };
-
+                // One press per row and no release, as Ghostty reports the
+                // wheel (src/Surface.zig at 108cacb1, scrollCallback): hx
+                // counts an SGR release of button 4 or 5 as another scroll
+                // (popos-tai).
                 self.mouse_event
                     .set_button(Some(scroll_btn))
                     .set_action(mouse::Action::Press);
-                self.response.reserve(ENCODE_ROOM);
-                self.mouse_encoder
-                    .encode_to_vec(&self.mouse_event, &mut self.response)?;
-
-                self.mouse_event.set_action(mouse::Action::Release);
-                self.response.reserve(ENCODE_ROOM);
-                self.mouse_encoder
-                    .encode_to_vec(&self.mouse_event, &mut self.response)?;
+                for _ in 0..rows.unsigned_abs() {
+                    self.response.reserve(ENCODE_ROOM);
+                    self.mouse_encoder
+                        .encode_to_vec(&self.mouse_event, &mut self.response)?;
+                }
             } else {
-                // Scroll the viewport through scrollback. Adapt
-                // the scroll delta to the wheel/touchpad velocity
-                // for a comfortable pace.  Delta is negative to scroll
-                // up (into history), positive to scroll down.
-                let scroll_delta: isize = (wheel_y * -2.5) as isize;
-                terminal.scroll_viewport(ScrollViewport::Delta(scroll_delta));
+                // Scroll the viewport through scrollback: negative is up,
+                // into history.
+                terminal.scroll_viewport(ScrollViewport::Delta(-rows));
                 // A drag in progress follows the scroll: the cell under the
                 // resting pointer is a different one now.
                 if self.selection.is_selecting() {
@@ -2623,7 +2679,45 @@ mod pty;
 
 #[cfg(test)]
 mod tests {
-    use super::{Dimensions, Input, PADDING};
+    use super::{Dimensions, Input, PADDING, WHEEL_ROWS, take_rows, wheel_notches};
+
+    #[test]
+    fn a_wheel_notch_scrolls_three_rows_on_each_platform() {
+        // One notch, as miniquad reports it here.
+        let notch = if cfg!(windows) {
+            120.0
+        } else if cfg!(target_os = "linux") {
+            1.0
+        } else {
+            10.0
+        };
+        let mut pending = 0.0;
+        assert_eq!(
+            take_rows(&mut pending, wheel_notches(notch) * WHEEL_ROWS),
+            3
+        );
+        assert_eq!(
+            take_rows(&mut pending, wheel_notches(-notch) * WHEEL_ROWS),
+            -3
+        );
+        // Several notches in one frame all count: each event is converted
+        // on its own, then summed, as KeyEvents does.
+        let four: f32 = (0..4).map(|_| wheel_notches(notch)).sum();
+        assert_eq!(take_rows(&mut pending, four * WHEEL_ROWS), 12);
+    }
+
+    #[test]
+    fn fractions_of_a_row_carry_until_the_direction_changes() {
+        let mut pending = 0.0;
+        // A trackpad's small steps add up instead of rounding to nothing.
+        let steps: isize = (0..10).map(|_| take_rows(&mut pending, 0.25)).sum();
+        assert_eq!(steps, 2);
+        assert!((pending - 0.5).abs() < 1e-6);
+        // Turning around drops the half row left from going up.
+        assert_eq!(take_rows(&mut pending, -0.75), 0);
+        assert!((pending + 0.75).abs() < 1e-6);
+        assert_eq!(take_rows(&mut pending, 0.0), 0);
+    }
 
     fn dims(window: (f32, f32), cell: (f32, f32), dpi_scale: f32) -> Dimensions {
         Dimensions {
