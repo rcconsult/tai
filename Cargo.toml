@@ -91,7 +91,9 @@ nix = { version = "0.31.2", features = ["term", "fs", "signal", "process", "user
 # ConPTY on Windows (ADR 0002).
 [target.'cfg(windows)'.dependencies]
 portable-pty = "0.9.0"
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_System_LibraryLoader"] }
+# Win32_UI_Input_KeyboardAndMouse: SetCapture for a mouse drag past tai's
+# window (src/main.rs, `capture_mouse`).
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_System_LibraryLoader", "Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse"] }
 # DirectWrite font fallback (ADR 0012); windows-sys has no COM interfaces.
 # 0.62.2 is the version wgpu already brings in for tai-gui.
 windows = { version = "0.62.2", features = ["Win32_Graphics_DirectWrite", "Win32_Globalization"] }

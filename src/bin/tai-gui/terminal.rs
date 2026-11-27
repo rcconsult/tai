@@ -748,9 +748,15 @@ impl TerminalPane {
                 .encode_to_vec(&self.mouse_event, &mut out)?;
         }
         let dragging = self.reported.iter().any(|&r| r);
+        // With Shift the mouse is the terminal's, as for the press above.
+        // A Shift-press starts its selection only in handle_pointer, after
+        // this, so `selecting` was still false in that frame and its motion
+        // went to the program with the left button down: hx took it as a
+        // drag and grew its own selection (popos-tai).
         if let Some(pos) = pos
             && moved
             && !self.selecting
+            && !held.shift
             && (dragging || rect.contains(pos))
         {
             let button = BUTTONS

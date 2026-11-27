@@ -120,6 +120,10 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
   one font. An emoji ZWJ sequence, skin tone, flag or keycap needs a
   ligature, so it shows only its first emoji or character.
 - macroquad is vendored with a clipboard fix (`vendor/macroquad/TAI-PATCHES.md`).
+- Linux, X11: in tai-gui one wheel notch may scroll 6 rows instead of 3.
+  Under Xvfb with XTest wheel clicks, winit reports two lines for each
+  notch, and tai-gui scrolls 3 rows a line, as Ghostty does. Whether a
+  real mouse on a real X server does the same hasn't been checked.
 - Windows: tai bundles Microsoft's ConPTY (`conpty.dll` and
   `OpenConsole.exe`, next to `tai.exe`; ADR 0007), because Windows' own
   swallows image sequences. Without those files tai still works, without
