@@ -181,6 +181,38 @@ fn arrow_seq(up: bool, application: bool) -> &'static [u8] {
     }
 }
 
+/// Hold the mouse for tai's window while a button is down, as winit does
+/// for tai-gui. miniquad 0.4.11 never calls SetCapture, so once a drag
+/// left the window Windows sent it no WM_MOUSEMOVE, and a selection
+/// couldn't autoscroll past the edge, and a button let go outside the
+/// window never reached tai. With the capture, both reach miniquad's
+/// window procedure, which takes the signed coordinates past the edge.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn capture_mouse(held: bool, captured: &mut bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetActiveWindow, ReleaseCapture, SetCapture,
+    };
+    if held == *captured {
+        return;
+    }
+    // SAFETY: user32 calls with no pointers, from the thread that owns the
+    // window (macroquad runs tai's loop on it); GetActiveWindow is that
+    // thread's own active window, or null.
+    unsafe {
+        if held {
+            let hwnd = GetActiveWindow();
+            if hwnd.is_null() {
+                return;
+            }
+            SetCapture(hwnd);
+        } else {
+            ReleaseCapture();
+        }
+    }
+    *captured = held;
+}
+
 /// Add `rows` of travel to `pending` and take the whole rows out, keeping
 /// the fraction for the next frame. A change of direction drops the
 /// fraction left from the other way.
@@ -1708,6 +1740,9 @@ struct Input<'alloc> {
     chars_before_keys: Option<bool>,
     /// On X11, characters waiting for the key press they belong to.
     lead_text: String,
+    /// Whether tai holds the mouse while a button is down (`capture_mouse`).
+    #[cfg(windows)]
+    mouse_captured: bool,
     /// This frame's wheel travel in notches, from the input stream.
     wheel: f32,
     /// Wheel travel not yet a whole row, as Ghostty's `pending_scroll_y`
@@ -1738,6 +1773,8 @@ impl<'alloc> Input<'alloc> {
                 Some(false)
             },
             lead_text: String::new(),
+            #[cfg(windows)]
+            mouse_captured: false,
             wheel: 0.0,
             pending_rows: 0.0,
         })
@@ -2244,6 +2281,8 @@ impl<'alloc> Input<'alloc> {
         if self.selection.is_selecting() {
             self.selection.autoscroll_tick(terminal, x, y, dims, mods)?;
         }
+        #[cfg(windows)]
+        capture_mouse(any_pressed, &mut self.mouse_captured);
         Ok(())
     }
 
