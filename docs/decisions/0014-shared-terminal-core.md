@@ -27,8 +27,12 @@ On 2026-11-27, main at `98edab0`, the two copies were:
 - **Diverged.**
   - Only tai answers device attributes (DA1/DA2/DA3, with Sixel listed
     only under `TAI_SIXEL=1`, ADR 0009) and the colour-scheme query
-    (CSI ? 996 n), and sends the mode 2048 in-band size report when a
-    program sets the mode.
+    (CSI ? 996 n).
+  - tai sends its own mode 2048 size report when a program sets the
+    mode. libghostty-vt already sends one itself at this pin (Ghostty
+    `src/terminal/stream_terminal.zig`, `reportMode2048`, at 108cacb1),
+    so programs get it twice in tai and once in tai-gui (found by the
+    macOS and Linux sessions while testing step 1).
   - Only tai-gui reads prompt marks (`on_semantic_prompt`, ADR 0013).
   - Only tai has Kitty images and Sixel.
   - So a program sees two slightly different terminals.
@@ -66,10 +70,10 @@ three platforms.
    1. **Setup and replies** (`term/setup.rs`):
       - creating a terminal with its options;
       - the replies: pty write, size, device attributes, XTVERSION,
-        colour scheme;
-      - the mode 2048 in-band size report.
+        colour scheme.
 
-      tai-gui gains the replies it lacked.
+      tai-gui gains the replies it lacked. tai drops its own mode 2048
+      report, leaving libghostty-vt's, so both send it once.
    2. **Images** (`term/images.rs`):
       - Kitty graphics setup and the PNG decoder;
       - the Sixel translator;

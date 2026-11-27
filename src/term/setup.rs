@@ -1,7 +1,9 @@
 //! Creating a terminal, and its answers to programs' queries (ADR 0014,
 //! step 1). tai and tai-gui answered differently before: only tai answered
-//! device attributes and the colour-scheme query, and sent the mode 2048
-//! size report when a program set the mode.
+//! device attributes and the colour-scheme query. The mode 2048 size
+//! report needs nothing here beyond the size callback: libghostty-vt sends
+//! it itself when a program sets the mode and on each resize (Ghostty
+//! src/terminal/stream_terminal.zig, reportMode2048, at 108cacb1).
 
 use libghostty_vt::{
     Terminal,
@@ -106,84 +108,35 @@ pub fn answer_queries<'alloc, 'cb>(
     Ok(())
 }
 
-/// Mode 2048, in-band size reports. libghostty-vt sends a report on each
-/// resize while the mode is on, but not when a program sets it; Ghostty's
-/// app sends one then (src/termio/stream_handler.zig, at a887df42), and
-/// Textual waits for it before it reads SGR-Pixels mouse reports as pixels.
-#[derive(Default)]
-pub struct InBandResize {
-    on: bool,
-}
-
-impl InBandResize {
-    /// After the program's output was parsed: the report to send, if the
-    /// program has just set the mode.
-    pub fn report(
-        &mut self,
-        terminal: &Terminal<'_, '_>,
-        grid: (u16, u16),
-        cell_pixels: (u32, u32),
-    ) -> Result<Option<String>> {
-        let on = terminal.mode(Mode::IN_BAND_RESIZE)?;
-        let report = (on && !self.on).then(|| size_report(grid, cell_pixels));
-        self.on = on;
-        Ok(report)
-    }
-}
-
-/// The mode 2048 size report, ESC [ 48 ; rows ; cols ; height ; width t,
-/// encoded like Ghostty's src/terminal/size_report.zig (at a887df42).
-fn size_report((cols, rows): (u16, u16), (cell_w, cell_h): (u32, u32)) -> String {
-    let (height, width) = (
-        u64::from(rows) * u64::from(cell_h),
-        u64::from(cols) * u64::from(cell_w),
-    );
-    format!("\x1b[48;{rows};{cols};{height};{width}t")
-}
-
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use super::{InBandResize, answer_queries, new_terminal, size_report};
+    use super::{answer_queries, new_terminal};
 
     #[test]
-    fn the_in_band_size_report_matches_libghosttys_on_resize() {
+    fn setting_mode_2048_sends_one_size_report() {
+        // libghostty-vt reports the size itself when a program sets mode
+        // 2048, given the size callback answer_queries installs (Ghostty
+        // src/terminal/stream_terminal.zig, reportMode2048, at 108cacb1).
+        // tai sent its own too, so programs got it twice (macos-tai,
+        // popos-tai).
         let mut terminal = new_terminal(80, 24, (10, 20)).unwrap();
         let sent = Rc::new(RefCell::new(Vec::new()));
         let s = sent.clone();
-        terminal
-            .on_pty_write(move |_t, data| s.borrow_mut().extend_from_slice(data))
-            .unwrap();
+        answer_queries(
+            &mut terminal,
+            move |data| s.borrow_mut().extend_from_slice(data),
+            || ((80, 24), (10, 20)),
+        )
+        .unwrap();
         terminal.vt_write(b"\x1b[?2048h");
-        // Setting the mode sends nothing; tai has to.
-        assert!(sent.borrow().is_empty());
-        // libghostty-vt's own report on resize is what tai's must match.
+        let set = String::from_utf8(std::mem::take(&mut *sent.borrow_mut())).unwrap();
+        assert_eq!(set, "\x1b[48;24;80;480;800t");
+        // And one on each resize while the mode is on.
         terminal.resize(100, 30, 9, 18).unwrap();
-        let expected = size_report((100, 30), (9, 18));
-        assert_eq!(expected, "\x1b[48;30;100;540;900t");
-        assert_eq!(*sent.borrow(), expected.as_bytes());
-    }
-
-    #[test]
-    fn a_size_report_goes_once_when_a_program_sets_the_mode() {
-        let mut terminal = new_terminal(80, 24, (10, 20)).unwrap();
-        let mut in_band = InBandResize::default();
-        assert_eq!(in_band.report(&terminal, (80, 24), (10, 20)).unwrap(), None);
-        terminal.vt_write(b"\x1b[?2048h");
-        let first = in_band.report(&terminal, (80, 24), (10, 20)).unwrap();
-        assert_eq!(first.as_deref(), Some("\x1b[48;24;80;480;800t"));
-        assert_eq!(in_band.report(&terminal, (80, 24), (10, 20)).unwrap(), None);
-        // Off and on again: another report.
-        terminal.vt_write(b"\x1b[?2048l");
-        assert_eq!(in_band.report(&terminal, (80, 24), (10, 20)).unwrap(), None);
-        terminal.vt_write(b"\x1b[?2048h");
-        assert!(
-            in_band
-                .report(&terminal, (80, 24), (10, 20))
-                .unwrap()
-                .is_some()
-        );
+        let resized = String::from_utf8(std::mem::take(&mut *sent.borrow_mut())).unwrap();
+        assert_eq!(resized, "\x1b[48;30;100;540;900t");
     }
 
     #[test]

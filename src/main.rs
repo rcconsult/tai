@@ -294,8 +294,6 @@ async fn main() -> Result<()> {
     // screen and makes the shell redraw its prompt, so a run of size steps
     // is applied once, after the last one.
     let mut resize_due: Option<Instant> = None;
-    // Mode 2048, in-band size reports (src/term/setup.rs).
-    let mut in_band = term::setup::InBandResize::default();
 
     // Spawn a child shell connected to a pseudo-terminal. On Windows this
     // restricts tai's DLL search to its own folder and System32 (ADR 0007),
@@ -468,13 +466,6 @@ async fn main() -> Result<()> {
                         tracing::error!("failed to read from pty: {e}");
                         child.mark_exited();
                     }
-                }
-
-                // A size report when a program sets mode 2048.
-                if let Some(report) =
-                    in_band.report(&terminal, grid_size.get(), cell_pixels.get())?
-                {
-                    pty.reply(report.as_bytes());
                 }
             }
             // Try to reap the child if it had already exited.

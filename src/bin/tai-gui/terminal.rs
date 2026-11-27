@@ -178,8 +178,6 @@ pub struct TerminalPane {
     response: Vec<u8>,
     /// Set by the pty's reader when it has woken egui, cleared by pump.
     wake_pending: Arc<AtomicBool>,
-    /// Mode 2048, in-band size reports (src/term/setup.rs).
-    in_band: crate::term::setup::InBandResize,
     /// Mouse selection, through libghostty-vt's gesture API as in the
     /// macroquad build (`SelectionState` in src/main.rs).
     gesture: Gesture<'static>,
@@ -320,7 +318,6 @@ impl TerminalPane {
             rows: Vec::new(),
             response: Vec::new(),
             wake_pending,
-            in_band: Default::default(),
             gesture: Gesture::new()?,
             press: {
                 let mut press = PressEvent::new()?;
@@ -474,15 +471,6 @@ impl TerminalPane {
         let now = Instant::now();
         if got {
             self.last_output = Some(now);
-            // A size report when a program sets mode 2048, as tai sends.
-            match self
-                .in_band
-                .report(&self.terminal, self.grid_size.get(), self.cell_pixels.get())
-            {
-                Ok(Some(report)) => self.pty.reply(report.as_bytes()),
-                Ok(None) => {}
-                Err(e) => tracing::warn!("mode 2048: {e}"),
-            }
         }
         if self.pending_command.is_some() {
             match self.last_output {
