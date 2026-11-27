@@ -2195,6 +2195,17 @@ impl<'alloc> Input<'alloc> {
                     }
                     _ => {}
                 }
+                // A button the program gets clears the terminal's selection,
+                // and the gesture forgets its click, as Ghostty's
+                // mouseButtonCallback does (src/Surface.zig at 108cacb1):
+                // the program handles the mouse now. Shift keeps the mouse
+                // the terminal's, and without tracking nothing is reported.
+                if terminal.is_mouse_tracking()? && !mods.contains(key::Mods::SHIFT) {
+                    if terminal.selection()?.is_some() {
+                        terminal.set_selection(None)?;
+                    }
+                    self.selection.gesture.reset(terminal);
+                }
                 self.mouse_event.set_action(action).set_button(Some(btn));
                 self.response.reserve(ENCODE_ROOM);
                 self.mouse_encoder

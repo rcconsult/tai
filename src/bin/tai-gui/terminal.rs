@@ -736,6 +736,17 @@ impl TerminalPane {
             } else {
                 continue;
             };
+            // A button the program gets clears the terminal's selection, and
+            // the gesture forgets its click, as Ghostty's mouseButtonCallback
+            // does (src/Surface.zig at 108cacb1): the program handles the
+            // mouse now. Shift keeps the mouse the terminal's.
+            if !mods.shift {
+                if self.terminal.selection()?.is_some() {
+                    self.terminal.set_selection(None)?;
+                    self.selection_changed = true;
+                }
+                self.gesture.reset(&self.terminal);
+            }
             let position = self.surface_position(at - rect.min);
             self.mouse_encoder
                 .set_any_button_pressed(self.reported.iter().any(|&r| r));
