@@ -83,17 +83,9 @@ impl Pty {
         let locale = crate::locale::child_env();
         // Other terminals' identity variables to drop (ADR 0005).
         let foreign = crate::identity::foreign_vars(std::env::vars_os());
-        // Determine the user's preferred shell. We try $SHELL first (the
-        // standard convention), then fall back to the passwd entry, and
-        // finally to /bin/sh if nothing else is available. Chosen before
-        // forking, so the shell integration's scripts can be written.
-        let shell = match std::env::var_os("SHELL") {
-            Some(shell) if !shell.is_empty() => PathBuf::from(shell),
-            _ => match unistd::User::from_uid(unistd::getuid()) {
-                Ok(Some(user)) => user.shell,
-                _ => PathBuf::from("/bin/sh"),
-            },
-        };
+        // Chosen before forking, so the shell integration's scripts can be
+        // written.
+        let shell = default_shell();
         // On macOS, start a login shell ("-zsh") like Terminal.app does,
         // so ~/.zprofile and path_helper set up PATH. The shell
         // integration may start it otherwise (src/shell_integration.rs).
@@ -469,6 +461,19 @@ impl Child {
         {
             *self = Child::Reaped(wp);
         }
+    }
+}
+
+/// The user's preferred shell: $SHELL (the standard convention), else the
+/// passwd entry, else /bin/sh. tai-gui's /edit asks too, to type a command
+/// the shell takes (src/bin/tai-gui/editor.rs).
+pub fn default_shell() -> PathBuf {
+    match std::env::var_os("SHELL") {
+        Some(shell) if !shell.is_empty() => PathBuf::from(shell),
+        _ => match unistd::User::from_uid(unistd::getuid()) {
+            Ok(Some(user)) => user.shell,
+            _ => PathBuf::from("/bin/sh"),
+        },
     }
 }
 

@@ -613,7 +613,10 @@ impl App {
                     busy.join(", ")
                 ));
                 ui.horizontal(|ui| {
-                    if ui.button("Quit").clicked() {
+                    // Enter answers with the action, as a dialog's default
+                    // button does; Escape cancels (Modal::should_close).
+                    if ui.button("Quit").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
                         answer = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
@@ -644,7 +647,8 @@ impl App {
                      and everything running in it.",
                 );
                 ui.horizontal(|ui| {
-                    if ui.button("Close").clicked() {
+                    if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
                         answer = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
