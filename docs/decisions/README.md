@@ -19,8 +19,9 @@ Status is summarised; the record itself is authoritative.
 | [0011](0011-native-gui-egui.md) | A Rust-native GUI on egui, with terminals as panes | ✅ Accepted 2026-11-01, after the prototype |
 | [0012](0012-cjk-font-fallback.md) | Ask the OS for fonts that tai lacks, and draw every glyph with skrifa; retire the immediate renderer | ✅ Accepted 2026-11-01 |
 | [0013](0013-terminals-by-alias.md) | Reach a terminal by its number or name, and type a command into it | ✅ Accepted 2026-11-23 |
+| [0014](0014-shared-terminal-core.md) | One terminal core for tai and tai-gui, under `src/term/`, built in five steps | ✅ Accepted 2026-11-27 |
 
-Numbering is sequential. The next record is `0014`.
+Numbering is sequential. The next record is `0015`.
 
 ## About these records
 
