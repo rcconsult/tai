@@ -1,12 +1,12 @@
 // Unfortunately, there will be some unsafe shenanigans here.
 #![allow(unsafe_code)]
 use std::{
+    ffi::{CString, OsStr, OsString, c_char},
     os::{
         fd::{AsRawFd, OwnedFd},
-        unix::process::CommandExt,
+        unix::{ffi::OsStrExt, fs::PermissionsExt},
     },
-    path::PathBuf,
-    process::Command,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
@@ -99,16 +99,21 @@ impl Pty {
         // integration may start it otherwise (src/shell_integration.rs).
         let launch = crate::shell_integration::launch(&shell, cfg!(target_os = "macos"));
 
+        // Everything the child needs is built here, before the fork: a
+        // forked child of a threaded process may only make
+        // async-signal-safe calls until exec, so it mustn't allocate (a
+        // malloc lock another thread held at the fork would hang it). As
+        // Ghostty's src/Command.zig does (at 108cacb1): argv and envp are
+        // prepared first, and the child only resets state and execs.
+        let exec = Exec::new(&shell, &launch, cwd, &foreign, &locale)?;
+
         // forkpty() combines openpty + fork + login_tty into one call.
         // In the child it sets up the slave side as stdin/stdout/stderr.
-        // SAFETY: forkpty is unsafe because a forked child of a threaded
-        // process may only make async-signal-safe calls until exec. The fd
-        // closing and signal resets below are; building the Command
-        // allocates, which is not (a malloc lock held by another thread at
-        // the fork would deadlock the child). Known and not yet fixed.
+        // SAFETY: the child arm below makes only async-signal-safe calls
+        // (close, signal, sigprocmask, chdir, execve, _exit) on memory
+        // built before the fork, and allocates nothing.
         match unsafe { nix::pty::forkpty(&dims.to_winsize(), None)? } {
             // Child process -- replace ourselves with the shell.
-            // TERM tells programs what escape sequences we understand.
             ForkptyResult::Child => {
                 // Close every descriptor the shell would otherwise inherit
                 // from tai beyond stdin, stdout and stderr: other terminals'
@@ -153,40 +158,7 @@ impl Pty {
                     Some(&signal::SigSet::empty()),
                     None,
                 );
-
-                // Extract just the program name for argv[0] (e.g. "/bin/zsh" -> "zsh").
-                let name = shell.file_name().unwrap_or(shell.as_os_str());
-
-                // "-zsh" for a login shell.
-                let mut arg0 = std::ffi::OsString::new();
-                if launch.login {
-                    arg0.push("-");
-                }
-                arg0.push(name);
-
-                // Replace the child process with the user's shell via `exec`.
-                let mut command = Command::new(&shell);
-                if let Some(dir) = cwd {
-                    command.current_dir(dir);
-                }
-                for name in &foreign {
-                    command.env_remove(name);
-                }
-                _ = command
-                    .env("TERM", "xterm-256color")
-                    .env("COLORTERM", "truecolor")
-                    // Identify tai, not the terminal that started it.
-                    .envs(crate::identity::vars())
-                    // A UTF-8 character type; see src/locale.rs.
-                    .envs(locale.iter().map(|(k, v)| (k, v)))
-                    // The shell integration's, last.
-                    .envs(launch.env.iter().map(|(k, v)| (k, v)))
-                    .args(&launch.args)
-                    .arg0(arg0)
-                    .exec();
-
-                // `exec` only returns on error.
-                std::process::exit(127);
+                exec.run()
             }
 
             // Parent -- make the master fd non-blocking so read() returns EAGAIN
@@ -419,6 +391,54 @@ mod tests {
         assert_eq!(got.len(), sent.len());
         assert!(got == sent);
     }
+
+    #[test]
+    fn a_bare_shell_name_is_found_on_path_before_the_fork() {
+        use std::path::Path;
+        let found = super::resolve(Path::new("sh"), Some("/nonexistent:/bin".as_ref()));
+        assert_eq!(found, Path::new("/bin/sh"));
+        // A path with a slash, or a name on no PATH entry, is left as is.
+        assert_eq!(
+            super::resolve(Path::new("/x/zsh"), None),
+            Path::new("/x/zsh")
+        );
+        assert_eq!(
+            super::resolve(Path::new("nosuchshell"), Some("/bin".as_ref())),
+            Path::new("nosuchshell")
+        );
+    }
+
+    #[test]
+    fn the_exec_is_built_whole_before_the_fork() {
+        use std::{ffi::OsString, path::Path};
+        let launch = crate::shell_integration::Launch {
+            env: vec![("TERM".into(), "from-integration".into())],
+            args: vec!["-i".into()],
+            login: true,
+        };
+        let exec = super::Exec::new(
+            Path::new("/bin/sh"),
+            &launch,
+            Some(Path::new("/")),
+            &[OsString::from("PATH")],
+            &[("LC_CTYPE", "C.UTF-8".to_string())],
+        )
+        .unwrap();
+        let args: Vec<&str> = exec._args.iter().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(args, ["-sh", "-i"]);
+        let env: Vec<&str> = exec._env.iter().map(|s| s.to_str().unwrap()).collect();
+        // Later settings replace earlier ones, and dropped names go.
+        assert_eq!(env.iter().filter(|e| e.starts_with("TERM=")).count(), 1);
+        assert!(env.contains(&"TERM=from-integration"));
+        assert!(env.contains(&"COLORTERM=truecolor"));
+        assert!(env.contains(&"LC_CTYPE=C.UTF-8"));
+        assert!(!env.iter().any(|e| e.starts_with("PATH=")));
+        // Both pointer arrays end in null, and point at the strings.
+        assert_eq!(exec.argv.len(), 3);
+        assert!(exec.argv[2].is_null() && exec.envp[env.len()].is_null());
+        assert_eq!(exec.argv[0], exec._args[0].as_ptr());
+        assert_eq!(exec.program.to_str().unwrap(), "/bin/sh");
+    }
 }
 
 /// The child process within a pseudo-terminal.
@@ -450,6 +470,140 @@ impl Child {
             *self = Child::Reaped(wp);
         }
     }
+}
+
+/// The shell's exec, built before the fork so the child allocates nothing.
+struct Exec {
+    program: CString,
+    cwd: Option<CString>,
+    // The pointer arrays point into these; a Vec's heap buffer doesn't
+    // move when the Vec does.
+    _args: Vec<CString>,
+    _env: Vec<CString>,
+    argv: Vec<*const c_char>,
+    envp: Vec<*const c_char>,
+}
+
+impl Exec {
+    fn new(
+        shell: &Path,
+        launch: &crate::shell_integration::Launch,
+        cwd: Option<&Path>,
+        foreign: &[OsString],
+        locale: &[(&'static str, String)],
+    ) -> std::io::Result<Self> {
+        // tai's environment, less other terminals' identity, then tai's
+        // variables, later ones replacing earlier ones as Command::env did.
+        let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
+            .filter(|(name, _)| !foreign.contains(name))
+            .collect();
+        let mut set = |name: &OsStr, value: &OsStr| match env.iter_mut().find(|(n, _)| n == name) {
+            Some(slot) => slot.1 = value.to_owned(),
+            None => env.push((name.to_owned(), value.to_owned())),
+        };
+        // TERM tells programs what escape sequences we understand.
+        set("TERM".as_ref(), "xterm-256color".as_ref());
+        set("COLORTERM".as_ref(), "truecolor".as_ref());
+        // Identify tai, not the terminal that started it.
+        for (name, value) in crate::identity::vars() {
+            set(name.as_ref(), value.as_ref());
+        }
+        // A UTF-8 character type; see src/locale.rs.
+        for (name, value) in locale {
+            set(name.as_ref(), value.as_ref());
+        }
+        // The shell integration's, last.
+        for (name, value) in &launch.env {
+            set(name.as_os_str(), value.as_os_str());
+        }
+
+        // Command::new searched PATH for a bare name; execve doesn't.
+        let path = env
+            .iter()
+            .find(|(n, _)| n == "PATH")
+            .map(|(_, v)| v.clone());
+        let program = resolve(shell, path.as_deref());
+
+        // argv[0] is just the program name ("/bin/zsh" -> "zsh"), "-zsh"
+        // for a login shell.
+        let mut arg0 = OsString::new();
+        if launch.login {
+            arg0.push("-");
+        }
+        arg0.push(shell.file_name().unwrap_or(shell.as_os_str()));
+
+        let c = |s: &OsStr| {
+            CString::new(s.as_bytes()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "nul byte in the shell's command or environment",
+                )
+            })
+        };
+        let args = std::iter::once(arg0.as_os_str())
+            .chain(launch.args.iter().map(OsString::as_os_str))
+            .map(c)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let env = env
+            .iter()
+            .map(|(name, value)| {
+                let mut pair = name.clone();
+                pair.push("=");
+                pair.push(value);
+                c(&pair)
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let nul_terminated = |v: &[CString]| {
+            v.iter()
+                .map(|s| s.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect()
+        };
+        Ok(Self {
+            program: c(program.as_os_str())?,
+            cwd: cwd.map(|dir| c(dir.as_os_str())).transpose()?,
+            argv: nul_terminated(&args),
+            envp: nul_terminated(&env),
+            _args: args,
+            _env: env,
+        })
+    }
+
+    /// In the forked child: change directory and exec, or exit 127 as
+    /// Command::exec's caller did.
+    fn run(&self) -> ! {
+        // SAFETY: chdir, execve and _exit are async-signal-safe. Every
+        // pointer is into a NUL-terminated string or a null-terminated
+        // array that `self` owns, built before the fork.
+        unsafe {
+            if let Some(dir) = &self.cwd
+                && nix::libc::chdir(dir.as_ptr()) != 0
+            {
+                nix::libc::_exit(127);
+            }
+            nix::libc::execve(
+                self.program.as_ptr(),
+                self.argv.as_ptr(),
+                self.envp.as_ptr(),
+            );
+            nix::libc::_exit(127)
+        }
+    }
+}
+
+/// `shell` as execve wants it: as given when it has a slash, else the
+/// first executable file of that name on `path`, as Command::new did.
+fn resolve(shell: &Path, path: Option<&OsStr>) -> PathBuf {
+    if shell.as_os_str().as_bytes().contains(&b'/') {
+        return shell.to_path_buf();
+    }
+    std::env::split_paths(path.unwrap_or_default())
+        .map(|dir| dir.join(shell))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .unwrap_or_else(|| shell.to_path_buf())
 }
 
 /// Close descriptors 3 and up, in a forked child before exec. Only
