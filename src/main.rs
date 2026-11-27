@@ -49,7 +49,9 @@ use libghostty_vt::{
     render::{CellIteration, CellIterator, Colors, Dirty, RenderState, RowIterator},
     report::SizeReportSize,
     screen::CellWide,
-    selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
+    selection::gesture::{
+        Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
+    },
     style::StyleColor,
     terminal::ScrollViewport,
 };
@@ -147,6 +149,11 @@ fn present_material() -> Result<Material> {
 
 /// Small padding from window edges
 const PADDING: f32 = 6.0;
+
+/// How often a selection drag past the window's top or bottom scrolls one
+/// row, as Ghostty's `selection_scroll_ms` (src/termio/Thread.zig at
+/// 108cacb1).
+const AUTOSCROLL_EVERY: Duration = Duration::from_millis(15);
 
 /// Horizontal gap between cells. This is usually not necessary for
 /// TrueType fonts, but for bitmap fonts like macroquad's builtin font
@@ -2098,20 +2105,19 @@ impl<'alloc> Input<'alloc> {
         if delta.x.abs() > 1e-6 || delta.y.abs() > 1e-6 {
             if self.selection.is_selecting() {
                 self.selection.on_drag(terminal, x, y, dims, mods)?;
-                return Ok(());
+            } else {
+                self.mouse_event
+                    .set_action(mouse::Action::Motion)
+                    .set_button(
+                        Self::ALL_MOUSE_BUTTONS
+                            .into_iter()
+                            .find(|(mb, _)| is_mouse_button_down(*mb))
+                            .map(|(_, btn)| btn),
+                    );
+                self.response.reserve(ENCODE_ROOM);
+                self.mouse_encoder
+                    .encode_to_vec(&self.mouse_event, &mut self.response)?;
             }
-
-            self.mouse_event
-                .set_action(mouse::Action::Motion)
-                .set_button(
-                    Self::ALL_MOUSE_BUTTONS
-                        .into_iter()
-                        .find(|(mb, _)| is_mouse_button_down(*mb))
-                        .map(|(_, btn)| btn),
-                );
-            self.response.reserve(ENCODE_ROOM);
-            self.mouse_encoder
-                .encode_to_vec(&self.mouse_event, &mut self.response)?;
         }
 
         // Scroll wheel handling.  When a mouse tracking mode is active the
@@ -2145,7 +2151,15 @@ impl<'alloc> Input<'alloc> {
                 // up (into history), positive to scroll down.
                 let scroll_delta: isize = (wheel_y * -2.5) as isize;
                 terminal.scroll_viewport(ScrollViewport::Delta(scroll_delta));
+                // A drag in progress follows the scroll: the cell under the
+                // resting pointer is a different one now.
+                if self.selection.is_selecting() {
+                    self.selection.on_drag(terminal, x, y, dims, mods)?;
+                }
             }
+        }
+        if self.selection.is_selecting() {
+            self.selection.autoscroll_tick(terminal, x, y, dims, mods)?;
         }
         Ok(())
     }
@@ -2346,6 +2360,10 @@ struct SelectionState<'alloc> {
     press_event: PressEvent<'alloc>,
     release_event: ReleaseEvent<'alloc>,
     drag_event: DragEvent<'alloc>,
+    autoscroll_event: AutoscrollTickEvent<'alloc>,
+    /// When the last autoscroll tick ran, while a drag past the window's
+    /// top or bottom scrolls it.
+    last_autoscroll: Option<Instant>,
     start_time: Instant,
     /// The cursor last set, so it is only set again when it changes.
     cursor: Cell<Option<CursorIcon>>,
@@ -2363,6 +2381,8 @@ impl SelectionState<'_> {
             press_event,
             release_event: ReleaseEvent::new()?,
             drag_event: DragEvent::new()?,
+            autoscroll_event: AutoscrollTickEvent::new()?,
+            last_autoscroll: None,
             start_time: Instant::now(),
             cursor: Cell::new(None),
             held: false,
@@ -2410,7 +2430,63 @@ impl SelectionState<'_> {
         self.release_event
             .apply(&mut self.gesture, terminal, grid_ref)?;
         self.held = false;
+        self.last_autoscroll = None;
         Ok(())
+    }
+
+    /// While a selection drag is past the window's top or bottom, scroll one
+    /// row and extend the selection every AUTOSCROLL_EVERY, as Ghostty's
+    /// selectionScrollTick does (src/Surface.zig at 108cacb1); the gesture
+    /// has no timer of its own (include/ghostty/vt/selection.h). The frame
+    /// loop redraws every frame while the button is down.
+    fn autoscroll_tick(
+        &mut self,
+        terminal: &Terminal<'_, '_>,
+        x: f32,
+        y: f32,
+        dims: Dimensions,
+        mods: key::Mods,
+    ) -> Result<()> {
+        if matches!(self.gesture.autoscroll(terminal)?, Autoscroll::None) {
+            self.last_autoscroll = None;
+            return Ok(());
+        }
+        let now = Instant::now();
+        if self
+            .last_autoscroll
+            .is_some_and(|last| now.duration_since(last) < AUTOSCROLL_EVERY)
+        {
+            return Ok(());
+        }
+        self.last_autoscroll = Some(now);
+        let Point::Viewport(at) = Input::mouse_viewport_point(terminal, dims)? else {
+            return Ok(());
+        };
+        let selection = self
+            .autoscroll_event
+            .set_rectangle(Input::selection_rectangle_mods(mods))?
+            .set_position(x.into(), y.into())?
+            .apply(
+                &mut self.gesture,
+                terminal,
+                at,
+                Self::geometry(terminal, dims)?,
+            )?;
+        // None: nothing to scroll, or the pressed cell left the screen and
+        // the gesture reset; the selection stays as it is.
+        if let Some(selection) = selection {
+            terminal.set_selection(Some(&selection))?;
+        }
+        Ok(())
+    }
+
+    fn geometry(terminal: &Terminal<'_, '_>, dims: Dimensions) -> Result<Geometry> {
+        Ok(Geometry {
+            columns: terminal.cols()?.into(),
+            cell_width: dims.cell_width as u32,
+            padding_left: PADDING as u32,
+            screen_height: dims.window_height as u32,
+        })
     }
 
     /// Update the selection state during and after a mouse drag.
@@ -2424,12 +2500,7 @@ impl SelectionState<'_> {
     ) -> Result<()> {
         let point = Input::mouse_viewport_point(terminal, dims)?;
         let grid_ref = terminal.grid_ref(point)?;
-        let geometry = Geometry {
-            columns: terminal.cols()?.into(),
-            cell_width: dims.cell_width as u32,
-            padding_left: PADDING as u32,
-            screen_height: dims.window_height as u32,
-        };
+        let geometry = Self::geometry(terminal, dims)?;
 
         let selection = self
             .drag_event
