@@ -59,6 +59,10 @@ const PARSE_BUDGET: Duration = Duration::from_millis(14);
 /// keystroke took two frames (popos-tai's typing-lag probe).
 const ECHO_WAIT: Duration = Duration::from_millis(4);
 
+/// Presses closer together than this are a double or triple click; a
+/// Shift-click further from the last press extends the selection.
+const CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
 /// How often a selection drag past the pane's top or bottom scrolls one
 /// row, as Ghostty's `selection_scroll_ms` (src/termio/Thread.zig at
 /// 108cacb1).
@@ -182,6 +186,8 @@ pub struct TerminalPane {
     release: ReleaseEvent<'static>,
     drag: DragEvent<'static>,
     autoscroll: AutoscrollTickEvent<'static>,
+    /// When the left button last pressed for a selection, for Shift-click.
+    last_press: Option<Instant>,
     /// When the last autoscroll tick ran, while a drag past the pane's
     /// top or bottom scrolls it.
     last_autoscroll: Option<Instant>,
@@ -334,12 +340,13 @@ impl TerminalPane {
             gesture: Gesture::new()?,
             press: {
                 let mut press = PressEvent::new()?;
-                press.set_repeat_interval(Duration::from_millis(500))?;
+                press.set_repeat_interval(CLICK_INTERVAL)?;
                 press
             },
             release: ReleaseEvent::new()?,
             drag: DragEvent::new()?,
             autoscroll: AutoscrollTickEvent::new()?,
+            last_press: None,
             last_autoscroll: None,
             epoch: Instant::now(),
             selecting: false,
@@ -911,16 +918,31 @@ impl TerminalPane {
             if self.terminal.is_mouse_tracking()? && !held.shift {
                 return Ok(());
             }
-            let grid_ref = self.terminal.grid_ref(self.viewport_point(local)?)?;
-            let selection = self
-                .press
-                .set_repeat_distance(self.dims.cell_width.into())?
-                .set_time(self.epoch.elapsed())?
-                .set_position(local.x.into(), local.y.into())?
-                .apply(&mut self.gesture, &self.terminal, grid_ref)?;
-            self.terminal.set_selection(selection.as_ref())?;
+            // Shift-click extends the selection there instead of starting
+            // a new one, as Ghostty's mouseButtonCallback does
+            // (src/Surface.zig at 108cacb1): with a selection, a click the
+            // gesture remembers, and that click longer ago than a double
+            // click, the press continues the old click's drag.
+            let since_press = self.last_press.map(|at| at.elapsed());
+            self.last_press = Some(Instant::now());
+            if held.shift
+                && self.terminal.selection()?.is_some()
+                && self.gesture.click_count(&self.terminal)? > 0
+                && since_press.is_some_and(|since| since > CLICK_INTERVAL)
+            {
+                self.drag_to(local, held)?;
+            } else {
+                let grid_ref = self.terminal.grid_ref(self.viewport_point(local)?)?;
+                let selection = self
+                    .press
+                    .set_repeat_distance(self.dims.cell_width.into())?
+                    .set_time(self.epoch.elapsed())?
+                    .set_position(local.x.into(), local.y.into())?
+                    .apply(&mut self.gesture, &self.terminal, grid_ref)?;
+                self.terminal.set_selection(selection.as_ref())?;
+                self.selection_changed = true;
+            }
             self.selecting = true;
-            self.selection_changed = true;
         } else if self.selecting && down && moved {
             self.drag_to(local, held)?;
         }
