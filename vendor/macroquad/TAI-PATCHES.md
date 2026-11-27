@@ -32,7 +32,14 @@ tai's root `Cargo.toml` uses this copy through `[patch.crates-io]`.
    keeps every glyph's outline, so parsing the three bundled fonts twice
    cost about 100 MB (a fresh tai went from 283 MB to 180 MB footprint on
    macOS). Upstream only loads fonts from bytes.
+5. `Cargo.toml`: `image` 0.25 instead of 0.24, so tai builds one `image`
+   crate: the version eframe uses and tai's shared terminal core decodes
+   Kitty images with (`src/term/images.rs`, ADR 0014 step 2). macroquad's
+   uses of it (`load_from_memory_with_format`, `load_from_memory`,
+   `to_rgba8`, `save_buffer`, `ImageError`, `ImageFormat`) are the same in
+   0.25, so no source changed. Upstream macroquad 0.4.16 still depends on
+   0.24.
 
 Drop this vendored copy once a macroquad release includes the clipboard fix,
-a way to reset a font's glyph cache without parsing it again, and a way to
-build a font from parsed font data.
+a way to reset a font's glyph cache without parsing it again, a way to
+build a font from parsed font data, and `image` 0.25.

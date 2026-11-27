@@ -35,6 +35,8 @@ mod identity;
 #[cfg(unix)]
 #[path = "../../locale.rs"]
 mod locale;
+#[path = "../../placeholders.rs"]
+mod placeholders;
 #[cfg(windows)]
 #[path = "../../pty_windows.rs"]
 #[allow(dead_code)]
@@ -53,16 +55,18 @@ mod shell_integration;
 #[path = "../../shortcuts.rs"]
 #[allow(dead_code)]
 mod shortcuts;
+#[path = "../../sixel.rs"]
+mod sixel;
 #[path = "../../term/mod.rs"]
 mod term;
 
 mod aliases;
+mod answer_images;
 mod chat;
 mod editor;
 mod engine;
 mod gpu;
 mod grammar;
-mod images;
 #[cfg(target_os = "macos")]
 mod macos_quit;
 mod ppxai;
@@ -187,7 +191,7 @@ impl TabViewer for Panes<'_> {
             Tab::Chat => self.chat.ui(ui, self.engine),
             Tab::Preview => self.runs.ui(ui),
             Tab::Image(i) => match self.images.get(*i) {
-                Some(path) => images::show_file(ui, path),
+                Some(path) => answer_images::show_file(ui, path),
                 None => {
                     ui.label("No image.");
                 }
@@ -978,11 +982,11 @@ impl eframe::App for App {
         // scheme: file:, or a Windows protocol handler. Only web links open
         // (in the browser); an answer's "open in Preview" link opens its
         // image here. The hover still shows the full target.
-        let mut open = images::take_open();
+        let mut open = answer_images::take_open();
         ui.ctx().output_mut(|o| {
             o.commands.retain(|command| match command {
                 egui::OutputCommand::OpenUrl(link) => {
-                    if let Some(path) = link.url.strip_prefix(images::OPEN_SCHEME) {
+                    if let Some(path) = link.url.strip_prefix(answer_images::OPEN_SCHEME) {
                         open.push(path.into());
                         false
                     } else if chat::is_web_link(&link.url) {
@@ -1018,11 +1022,17 @@ fn main() -> eframe::Result {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 // egui_commonmark asks egui_extras for image loaders, which
-                // tai-gui builds without: its own are in images.rs.
+                // tai-gui builds without: its own are in answer_images.rs.
                 "info,egui_extras::loaders=error".into()
             }),
         )
         .init();
+
+    // The PNG decoder Kitty images need (src/term/images.rs). It's
+    // process-global, so it goes before any terminal is created.
+    // SAFETY: no terminal exists yet, and only this thread uses
+    // libghostty-vt (its types are !Send; the pty threads never touch it).
+    unsafe { term::images::install_png_decoder() };
 
     let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -1102,7 +1112,7 @@ fn main() -> eframe::Result {
                     priority: egui::epaint::text::FontPriority::Highest,
                 }],
             ));
-            images::install(&cc.egui_ctx);
+            answer_images::install(&cc.egui_ctx);
             // tai-gui takes its own quit chord (QUIT).
             cc.egui_ctx.options_mut(|o| o.quit_shortcuts.clear());
             let terminal = fonts::Coverage::new()

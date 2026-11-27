@@ -92,7 +92,8 @@ would pick Sixel over the Kitty placeholders that work today
 ([ADR 0009](docs/decisions/0009-sixel-not-advertised.md)). Set
 `TAI_SIXEL=1` to advertise it.
 
-Images draw in `tai` only, not yet in `tai-gui`'s terminal pane.
+Images draw the same way in `tai` and in `tai-gui`'s terminal panes,
+through the terminal core both share (`src/term/images.rs`, ADR 0014).
 
 iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
 (OSC 1337), which libghostty-vt doesn't implement.

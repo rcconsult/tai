@@ -22,6 +22,7 @@ use libghostty_vt::{
     color::Rgb,
     effect::SemanticPromptKind,
     key::{self, Key},
+    kitty::graphics::PlacementIterator,
     mode::Mode,
     mouse,
     point::{Coordinate, Point},
@@ -37,15 +38,17 @@ use macroquad::color::Color;
 use crate::{
     cells::{GlyphAtlas, Instance},
     fonts::{Coverage, Face, SymbolSpan},
-    gpu::{AtlasUpload, CellFrame},
+    gpu::{AtlasUpload, CellFrame, ImageStage, ImageUpload, ImagesHeld},
     pty::{Child, Pty, PtyError},
     selection, shortcuts,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Space between the pane's edge and the grid, as in the macroquad build.
-const PADDING: f32 = 6.0;
+// Space between the pane's edge and the grid: the terminal core's, shared
+// with tai (src/term/mod.rs).
+use crate::term::PADDING;
+
 /// Space added to the glyph height for each row, as in the macroquad build.
 const ROW_GAP: f32 = 12.0;
 /// How long one frame may spend feeding pty output to the terminal; it
@@ -168,6 +171,16 @@ pub struct TerminalPane {
     gpu: crate::gpu::PaneId,
     /// The last frame's instances, reused while nothing changed.
     instances: Arc<Vec<Instance>>,
+    /// Where the cell backgrounds and the glyphs start in `instances`, so
+    /// images can draw between them (gpu.rs, `ImageStage`).
+    bg_start: u32,
+    text_start: u32,
+    /// Kitty images (src/term/images.rs): placements, and each drawn
+    /// image's pixels, copied once per generation for the GPU side.
+    placement_it: PlacementIterator<'static>,
+    images_held: ImagesHeld,
+    /// Translates Sixel in the pty's output into Kitty images (ADR 0006).
+    sixel: crate::sixel::Translator,
     built_for: Option<(Dimensions, Option<(u16, u16)>)>,
     /// Each viewport row's instances as last built, so a frame rebuilds
     /// only the rows that changed, as Ghostty's `rebuildRow` does
@@ -283,6 +296,8 @@ impl TerminalPane {
                 move || (gs.get(), cp.get())
             },
         )?;
+        // Kitty images, as tai accepts them (src/term/images.rs).
+        crate::term::images::enable(&mut terminal)?;
         terminal.on_semantic_prompt({
             let prompt = Rc::clone(&prompt);
             // A panic here aborts, so a kind these bindings don't know
@@ -314,6 +329,11 @@ impl TerminalPane {
             atlas: GlyphAtlas::new(crate::cells::ATLAS_MAX_HEIGHT),
             gpu: crate::gpu::PaneId::new(),
             instances: Arc::new(Vec::new()),
+            bg_start: 0,
+            text_start: 0,
+            placement_it: PlacementIterator::new()?,
+            images_held: Default::default(),
+            sixel: crate::sixel::Translator::new(),
             built_for: None,
             rows: Vec::new(),
             response: Vec::new(),
@@ -456,9 +476,12 @@ impl TerminalPane {
         }
         let mut got = false;
         let terminal = &mut self.terminal;
+        let sixel = &mut self.sixel;
+        // Sixel images become Kitty images on the way in (ADR 0006).
+        let cell_height = self.cell_pixels.get().1;
         let mut sink = |bytes: &[u8]| {
             got = true;
-            terminal.vt_write(bytes);
+            sixel.feed(bytes, cell_height, &mut |out| terminal.vt_write(out));
         };
         match self.pty.read(&mut sink, Instant::now() + PARSE_BUDGET) {
             Ok(()) => {}
@@ -633,6 +656,10 @@ impl TerminalPane {
                     .to_vec(),
             }
         });
+        let (images, image_uploads) = self.image_frame().unwrap_or_else(|e| {
+            tracing::warn!("images: {e}");
+            Default::default()
+        });
         ui.painter()
             .add(eframe::egui_wgpu::Callback::new_paint_callback(
                 rect,
@@ -641,6 +668,11 @@ impl TerminalPane {
                     view: rect.size(),
                     instances: Arc::clone(&self.instances),
                     atlas,
+                    bg_start: self.bg_start,
+                    text_start: self.text_start,
+                    images,
+                    image_uploads,
+                    images_held: Arc::clone(&self.images_held),
                 },
             ));
         if let Some(badge) = &self.badge {
@@ -1086,6 +1118,10 @@ impl TerminalPane {
                     Ok(RowSemanticPrompt::None) | Err(_)
                 );
                 let mut extend_cells = Vec::new();
+                // A row with Kitty Unicode placeholders: each cell's
+                // placeholder, or None (src/term/images.rs).
+                let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
+                let mut placeholder_cells = Vec::new();
                 let mut cell_it = self.cell_it.update(row)?;
                 let mut x = PADDING;
                 let mut col: u16 = 0;
@@ -1140,7 +1176,17 @@ impl TerminalPane {
                     } else if has_bg {
                         cached.bg.push(Instance::solid(cell_rect, rgba(bg)));
                     }
-                    if graphemes > 0 {
+                    // A placeholder cell shows part of an image, drawn with
+                    // the images; its own character has no glyph.
+                    let placeholder = if placeholder_row {
+                        let cell_placeholder = crate::term::images::placeholder_cell(cell)?;
+                        let is = cell_placeholder.is_some();
+                        placeholder_cells.push(cell_placeholder);
+                        is
+                    } else {
+                        false
+                    };
+                    if graphemes > 0 && !placeholder {
                         // One face for the whole cluster, trimmed to what
                         // tai draws (see walk_row in src/main.rs).
                         let face = self.coverage.cluster_face(&mut text);
@@ -1185,6 +1231,11 @@ impl TerminalPane {
                     );
                 }
                 cached.extend = extends(prompt, &extend_cells, colors.background);
+                cached.virtual_runs = if placeholder_row {
+                    crate::placeholders::row_placements(placeholder_cells)
+                } else {
+                    Vec::new()
+                };
                 row.set_dirty(false)?;
             }
             y += dims.cell_height;
@@ -1210,14 +1261,75 @@ impl TerminalPane {
                 .into_iter()
                 .map(|(rect, color)| Instance::solid(rect, color)),
         );
+        self.bg_start = out.len() as u32;
         for row in &self.rows {
             out.extend_from_slice(&row.bg);
         }
+        self.text_start = out.len() as u32;
         for row in &self.rows {
             out.extend_from_slice(&row.text);
         }
         self.instances = Arc::new(out);
         Ok(true)
+    }
+
+    /// This frame's Kitty images in drawing order (src/term/images.rs), and
+    /// the pixels of those the GPU side holds no texture for.
+    #[allow(clippy::type_complexity)]
+    fn image_frame(&mut self) -> Result<(Vec<(ImageStage, u32, u64, Instance)>, Vec<ImageUpload>)> {
+        let Some(graphics) = self.terminal.kitty_graphics()? else {
+            return Ok(Default::default());
+        };
+        let geometry = crate::term::images::Geometry {
+            cell_width: self.dims.cell_width,
+            cell_height: self.dims.cell_height,
+            dpi_scale: self.dims.dpi_scale,
+        };
+        let runs: Vec<(u16, crate::placeholders::Placement)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
+            .collect();
+        let staged = crate::term::images::frame_draws(
+            &self.terminal,
+            &mut self.placement_it,
+            &graphics,
+            &runs,
+            geometry,
+        )?;
+        let held = self
+            .images_held
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default();
+        let mut images = Vec::with_capacity(staged.len());
+        let mut uploads: Vec<ImageUpload> = Vec::new();
+        for (stage, draw) in staged {
+            let Some(pixels) = crate::term::images::pixels(&graphics, draw.image_id)? else {
+                continue;
+            };
+            if held.get(&draw.image_id) != Some(&pixels.generation)
+                && !uploads.iter().any(|u| u.id == draw.image_id)
+            {
+                uploads.push(ImageUpload {
+                    id: draw.image_id,
+                    generation: pixels.generation,
+                    size: (pixels.width, pixels.height),
+                    rgba: pixels.data.to_vec(),
+                });
+            }
+            images.push((
+                stage,
+                draw.image_id,
+                pixels.generation,
+                Instance::textured(
+                    [draw.dest.x, draw.dest.y, draw.dest.w, draw.dest.h],
+                    [draw.source.x, draw.source.y, draw.source.w, draw.source.h],
+                ),
+            ));
+        }
+        Ok((images, uploads))
     }
 
     fn handle_event(&mut self, event: &egui::Event, held: egui::Modifiers) -> Result<()> {
@@ -1352,6 +1464,8 @@ struct RowInstances {
     edge: Vec<[u8; 4]>,
     /// Whether the padding above or below may take this row's colours.
     extend: bool,
+    /// The row's Kitty Unicode placeholder runs (src/placeholders.rs).
+    virtual_runs: Vec<crate::placeholders::Placement>,
 }
 
 /// The padding around the grid in the colours of the nearest cells, as

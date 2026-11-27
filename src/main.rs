@@ -33,12 +33,10 @@ use macroquad::{
 };
 
 use libghostty_vt::{
-    Terminal,
-    alloc::Bytes,
-    build_info,
+    Terminal, build_info,
     color::Rgb,
     key::{self, Key},
-    kitty::graphics::{self, DecodePng, DecodedImage, Graphics, Layer, PlacementIterator},
+    kitty::graphics::{Graphics, PlacementIterator},
     mode::Mode,
     mouse,
     point::{Coordinate, Point},
@@ -47,7 +45,6 @@ use libghostty_vt::{
     selection::gesture::{
         Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
     },
-    style::StyleColor,
     terminal::ScrollViewport,
 };
 
@@ -143,8 +140,9 @@ fn present_material() -> Result<Material> {
 // so feel free to tweak and tune these settings to your liking :)
 // ---------------------------------------------------------------------------
 
-/// Small padding from window edges
-const PADDING: f32 = 6.0;
+// The padding from the window's edges is the terminal core's, shared with
+// tai-gui (src/term/mod.rs).
+use crate::term::PADDING;
 
 /// Rows one notch of a mouse wheel scrolls, Ghostty's default discrete
 /// mouse-scroll-multiplier.
@@ -301,13 +299,14 @@ async fn main() -> Result<()> {
     // macroquad::main.
     let (pty, mut child) = Pty::new(dims, None)?;
 
-    // Install the PNG decoder so the terminal can handle PNG images in the
-    // Kitty Graphics Protocol. This is a process-global setting and must be
-    // done before any terminal is created.
+    // Install the PNG decoder Kitty images need (src/term/images.rs). It's
+    // process-global, so it goes before any terminal is created.
     // SAFETY: the pty's reader thread never calls libghostty (its types are
     // !Send), and no terminal exists yet.
     #[allow(unsafe_code)]
-    unsafe { graphics::set_png_decoder(Some(Box::new(PngDecoder))) }?;
+    unsafe {
+        term::images::install_png_decoder()
+    };
 
     // Create a ghostty virtual terminal with the computed grid, with the
     // options tai and tai-gui share (src/term/setup.rs). It holds all the
@@ -315,17 +314,8 @@ async fn main() -> Result<()> {
     // about the pty or the window.
     let mut terminal = term::setup::new_terminal(cols, rows, dims.cell_pixels())?;
 
-    terminal
-        // Enable Kitty graphics by setting a storage limit.  Without this the
-        // terminal rejects all image data.  64 MiB is a generous default.
-        .set_kitty_image_storage_limit(64 * 1024 * 1024)?
-        // Allow images to be transmitted via file, temp file, and shared
-        // memory mediums in addition to the default inline (direct) medium.
-        // Temp files must be in the OS temp directory, which is what
-        // Ghostty's own app allows (src/os/file.zig, tmpDir).
-        .set_kitty_image_from_file_allowed(true)?
-        .set_kitty_image_temp_file_dir(Some(&std::env::temp_dir()))?
-        .set_kitty_image_from_shared_mem_allowed(true)?;
+    // Accept Kitty images, as tai-gui does (src/term/images.rs).
+    term::images::enable(&mut terminal)?;
 
     // Answer programs' queries: device attributes, sizes, XTVERSION and the
     // rest, as tai-gui does (src/term/setup.rs).
@@ -609,6 +599,8 @@ struct Renderer<'alloc> {
     /// The cell-buffer renderer of ADR 0008, tai's only renderer since
     /// ADR 0012.
     cells: CellGrid,
+    /// Image textures, kept between frames (src/term/images.rs).
+    image_textures: term::images::TextureCache<Texture2D>,
 }
 
 /// The state of the cell-buffer renderer (ADR 0008). Each viewport row's
@@ -679,6 +671,7 @@ impl<'alloc> Renderer<'alloc> {
             frame: None,
             present_material: present_material()?,
             cells: CellGrid::new()?,
+            image_textures: Default::default(),
         })
     }
 
@@ -833,16 +826,35 @@ impl<'alloc> Renderer<'alloc> {
         }
         rows.truncate(row_index);
 
+        // Every image this frame draws, with its stage (src/term/images.rs).
+        let image_draws = match graphics.as_ref() {
+            Some(graphics) => {
+                let virtual_runs: Vec<(u16, placeholders::Placement)> = rows
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
+                    .collect();
+                term::images::frame_draws(
+                    terminal,
+                    &mut self.placement_it,
+                    graphics,
+                    &virtual_runs,
+                    image_geometry(dims),
+                )?
+            }
+            None => Vec::new(),
+        };
+        let mut draw_stage = |stage: term::images::Stage| -> Result<()> {
+            match graphics.as_ref() {
+                Some(graphics) => {
+                    Self::draw_images(&mut self.image_textures, graphics, &image_draws, stage)
+                }
+                None => Ok(()),
+            }
+        };
+
         clear_background(color(colors.background));
-        if let Some(graphics) = graphics.as_ref() {
-            Self::render_kitty_images(
-                terminal,
-                &mut self.placement_it,
-                graphics,
-                Layer::BELOW_BACKGROUND,
-                dims,
-            )?
-        }
+        draw_stage(term::images::Stage::BelowBackground)?;
 
         // Backgrounds: one texel per cell, stretched over the grid with
         // nearest filtering, as Ghostty's cell_bg pass looks up each pixel's
@@ -882,6 +894,11 @@ impl<'alloc> Renderer<'alloc> {
             );
         }
 
+        // Images below the text, Unicode placeholder images among them, go
+        // before the glyphs, as in Ghostty and tai-gui. The text pass
+        // flushes macroquad's batch first (cells.rs), so they're under it.
+        draw_stage(term::images::Stage::BelowText)?;
+
         instances.clear();
         for row in rows.iter() {
             instances.extend_from_slice(&row.text);
@@ -892,29 +909,6 @@ impl<'alloc> Renderer<'alloc> {
             camera.matrix(),
             Some(frame.target.render_pass.raw_miniquad_id()),
         );
-
-        if let Some(graphics) = graphics.as_ref() {
-            Self::render_kitty_images(
-                terminal,
-                &mut self.placement_it,
-                graphics,
-                Layer::BELOW_TEXT,
-                dims,
-            )?;
-            let virtual_runs: Vec<(u16, placeholders::Placement)> = rows
-                .iter()
-                .enumerate()
-                .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
-                .collect();
-            if !virtual_runs.is_empty() {
-                Self::render_virtual_placements(
-                    &mut self.placement_it,
-                    graphics,
-                    &virtual_runs,
-                    dims,
-                )?;
-            }
-        }
 
         if let Some((x, y)) = cursor {
             let cursor_color = colors.cursor.unwrap_or(colors.foreground);
@@ -927,15 +921,10 @@ impl<'alloc> Renderer<'alloc> {
             );
         }
 
-        if let Some(graphics) = graphics.as_ref() {
-            Self::render_kitty_images(
-                terminal,
-                &mut self.placement_it,
-                graphics,
-                Layer::ABOVE_TEXT,
-                dims,
-            )?
-        }
+        draw_stage(term::images::Stage::AboveText)?;
+
+        // Textures of images this frame didn't draw go.
+        self.image_textures.end_frame();
 
         snapshot.set_dirty(Dirty::Clean)?;
         set_default_camera();
@@ -1000,198 +989,39 @@ impl<'alloc> Renderer<'alloc> {
         gl_use_default_material();
     }
 
-    /// Draw the image slices that Unicode placeholder runs show. Each run's
-    /// image and grid come from its virtual placement; the slice and its
-    /// position are worked out as in Ghostty (`src/placeholders.rs`).
-    fn render_virtual_placements(
-        placement_it: &mut PlacementIterator<'_>,
+    /// Draw one stage's images from their textures, made when an image is
+    /// new or its data changed.
+    fn draw_images(
+        textures: &mut term::images::TextureCache<Texture2D>,
         graphics: &Graphics<'_>,
-        runs: &[(u16, placeholders::Placement)],
-        dims: Dimensions,
+        draws: &[(term::images::Stage, term::images::Draw)],
+        stage: term::images::Stage,
     ) -> Result<()> {
-        // Virtual placements' grids (`c`, `r`): by image and placement id,
-        // and the first one of each image for runs that name no placement.
-        let mut by_id = std::collections::HashMap::new();
-        let mut first = std::collections::HashMap::new();
-        let mut placements = placement_it.update(graphics)?;
-        placements.set_layer(Layer::all())?;
-        while let Some(placement) = placements.next() {
-            if !placement.is_virtual()? {
-                continue;
-            }
-            let image_id = placement.image_id()?;
-            let grid = (placement.columns()?, placement.rows()?);
-            by_id.insert((image_id, placement.placement_id()?), grid);
-            first.entry(image_id).or_insert(grid);
-        }
-
-        // The protocol's sizes are in physical pixels; tai draws in logical
-        // units.
-        let scale = dims.dpi_scale;
-        let cell_w = (dims.cell_width * scale).round().max(1.0) as u32;
-        let cell_h = (dims.cell_height * scale).round().max(1.0) as u32;
-        let mut textures = std::collections::HashMap::new();
-
-        for (row, run) in runs {
-            let grid = if run.placement_id > 0 {
-                by_id.get(&(run.image_id, run.placement_id))
-            } else {
-                first.get(&run.image_id)
-            };
-            let (Some(&(columns, rows)), Some(image)) = (grid, graphics.image(run.image_id)) else {
+        for (_, draw) in draws.iter().filter(|(s, _)| *s == stage) {
+            let Some(pixels) = term::images::pixels(graphics, draw.image_id)? else {
                 continue;
             };
-            if image.format()? != graphics::ImageFormat::Rgba {
-                continue;
-            }
-            let (img_w, img_h) = (image.width()?, image.height()?);
-            let Some(data) = image.data()? else {
-                continue;
-            };
-            if data.len() < (img_w * img_h * 4) as usize {
-                continue;
-            }
-            let grid = placeholders::grid(columns, rows, img_w, img_h, cell_w, cell_h);
-            let Some(slice) = placeholders::render(run, grid, img_w, img_h, cell_w, cell_h) else {
-                continue;
-            };
-            let tex = textures
-                .entry(run.image_id)
-                .or_insert_with(|| Texture2D::from_rgba8(img_w as u16, img_h as u16, data));
+            let (tex, _) = textures.texture(draw.image_id, pixels.generation, || {
+                Texture2D::from_rgba8(pixels.width as u16, pixels.height as u16, pixels.data)
+            });
             draw_texture_ex(
                 tex,
-                PADDING + f32::from(run.x) * dims.cell_width + slice.offset_x as f32 / scale,
-                PADDING + f32::from(*row) * dims.cell_height + slice.offset_y as f32 / scale,
+                draw.dest.x,
+                draw.dest.y,
                 WHITE,
                 DrawTextureParams {
-                    dest_size: Some(vec2(
-                        slice.dest_width as f32 / scale,
-                        slice.dest_height as f32 / scale,
-                    )),
+                    dest_size: Some(vec2(draw.dest.w, draw.dest.h)),
                     source: Some(Rect {
-                        x: slice.source_x as f32,
-                        y: slice.source_y as f32,
-                        w: slice.source_width as f32,
-                        h: slice.source_height as f32,
+                        x: draw.source.x,
+                        y: draw.source.y,
+                        w: draw.source.w,
+                        h: draw.source.h,
                     }),
                     ..Default::default()
                 },
             );
         }
         Ok(())
-    }
-
-    fn render_kitty_images<'t>(
-        terminal: &'t Terminal<'_, '_>,
-        placement_it: &mut PlacementIterator<'_>,
-        graphics: &Graphics<'t>,
-        layer: Layer,
-        dims: Dimensions,
-    ) -> Result<()> {
-        for draw in Self::kitty_image_draws(terminal, placement_it, graphics, layer, dims)? {
-            let Some(image) = graphics.image(draw.image_id) else {
-                continue;
-            };
-            let Some(data) = image.data()? else {
-                continue;
-            };
-            let tex = Texture2D::from_rgba8(image.width()? as u16, image.height()? as u16, data);
-            draw_texture_ex(
-                &tex,
-                draw.pos.x,
-                draw.pos.y,
-                WHITE,
-                DrawTextureParams {
-                    dest_size: Some(draw.dest_size),
-                    source: Some(draw.source),
-                    ..Default::default()
-                },
-            );
-        }
-
-        Ok(())
-    }
-
-    /// One layer's visible placements, in drawing order. libghostty-vt's
-    /// iterator walks a hash map, so Ghostty's renderer sorts placements by
-    /// z and then image id, which puts the newer of two overlapping images
-    /// on top (`src/renderer/image.zig`, `sortUnstable` and `Id.zLessThan`,
-    /// a887df42). tai sorts the same way.
-    fn kitty_image_draws<'t>(
-        terminal: &'t Terminal<'_, '_>,
-        placement_it: &mut PlacementIterator<'_>,
-        graphics: &Graphics<'t>,
-        layer: Layer,
-        dims: Dimensions,
-    ) -> Result<Vec<ImageDraw>> {
-        let mut draws = Vec::new();
-        let mut placements = placement_it.update(graphics)?;
-        placements.set_layer(layer)?;
-
-        while let Some(placement) = placements.next() {
-            let image_id = placement.image_id()?;
-            let Some(image) = graphics.image(image_id) else {
-                continue;
-            };
-
-            let info = placement.placement_render_info(&image, terminal)?;
-
-            // Skip images that aren't visible in our viewport,
-            // or have zero width/height in either pixel or grid coordinates
-            if !info.viewport_visible
-                || info.pixel_width == 0
-                || info.pixel_height == 0
-                || info.grid_cols == 0
-                || info.grid_rows == 0
-            {
-                continue;
-            }
-
-            // We only handle RGBA (the PNG decoder we registered converts
-            // everything to RGBA)
-            if image.format()? != graphics::ImageFormat::Rgba {
-                continue;
-            }
-
-            let image_width = image.width()?;
-            let image_height = image.height()?;
-            let Some(data) = image.data()? else {
-                continue;
-            };
-            if data.len() < (image_width * image_height * 4) as usize {
-                continue;
-            }
-
-            // Compute grid cell count for rendered size.
-            let dest_size = vec2(
-                info.grid_cols as f32 * dims.cell_width,
-                info.grid_rows as f32 * dims.cell_height,
-            );
-
-            // Read the sub-cell pixel offsets. They are in the terminal's
-            // physical pixels; we draw in logical units.
-            let x_offset = placement.x_offset()? as f32 / dims.dpi_scale;
-            let y_offset = placement.y_offset()? as f32 / dims.dpi_scale;
-
-            draws.push(ImageDraw {
-                z: placement.z()?,
-                image_id,
-                pos: vec2(
-                    PADDING + info.viewport_col as f32 * dims.cell_width + x_offset,
-                    PADDING + info.viewport_row as f32 * dims.cell_height + y_offset,
-                ),
-                dest_size,
-                source: Rect {
-                    x: info.source_x as f32,
-                    y: info.source_y as f32,
-                    w: info.source_width as f32,
-                    h: info.source_height as f32,
-                },
-            });
-        }
-
-        draws.sort_by_key(|d| (d.z, d.image_id));
-        Ok(draws)
     }
 }
 
@@ -1241,14 +1071,8 @@ fn walk_row(
         // A placeholder cell shows part of an image, drawn later; its own
         // character has no glyph.
         if placeholder_row {
-            let cp = (graphemes > 0).then(|| cell.graphemes()).transpose()?;
-            if let Some(cps) = cp.filter(|c| c.first() == Some(&placeholders::PLACEHOLDER)) {
-                let style = cell.style()?;
-                placeholder_cells.push(Some(placeholders::PlaceholderCell {
-                    diacritics: cps[1..].to_vec(),
-                    fg: id_color(style.fg_color),
-                    underline: id_color(style.underline_color),
-                }));
+            if let Some(placeholder) = term::images::placeholder_cell(cell)? {
+                placeholder_cells.push(Some(placeholder));
                 sink.background(x, bg);
                 x += dims.cell_width;
                 continue;
@@ -1394,24 +1218,13 @@ fn color(rgb: Rgb) -> Color {
     color_u8!(r, g, b, 255)
 }
 
-/// A style colour as the Kitty placeholder protocol reads it: the raw value,
-/// not the colour it resolves to.
-fn id_color(c: StyleColor) -> placeholders::IdColor {
-    match c {
-        StyleColor::None => placeholders::IdColor::None,
-        StyleColor::Palette(index) => placeholders::IdColor::Palette(index.0),
-        StyleColor::Rgb(Rgb { r, g, b }) => placeholders::IdColor::Rgb(r, g, b),
+/// Where the grid is, for src/term/images.rs.
+fn image_geometry(dims: Dimensions) -> term::images::Geometry {
+    term::images::Geometry {
+        cell_width: dims.cell_width,
+        cell_height: dims.cell_height,
+        dpi_scale: dims.dpi_scale,
     }
-}
-
-/// One Kitty image placement, ready to draw.
-#[derive(Debug)]
-struct ImageDraw {
-    z: i32,
-    image_id: u32,
-    pos: Vec2,
-    dest_size: Vec2,
-    source: Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2631,28 +2444,6 @@ fn macroquad_conf() -> Conf {
 /// A decoder that decodes raw PNG data into 8-bit RGBA pixels using
 /// `macroquad`'s PNG decoder. The output buffer is allocated through the
 /// provided `Allocator` so the library can free it later.
-struct PngDecoder;
-
-impl DecodePng for PngDecoder {
-    fn decode_png<'alloc>(
-        &mut self,
-        alloc: &'alloc libghostty_vt::alloc::Allocator<'_>,
-        data: &[u8],
-    ) -> Option<DecodedImage<'alloc>> {
-        // `macroquad` decodes the PNG image for us and converts it
-        // to the correct RGBA8 pixel format automatically.
-        let img = Image::from_file_with_format(data, Some(ImageFormat::Png)).ok()?;
-        let mut data = Bytes::new_zeroed_with_alloc(alloc, img.bytes.len()).ok()?;
-        data.copy_from_slice(&img.bytes);
-
-        Some(DecodedImage {
-            width: img.width as u32,
-            height: img.height as u32,
-            data,
-        })
-    }
-}
-
 /// This is a full implementation of a pseudo-terminal (PTY) interface.
 ///
 /// Normally we would try to avoid using unsafe code in examples,
@@ -2729,34 +2520,6 @@ mod tests {
             baseline: 0.0,
             dpi_scale,
         }
-    }
-
-    #[test]
-    fn overlapping_images_draw_oldest_first() {
-        use super::Renderer;
-        use libghostty_vt::Terminal;
-        use libghostty_vt::kitty::graphics::{Layer, PlacementIterator};
-
-        let mut term = Terminal::new(80, 24).unwrap();
-        term.set_scrollback_max_lines(Some(100)).unwrap();
-        term.resize(80, 24, 10, 20).unwrap();
-        term.set_kitty_image_storage_limit(64 * 1024 * 1024)
-            .unwrap();
-        // Eight 1x1 RGBA images at the same cell, as a carousel would
-        // draw them. With no i=, libghostty-vt numbers them in order.
-        for _ in 0..8 {
-            term.vt_write(b"\x1b_Ga=T,f=32,q=2,C=1,s=1,v=1;/wAA/w==\x1b\\");
-        }
-
-        let graphics = term.kitty_graphics().unwrap().unwrap();
-        let mut it = PlacementIterator::new().unwrap();
-        let d = dims((800.0, 600.0), (10.0, 20.0), 1.0);
-        let draws =
-            Renderer::kitty_image_draws(&term, &mut it, &graphics, Layer::all(), d).unwrap();
-        let ids: Vec<u32> = draws.iter().map(|d| d.image_id).collect();
-        assert_eq!(ids.len(), 8);
-        // The newest image draws last, so it ends up on top.
-        assert!(ids.is_sorted(), "draw order {ids:?}");
     }
 
     #[test]

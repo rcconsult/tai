@@ -21,7 +21,8 @@
   the mouse to programs that track it, with the wheel as Ghostty sends
   it (branch `gui-mouse`). Still to build: images in the terminal pane,
   workspace tabs (there is one layout per window), and ADR 0010's
-  plain-mode fallback.)
+  plain-mode fallback.) (2026-11-27: images in the terminal pane are
+  built, through ADR 0014's shared core, on branch `term-core-images`.)
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host.
 - **Amends:** decision 3 of [ADR 0001](0001-stack-rust-libghostty-vt-ppxai-server.md)

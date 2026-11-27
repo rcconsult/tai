@@ -1,7 +1,7 @@
 # ADR 0014: One terminal core for tai and tai-gui, under `src/term/`
 
-- **Status:** Accepted 2026-11-27 (owner). Step 1 is under way on branch
-  `term-core-setup`.
+- **Status:** Accepted 2026-11-27 (owner). Step 1 is on branch
+  `term-core-setup`, step 2 on `term-core-images` on top of it.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host, from the owner's question that day: "what else can we refactor
   to minimize divergence and code duplication?"
@@ -81,8 +81,11 @@ three platforms.
       - a draw list of image id, generation, source and destination
         rectangles, and layer.
 
-      Each front end keeps a texture cache and one textured-quad draw.
-      tai-gui gains images.
+      The texture cache's logic is shared too (`TextureCache<T>`, over
+      each front end's texture type); each front end keeps only its
+      textured-quad draw. tai-gui gains images. One `image` crate decodes
+      PNG for both, so the vendored macroquad moves to the version eframe
+      uses (`vendor/macroquad/TAI-PATCHES.md`, patch 5).
    3. **Mouse, selection and wheel** (`term/pointer.rs`): one state
       machine fed with neutral button, position, modifier and wheel
       events.

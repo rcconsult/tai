@@ -359,7 +359,7 @@ impl Live {
                     format!("Attached {source} ({})", about.join(", "))
                 });
             }
-            ChatEvent::Display(path) => match crate::images::shown_markdown(&path) {
+            ChatEvent::Display(path) => match crate::answer_images::shown_markdown(&path) {
                 Some(markdown) => {
                     self.activity = None;
                     self.displayed.push_str(&markdown);
@@ -1736,7 +1736,7 @@ impl ChatPane {
                 self.entries
                     .push(Entry::Note(format!("Working directory changed to {path}")));
             }
-            crate::images::set_workdir(Some(&path));
+            crate::answer_images::set_workdir(Some(&path));
             self.folder = Some(path);
         }
         if let Some(on) = state.tools_enabled {
@@ -1821,7 +1821,7 @@ impl ChatPane {
                         self.entries
                             .push(Entry::Note(format!("Working directory set to {path}")));
                     }
-                    crate::images::set_workdir(Some(&path));
+                    crate::answer_images::set_workdir(Some(&path));
                     self.folder = Some(path);
                 }
                 Done::Folder(Err(why), _) => {
@@ -1838,7 +1838,7 @@ impl ChatPane {
                             if outcome.ok && RESETS_TRANSCRIPT.contains(&name.as_str()) {
                                 self.entries.clear();
                                 self.markdown = CommonMarkCache::default();
-                                crate::images::new_conversation();
+                                crate::answer_images::new_conversation();
                             }
                             self.apply_state(outcome.state, ctx, false);
                             let mut notes = Vec::new();
@@ -1850,7 +1850,7 @@ impl ChatPane {
                                     // its right-hand panel; here, in the
                                     // Preview stack.
                                     SideEffect::ShowImage(path) => {
-                                        crate::images::request_open(&path)
+                                        crate::answer_images::request_open(&path)
                                     }
                                     // /show <text file>: the web app opens
                                     // a read-only code view; here, a tab in
@@ -2183,8 +2183,8 @@ pub fn show_reply(
         }
         for (b, block) in reply.blocks.iter().enumerate() {
             ui.push_id(b, |ui| {
-                // Images resolved and gated first (images.rs).
-                let text = crate::images::prepare(&block.text);
+                // Images resolved and gated first (answer_images.rs).
+                let text = crate::answer_images::prepare(&block.text);
                 let mut show = |ui: &mut egui::Ui| {
                     CommonMarkViewer::new()
                         .explicit_image_uri_scheme(true)
@@ -2552,7 +2552,7 @@ fn source_name(source: &ppxai::Source) -> &str {
 /// since loading an image tells its host the URL, and an answer can put
 /// anything into it.
 fn web_images_bar(ui: &mut egui::Ui) {
-    let hosts = crate::images::pending_hosts();
+    let hosts = crate::answer_images::pending_hosts();
     if hosts.is_empty() {
         return;
     }
@@ -2582,14 +2582,14 @@ fn web_images_bar(ui: &mut egui::Ui) {
                 .on_hover_text("For this conversation; /clear asks again")
                 .clicked()
             {
-                crate::images::set_web(ui.ctx(), crate::images::Web::Allowed);
+                crate::answer_images::set_web(ui.ctx(), crate::answer_images::Web::Allowed);
             }
             if ui
                 .button("Keep them as links")
                 .on_hover_text("For this conversation; /clear asks again")
                 .clicked()
             {
-                crate::images::set_web(ui.ctx(), crate::images::Web::Denied);
+                crate::answer_images::set_web(ui.ctx(), crate::answer_images::Web::Denied);
             }
         });
     });
