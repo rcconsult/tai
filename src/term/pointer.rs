@@ -297,10 +297,14 @@ impl Pointer {
                     && !input.mods.contains(key::Mods::SHIFT)
                     && (dragging || in_pane(pane, pos))
                 {
+                    // Only a button whose press the program got makes this
+                    // a drag: one pressed off the pane, say in another
+                    // pane, moves as no button at all, as in Ghostty,
+                    // whose surface tracks only the presses it saw.
                     let button = BUTTONS
                         .iter()
-                        .zip(input.down)
-                        .find(|&(_, down)| down)
+                        .zip(self.reported)
+                        .find(|&(_, reported)| reported)
                         .map(|(&b, _)| b);
                     self.encoder.set_any_button_pressed(dragging);
                     self.event
@@ -793,6 +797,43 @@ mod tests {
             .frame(&mut terminal, pane, &input, &mut out)
             .unwrap();
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A drag that began off the pane isn't the program's: no button
+    /// motion under button tracking (1002), plain motion under any-event
+    /// tracking (1003).
+    #[test]
+    fn a_drag_pressed_off_the_pane_is_not_reported_as_a_drag() {
+        let (pane, mut terminal) = pane_and_terminal();
+        let mut pointer = Pointer::new().unwrap();
+        let none = key::Mods::empty();
+        let off = Pos { x: -5.0, y: 10.0 };
+        let mut out = Vec::new();
+        let press = Input {
+            clicks: vec![click(Button::Left, true, off, none)],
+            pointer: Some(off),
+            down: [true, false, false],
+            ..Default::default()
+        };
+        let drag = Input {
+            pointer: Some(at(3.0, 1.0)),
+            moved: true,
+            down: [true, false, false],
+            ..Default::default()
+        };
+        terminal.vt_write(b"\x1b[?1002h\x1b[?1006h");
+        pointer
+            .frame(&mut terminal, pane, &press, &mut out)
+            .unwrap();
+        pointer.frame(&mut terminal, pane, &drag, &mut out).unwrap();
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+        terminal.vt_write(b"\x1b[?1003h");
+        let drag = Input {
+            pointer: Some(at(4.0, 1.0)),
+            ..drag
+        };
+        pointer.frame(&mut terminal, pane, &drag, &mut out).unwrap();
+        assert_eq!(out, b"\x1b[<35;5;2M");
     }
 
     #[test]
