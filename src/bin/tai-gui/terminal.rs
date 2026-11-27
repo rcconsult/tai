@@ -596,8 +596,14 @@ impl TerminalPane {
             match self.wheel_to_program(ui, rect) {
                 Ok(true) => {}
                 Ok(false) => {
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    let lines = (scroll / self.dims.cell_height).round() as isize;
+                    // Whole rows of the wheel's travel, the rest kept for
+                    // the next frame. Rounding egui's smoothed per-frame
+                    // delta lost the fractions, so fast notches scrolled
+                    // about a row for five (popos-tai).
+                    let cell = self.dims.cell_height;
+                    let page = cell * f32::from(self.terminal.rows().unwrap_or(1));
+                    let travel = ui.input(|i| wheel_travel(i, cell, page));
+                    let lines = wheel_rows(&mut self.pending_scroll, travel, cell) as isize;
                     if lines != 0 {
                         self.terminal.scroll_viewport(ScrollViewport::Delta(-lines));
                         // A drag in progress follows the scroll: the cell
@@ -800,29 +806,16 @@ impl TerminalPane {
             && self.terminal.active_screen()? == Screen::Alternate
             && self.terminal.mode(Mode::ALT_SCROLL)?;
         if !tracking && !alternate {
-            self.pending_scroll = 0.0;
             return Ok(false);
         }
         let cell = self.dims.cell_height;
         let page = cell * f32::from(self.terminal.rows()?);
         let (travel, pos, held) = ui.input(|i| {
-            let travel: f32 = i
-                .events
-                .iter()
-                .filter_map(|e| match e {
-                    // Ctrl and Cmd with the wheel zoom in egui.
-                    egui::Event::MouseWheel {
-                        unit,
-                        delta,
-                        modifiers,
-                        ..
-                    } if !modifiers.command && !modifiers.ctrl => {
-                        Some(wheel_points(*unit, delta.y, cell, page))
-                    }
-                    _ => None,
-                })
-                .sum();
-            (travel, i.pointer.latest_pos(), i.modifiers)
+            (
+                wheel_travel(i, cell, page),
+                i.pointer.latest_pos(),
+                i.modifiers,
+            )
         });
         let rows = wheel_rows(&mut self.pending_scroll, travel, cell);
         if rows == 0 {
@@ -1488,11 +1481,36 @@ fn wheel_points(unit: egui::MouseWheelUnit, y: f32, cell: f32, page: f32) -> f32
     match unit {
         egui::MouseWheelUnit::Point => y,
         egui::MouseWheelUnit::Line if cfg!(target_os = "macos") && y != 0.0 => {
-            y.signum() * y.abs().max(1.0) * cell
+            y.signum() * y.abs().max(1.0) * cell * WHEEL_ROWS
         }
-        egui::MouseWheelUnit::Line => y * cell,
+        egui::MouseWheelUnit::Line => y * cell * WHEEL_ROWS,
         egui::MouseWheelUnit::Page => y * page,
     }
+}
+
+/// Rows one line of a mouse wheel (a notch) scrolls: Ghostty's default
+/// discrete mouse-scroll-multiplier (src/config/Config.zig at 108cacb1).
+/// A trackpad's points stay one to one, its precision multiplier.
+const WHEEL_ROWS: f32 = 3.0;
+
+/// This frame's wheel travel in points, up positive. Ctrl and Cmd with the
+/// wheel zoom in egui, so they don't count.
+fn wheel_travel(input: &egui::InputState, cell: f32, page: f32) -> f32 {
+    input
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                ..
+            } if !modifiers.command && !modifiers.ctrl => {
+                Some(wheel_points(*unit, delta.y, cell, page))
+            }
+            _ => None,
+        })
+        .sum()
 }
 
 /// Add `travel` to the pending travel and take whole rows from it, toward
@@ -1707,10 +1725,11 @@ mod tests {
         // Turning back undoes what is pending first.
         assert_eq!(wheel_rows(&mut pending, -6.0, 24.0), 0);
         assert_eq!(wheel_rows(&mut pending, -50.0, 24.0), -2);
-        // A line is a row; a page is the screen.
+        // A line (a notch) is WHEEL_ROWS rows, as in Ghostty; a page is
+        // the screen.
         assert_eq!(
             wheel_points(egui::MouseWheelUnit::Line, 3.0, 24.0, 480.0),
-            72.0
+            216.0
         );
         assert_eq!(
             wheel_points(egui::MouseWheelUnit::Page, -1.0, 24.0, 480.0),
@@ -1718,9 +1737,9 @@ mod tests {
         );
         let tenth = wheel_points(egui::MouseWheelUnit::Line, 0.1, 24.0, 480.0);
         if cfg!(target_os = "macos") {
-            assert_eq!(tenth, 24.0);
+            assert_eq!(tenth, 72.0);
         } else {
-            assert!((tenth - 2.4).abs() < 1e-4);
+            assert!((tenth - 7.2).abs() < 1e-4);
         }
     }
 
