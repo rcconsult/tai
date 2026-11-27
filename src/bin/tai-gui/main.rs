@@ -374,7 +374,7 @@ struct App {
     /// The rename box a terminal tab's menu opened.
     renaming: Option<Rename>,
     /// Terminals opened for `/edit`'s editor, which close once their shell
-    /// exits (editor.rs types `&& exit` after the editor), each with the
+    /// exits (editor.rs types `exit` after the editor), each with the
     /// terminal that had the focus before it, which gets it back.
     editors: Vec<(TermId, Option<TermId>)>,
     /// The busy terminals' titles, while the question before quitting is
