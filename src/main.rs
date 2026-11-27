@@ -1586,7 +1586,9 @@ enum KeyInput {
 #[derive(Default)]
 struct KeyEvents {
     keys: Vec<KeyInput>,
-    /// Vertical wheel travel, in miniquad's units (`wheel_notches`).
+    /// Vertical wheel travel in notches, each event converted on its own:
+    /// X11's notch is a travel of exactly 1, which a frame's sum isn't
+    /// once two arrive together (popos-tai).
     wheel: f32,
 }
 
@@ -1610,7 +1612,7 @@ impl EventHandler for KeyEvents {
         self.keys.push(KeyInput::Char(character));
     }
     fn mouse_wheel_event(&mut self, _x: f32, y: f32) {
-        self.wheel += y;
+        self.wheel += wheel_notches(y);
     }
 }
 
@@ -1695,7 +1697,7 @@ struct Input<'alloc> {
     chars_before_keys: Option<bool>,
     /// On X11, characters waiting for the key press they belong to.
     lead_text: String,
-    /// This frame's wheel travel, from the input stream.
+    /// This frame's wheel travel in notches, from the input stream.
     wheel: f32,
     /// Wheel travel not yet a whole row, as Ghostty's `pending_scroll_y`
     /// (src/Surface.zig at 108cacb1, scrollCallback).
@@ -2180,8 +2182,8 @@ impl<'alloc> Input<'alloc> {
         // Rows of travel, WHEEL_ROWS per notch as Ghostty's default
         // mouse-scroll-multiplier (src/config/Config.zig at 108cacb1), with
         // fractions carried to the next frame. Positive is up.
-        let wheel = std::mem::take(&mut self.wheel);
-        let rows = take_rows(&mut self.pending_rows, wheel_notches(wheel) * WHEEL_ROWS);
+        let notches = std::mem::take(&mut self.wheel);
+        let rows = take_rows(&mut self.pending_rows, notches * WHEEL_ROWS);
         if rows != 0 {
             if terminal.is_mouse_tracking()? {
                 let scroll_btn = if rows > 0 {
@@ -2189,16 +2191,14 @@ impl<'alloc> Input<'alloc> {
                 } else {
                     mouse::Button::Five
                 };
-                // One press and release per row, as Ghostty reports them.
+                // One press per row and no release, as Ghostty reports the
+                // wheel (src/Surface.zig at 108cacb1, scrollCallback): hx
+                // counts an SGR release of button 4 or 5 as another scroll
+                // (popos-tai).
+                self.mouse_event
+                    .set_button(Some(scroll_btn))
+                    .set_action(mouse::Action::Press);
                 for _ in 0..rows.unsigned_abs() {
-                    self.mouse_event
-                        .set_button(Some(scroll_btn))
-                        .set_action(mouse::Action::Press);
-                    self.response.reserve(ENCODE_ROOM);
-                    self.mouse_encoder
-                        .encode_to_vec(&self.mouse_event, &mut self.response)?;
-
-                    self.mouse_event.set_action(mouse::Action::Release);
                     self.response.reserve(ENCODE_ROOM);
                     self.mouse_encoder
                         .encode_to_vec(&self.mouse_event, &mut self.response)?;
@@ -2700,11 +2700,10 @@ mod tests {
             take_rows(&mut pending, wheel_notches(-notch) * WHEEL_ROWS),
             -3
         );
-        // Several notches in one frame all count.
-        assert_eq!(
-            take_rows(&mut pending, wheel_notches(4.0 * notch) * WHEEL_ROWS),
-            12
-        );
+        // Several notches in one frame all count: each event is converted
+        // on its own, then summed, as KeyEvents does.
+        let four: f32 = (0..4).map(|_| wheel_notches(notch)).sum();
+        assert_eq!(take_rows(&mut pending, four * WHEEL_ROWS), 12);
     }
 
     #[test]
