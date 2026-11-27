@@ -38,11 +38,10 @@ use libghostty_vt::{
     key::{self, Key},
     kitty::graphics::{Graphics, PlacementIterator},
     mode::Mode,
-    render::{CellIteration, CellIterator, Colors, Dirty, RenderState, RowIterator},
-    screen::CellWide,
+    render::{CellIterator, Dirty, RenderState, RowIterator},
 };
 
-use crate::fonts::{Coverage, Face, SymbolSpan, Typeface};
+use crate::fonts::{Coverage, Face, Typeface};
 use crate::pty::{Child, Pty, PtyError};
 use crate::shortcuts::Action;
 
@@ -563,10 +562,17 @@ struct CellGrid {
 /// One viewport row, as last built.
 #[derive(Default)]
 struct RowCells {
+    /// The row as the terminal core read it (src/term/rows.rs).
+    read: term::rows::Row,
     /// A colour per cell; transparent where the terminal's background shows.
     bg: Vec<[u8; 4]>,
     text: Vec<cells::Instance>,
-    virtual_runs: Vec<placeholders::Placement>,
+}
+
+impl AsRef<term::rows::Row> for RowCells {
+    fn as_ref(&self) -> &term::rows::Row {
+        &self.read
+    }
 }
 
 impl CellGrid {
@@ -668,6 +674,10 @@ impl<'alloc> Renderer<'alloc> {
         }
         grid.dims = Some(dims);
 
+        // The cursor is drawn into its cell (term::rows::read_row), so the
+        // rows it left and entered are read again.
+        let old_cursor_row = self.frame.as_ref().and_then(|f| f.cursor).map(|(_, y)| y);
+        let cursor_row = cursor.map(|(_, y)| y);
         if self.frame.as_ref().is_none_or(|f| f.dims != dims) {
             let target = render_target(
                 (dims.window_width * dims.dpi_scale).round() as u32,
@@ -700,10 +710,9 @@ impl<'alloc> Renderer<'alloc> {
             ..
         } = grid;
 
+        let cursor_color = colors.cursor.unwrap_or(colors.foreground);
         let mut row_it = self.row_it.update(&snapshot)?;
         let mut text = String::with_capacity(16);
-        let mut icons: Vec<Icon> = Vec::new();
-        let mut placeholder_cells: Vec<Option<placeholders::PlaceholderCell>> = Vec::new();
         let mut row_index = 0;
         let mut y = PADDING;
 
@@ -711,56 +720,47 @@ impl<'alloc> Renderer<'alloc> {
             if rows.len() <= row_index {
                 rows.push(RowCells::default());
             }
-            if !rebuild && !row.dirty()? {
+            let index = row_index as u16;
+            if !rebuild
+                && !row.dirty()?
+                && old_cursor_row != Some(index)
+                && cursor_row != Some(index)
+            {
                 y += dims.cell_height;
                 row_index += 1;
                 continue;
             }
             let built = &mut rows[row_index];
+            // The row, read by the terminal core tai-gui shares
+            // (src/term/rows.rs), into a texel per cell and glyphs.
+            let on_row = cursor
+                .filter(|&(_, cy)| cy == index)
+                .map(|(col, _)| term::rows::Cursor {
+                    col,
+                    color: cursor_color,
+                });
+            built.read =
+                term::rows::read_row(row, &mut self.cell_it, &colors, coverage, on_row, &mut text)?;
             built.bg.clear();
+            built.bg.extend(
+                built
+                    .read
+                    .bg
+                    .iter()
+                    .map(|bg| bg.map_or([0; 4], |c| [c.r, c.g, c.b, 255])),
+            );
             built.text.clear();
-            built.virtual_runs.clear();
-            let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
-            let mut cell_it = self.cell_it.update(row)?;
-            walk_row(
-                &mut cell_it,
-                placeholder_row,
-                y,
-                dims,
-                &colors,
+            term::rows::push_glyphs(
+                atlas,
                 coverage,
-                &mut text,
-                &mut icons,
-                &mut placeholder_cells,
-                &mut GridRow {
-                    atlas,
-                    row: built,
-                    font: coverage.font(Face::Primary),
-                    y,
-                    dims,
-                },
-            )?;
-
-            // Icons go after the row's text, so one that overhangs into a
-            // blank next cell isn't covered by it.
-            for icon in icons.drain(..) {
-                let place = coverage.place(icon.face, dims.font_size, icon.cells);
-                atlas.push_text(
-                    &mut built.text,
-                    coverage.font(icon.face),
-                    icon.face,
-                    &icon.text,
-                    icon.x,
-                    icon.y + dims.baseline - place.rise,
-                    place.font_size,
-                    dims.dpi_scale,
-                    icon.fg,
-                    icon.bold,
-                );
-            }
-            if placeholder_row {
-                built.virtual_runs = placeholders::row_placements(placeholder_cells.drain(..));
-            }
+                &mut built.text,
+                &built.read,
+                y,
+                dims.cell_width,
+                dims.baseline,
+                dims.font_size,
+                dims.dpi_scale,
+            );
             row.set_dirty(false)?;
             y += dims.cell_height;
             row_index += 1;
@@ -773,7 +773,12 @@ impl<'alloc> Renderer<'alloc> {
                 let virtual_runs: Vec<(u16, placeholders::Placement)> = rows
                     .iter()
                     .enumerate()
-                    .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
+                    .flat_map(|(r, row)| {
+                        row.read
+                            .virtual_runs
+                            .iter()
+                            .map(move |run| (r as u16, *run))
+                    })
                     .collect();
                 term::images::frame_draws(
                     terminal,
@@ -795,6 +800,18 @@ impl<'alloc> Renderer<'alloc> {
         };
 
         clear_background(color(colors.background));
+        // The padding in the edge cells' colours, as tai-gui and Ghostty's
+        // window-padding-color = extend (src/term/rows.rs).
+        for (rect, fill) in term::rows::padding_rects(
+            rows,
+            dims.window_width,
+            dims.window_height,
+            dims.cell_width,
+            dims.cell_height,
+            colors.background,
+        ) {
+            draw_rectangle(rect[0], rect[1], rect[2], rect[3], color(fill));
+        }
         draw_stage(term::images::Stage::BelowBackground)?;
 
         // Backgrounds: one texel per cell, stretched over the grid with
@@ -850,17 +867,6 @@ impl<'alloc> Renderer<'alloc> {
             camera.matrix(),
             Some(frame.target.render_pass.raw_miniquad_id()),
         );
-
-        if let Some((x, y)) = cursor {
-            let cursor_color = colors.cursor.unwrap_or(colors.foreground);
-            draw_rectangle(
-                PADDING + x as f32 * dims.cell_width,
-                PADDING + y as f32 * dims.cell_height,
-                dims.cell_width,
-                dims.cell_height,
-                color(cursor_color),
-            );
-        }
 
         draw_stage(term::images::Stage::AboveText)?;
 
@@ -964,174 +970,6 @@ impl<'alloc> Renderer<'alloc> {
         }
         Ok(())
     }
-}
-
-/// Read one row's cells and work out what each shows: colours (inverse and
-/// selection swap them), Kitty placeholder cells, and which font draws each
-/// grapheme. Backgrounds and primary-font text go to `sink` as they're
-/// read. Fallback-font icons go to `icons`, complete once the row is read,
-/// because an icon spreads into the next cell when that one is blank. On a placeholder row, every cell's placeholder or `None`
-/// goes to `placeholder_cells`.
-#[allow(clippy::too_many_arguments)]
-fn walk_row(
-    cell_it: &mut CellIteration<'_, '_>,
-    placeholder_row: bool,
-    y: f32,
-    dims: Dimensions,
-    colors: &Colors,
-    coverage: &Coverage,
-    text: &mut String,
-    icons: &mut Vec<Icon>,
-    placeholder_cells: &mut Vec<Option<placeholders::PlaceholderCell>>,
-    sink: &mut GridRow<'_>,
-) -> Result<()> {
-    placeholder_cells.clear();
-    let mut x = PADDING;
-    // Whether the last cell drew an icon, which may take this cell.
-    let mut icon_open = false;
-    let mut span = SymbolSpan::default();
-    while let Some(cell) = cell_it.next() {
-        // Selection membership is computed by libghostty from the
-        // terminal-owned selection. Selected cells use reverse-video colors,
-        // matching the common terminal behavior.
-        let selected = cell.is_selected()?;
-        let graphemes = cell.graphemes_len()?;
-        let bg = cell.bg_color()?;
-        if graphemes > 0 {
-            // The whole grapheme cluster as UTF-8 text.
-            cell.graphemes_utf8(text)?;
-        }
-        let grow = span.next((graphemes > 0).then(|| text.chars().next()).flatten());
-        if std::mem::take(&mut icon_open)
-            && grow
-            && let Some(icon) = icons.last_mut()
-        {
-            icon.cells = 2;
-        }
-
-        // A placeholder cell shows part of an image, drawn later; its own
-        // character has no glyph.
-        if placeholder_row {
-            if let Some(placeholder) = term::images::placeholder_cell(cell)? {
-                placeholder_cells.push(Some(placeholder));
-                sink.background(x, bg);
-                x += dims.cell_width;
-                continue;
-            }
-            placeholder_cells.push(None);
-        }
-
-        if graphemes == 0 {
-            // No text, but maybe a background (e.g. from an erase with a
-            // colour set), or the selection's.
-            sink.background(
-                x,
-                if selected {
-                    Some(colors.foreground)
-                } else {
-                    bg
-                },
-            );
-        } else {
-            // fg_color and bg_color flatten style colours, content-tag
-            // colours and palette lookups into one RGB value, `None` when
-            // the cell uses the terminal default.
-            let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-            let mut has_bg = bg.is_some();
-            let mut bg = bg.unwrap_or(colors.background);
-            let mut bold = false;
-            if cell.has_styling()? {
-                let style = cell.style()?;
-                // Inverse (reverse video) swaps foreground and background.
-                if style.inverse {
-                    std::mem::swap(&mut fg, &mut bg);
-                    has_bg = true;
-                }
-                bold = style.bold;
-            }
-            if selected {
-                std::mem::swap(&mut fg, &mut bg);
-                has_bg = true;
-            }
-            sink.background(x, has_bg.then_some(bg));
-
-            // A fallback font draws what the primary lacks (e.g. Nerd Font
-            // icons). One face draws the whole cluster, trimmed to what tai
-            // can draw without a shaper (`Coverage::cluster_face`).
-            let face = coverage.cluster_face(text);
-            if matches!(
-                face,
-                Face::Symbols | Face::Iosevka | Face::Emoji | Face::Discovered(_)
-            ) {
-                // A wide cell spans two cells; a narrow symbol may take
-                // the next cell too (`SymbolSpan`).
-                let wide = cell.raw_cell()?.wide()? == CellWide::Wide;
-                icons.push(Icon {
-                    text: text.clone(),
-                    face,
-                    x,
-                    y,
-                    fg: color(fg),
-                    bold,
-                    cells: if wide { 2 } else { 1 },
-                });
-                icon_open = !wide;
-            } else if face == Face::Primary {
-                sink.text(text, x, fg, bold);
-            }
-        }
-        x += dims.cell_width;
-    }
-    Ok(())
-}
-
-/// The cell renderer's row buffers (ADR 0008).
-struct GridRow<'a> {
-    atlas: &'a mut cells::GlyphAtlas,
-    row: &'a mut RowCells,
-    font: &'a Typeface,
-    y: f32,
-    dims: Dimensions,
-}
-
-impl GridRow<'_> {
-    /// The next cell's background; `None` where the terminal's own
-    /// background shows.
-    fn background(&mut self, _x: f32, bg: Option<Rgb>) {
-        // One texel per cell; transparent shows the terminal's background.
-        self.row
-            .bg
-            .push(bg.map_or([0; 4], |c| [c.r, c.g, c.b, 255]));
-    }
-
-    /// A cell's text in the primary font, at `x`.
-    fn text(&mut self, text: &str, x: f32, fg: Rgb, bold: bool) {
-        self.atlas.push_text(
-            &mut self.row.text,
-            self.font,
-            Face::Primary,
-            text,
-            x,
-            self.y + self.dims.baseline,
-            self.dims.font_size,
-            self.dims.dpi_scale,
-            color(fg),
-            bold,
-        );
-    }
-}
-
-/// A fallback-font glyph waiting to be drawn at the end of its row.
-struct Icon {
-    text: String,
-    face: Face,
-    x: f32,
-    y: f32,
-    fg: Color,
-    bold: bool,
-    /// How many cells it spans: 2 for a wide cell, or a narrow one whose
-    /// next cell is blank.
-    cells: u8,
 }
 
 /// The size of `text` in `font`, as macroquad's `measure_text` measured it
@@ -2046,7 +1884,7 @@ mod tests {
 
     /// The first row's cells after `line` is written, with grapheme
     /// clustering (mode 2027) on or off: each cell's text and width, as
-    /// walk_row reads them. Spacer cells are left out.
+    /// term::rows::read_row reads them. Spacer cells are left out.
     fn first_row_cells(
         line: &str,
         clustering: bool,

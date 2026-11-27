@@ -1,7 +1,8 @@
 # ADR 0014: One terminal core for tai and tai-gui, under `src/term/`
 
 - **Status:** Accepted 2026-11-27 (owner). Steps 1 and 2 are merged
-  (main `20f3ec6`, `fbc60ea`). Step 3 is on branch `term-core-pointer`.
+  (main `20f3ec6`, `fbc60ea`). Step 3 is on branch `term-core-pointer`,
+  step 4 on `term-core-cells` on top of it.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host, from the owner's question that day: "what else can we refactor
   to minimize divergence and code duplication?"
@@ -103,6 +104,15 @@ three platforms.
    4. **Row to cells:** one walker producing backgrounds, glyph runs,
       fallback icons and placeholder cells. Each renderer turns them into
       its own instances.
+
+      `term/rows.rs` reads a row into each cell's background, its glyphs
+      with their faces, the placeholder runs and the padding's colours;
+      `push_glyphs` and `padding_rects` are shared too. Where the two
+      renderers differed, both now do what tai-gui and Ghostty did: the
+      cursor is drawn into its cell, the character in the background
+      colour on the cursor's (tai covered it with a block), and the
+      padding takes the edge cells' colours (window-padding-color =
+      extend), which tai didn't do.
    5. **Keys:** one encoder path fed with a neutral key event.
 4. **Not in this decision:** drawing `tai` through tai-gui's wgpu
    renderer, so there is one renderer. That would change ADR 0008 and

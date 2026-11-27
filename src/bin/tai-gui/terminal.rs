@@ -25,14 +25,13 @@ use libghostty_vt::{
     kitty::graphics::PlacementIterator,
     mode::Mode,
     render::{CellIterator, Dirty, RenderState, RowIterator},
-    screen::{CellWide, RowSemanticPrompt, Screen},
+    screen::Screen,
     terminal::ScrollViewport,
 };
-use macroquad::color::Color;
 
 use crate::{
     cells::{GlyphAtlas, Instance},
-    fonts::{Coverage, Face, SymbolSpan},
+    fonts::{Coverage, Face},
     gpu::{AtlasUpload, CellFrame, ImageStage, ImageUpload, ImagesHeld},
     pty::{Child, Pty, PtyError},
     selection, shortcuts,
@@ -754,132 +753,45 @@ impl TerminalPane {
                 || cursor_row == Some(row_index);
             if rebuild {
                 let cached = &mut self.rows[index];
+                // The row, read by the terminal core tai shares
+                // (src/term/rows.rs), into this renderer's quads.
+                let on_row = cursor.filter(|&(_, cy)| cy == row_index).map(|(col, _)| {
+                    crate::term::rows::Cursor {
+                        col,
+                        color: cursor_color,
+                    }
+                });
+                cached.read = crate::term::rows::read_row(
+                    row,
+                    &mut self.cell_it,
+                    &colors,
+                    &self.coverage,
+                    on_row,
+                    &mut text,
+                )?;
                 cached.bg.clear();
                 cached.text.clear();
-                cached.edge.clear();
-                let prompt = !matches!(
-                    row.raw_row()?.semantic_prompt(),
-                    Ok(RowSemanticPrompt::None) | Err(_)
-                );
-                let mut extend_cells = Vec::new();
-                // A row with Kitty Unicode placeholders: each cell's
-                // placeholder, or None (src/term/images.rs).
-                let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
-                let mut placeholder_cells = Vec::new();
-                let mut cell_it = self.cell_it.update(row)?;
                 let mut x = PADDING;
-                let mut col: u16 = 0;
-                let mut span = SymbolSpan::default();
-                let mut held: Option<(Glyph, String)> = None;
-                while let Some(cell) = cell_it.next() {
-                    let graphemes = cell.graphemes_len()?;
-                    if graphemes > 0 {
-                        cell.graphemes_utf8(&mut text)?;
-                    }
-                    let grow = span.next((graphemes > 0).then(|| text.chars().next()).flatten());
-                    if let Some((mut glyph, held_text)) = held.take() {
-                        if grow {
-                            glyph.cells = 2;
-                        }
-                        glyph.push(
-                            &mut self.atlas,
-                            &self.coverage,
-                            &mut cached.text,
-                            &held_text,
-                            dims,
-                        );
-                    }
-                    let selected = cell.is_selected()?;
-                    let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-                    let bg = cell.bg_color()?;
-                    extend_cells.push((bg, (graphemes > 0).then(|| text.chars().next()).flatten()));
-                    let mut has_bg = bg.is_some();
-                    let mut bg = bg.unwrap_or(colors.background);
-                    let mut bold = false;
-                    if graphemes > 0 && cell.has_styling()? {
-                        let style = cell.style()?;
-                        if style.inverse {
-                            std::mem::swap(&mut fg, &mut bg);
-                            has_bg = true;
-                        }
-                        bold = style.bold;
-                    }
-                    cached.edge.push(rgba(bg));
-                    // Selected cells are drawn in reverse video, as in the
-                    // macroquad build (walk_row in src/main.rs).
-                    if selected {
-                        std::mem::swap(&mut fg, &mut bg);
-                        has_bg = true;
-                    }
-                    let cell_rect = [x, y, dims.cell_width, dims.cell_height];
-                    if cursor == Some((col, row_index)) {
-                        cached
-                            .bg
-                            .push(Instance::solid(cell_rect, rgba(cursor_color)));
-                        fg = colors.background;
-                    } else if has_bg {
-                        cached.bg.push(Instance::solid(cell_rect, rgba(bg)));
-                    }
-                    // A placeholder cell shows part of an image, drawn with
-                    // the images; its own character has no glyph.
-                    let placeholder = if placeholder_row {
-                        let cell_placeholder = crate::term::images::placeholder_cell(cell)?;
-                        let is = cell_placeholder.is_some();
-                        placeholder_cells.push(cell_placeholder);
-                        is
-                    } else {
-                        false
-                    };
-                    if graphemes > 0 && !placeholder {
-                        // One face for the whole cluster, trimmed to what
-                        // tai draws (see walk_row in src/main.rs).
-                        let face = self.coverage.cluster_face(&mut text);
-                        if face != Face::Blank && !text.is_empty() {
-                            // A wide character is drawn two cells wide, as
-                            // Ghostty's constraintWidth does (src/renderer/
-                            // cell.zig at 521cf2c5). A narrow one from a
-                            // fallback face waits for the next cell, which
-                            // it may take too (`SymbolSpan`).
-                            let wide = cell.raw_cell()?.wide()? == CellWide::Wide;
-                            let glyph = Glyph {
-                                face,
-                                x,
-                                y,
-                                fg: rgba(fg),
-                                bold,
-                                cells: if wide { 2 } else { 1 },
-                            };
-                            if wide || face == Face::Primary {
-                                glyph.push(
-                                    &mut self.atlas,
-                                    &self.coverage,
-                                    &mut cached.text,
-                                    &text,
-                                    dims,
-                                );
-                            } else {
-                                held = Some((glyph, text.clone()));
-                            }
-                        }
+                for bg in &cached.read.bg {
+                    if let Some(bg) = bg {
+                        cached.bg.push(Instance::solid(
+                            [x, y, dims.cell_width, dims.cell_height],
+                            rgba(*bg),
+                        ));
                     }
                     x += dims.cell_width;
-                    col += 1;
                 }
-                if let Some((glyph, text)) = held {
-                    glyph.push(
-                        &mut self.atlas,
-                        &self.coverage,
-                        &mut cached.text,
-                        &text,
-                        dims,
-                    );
-                }
-                cached.extend = extends(prompt, &extend_cells, colors.background);
-                cached.virtual_runs = if placeholder_row {
-                    crate::placeholders::row_placements(placeholder_cells)
-                } else {
-                    Vec::new()
-                };
+                crate::term::rows::push_glyphs(
+                    &mut self.atlas,
+                    &self.coverage,
+                    &mut cached.text,
+                    &cached.read,
+                    y,
+                    dims.cell_width,
+                    dims.baseline,
+                    dims.font_size,
+                    dims.dpi_scale,
+                );
                 row.set_dirty(false)?;
             }
             y += dims.cell_height;
@@ -901,9 +813,16 @@ impl TerminalPane {
             rgba(colors.background),
         ));
         out.extend(
-            padding_rects(&self.rows, dims, rgba(colors.background))
-                .into_iter()
-                .map(|(rect, color)| Instance::solid(rect, color)),
+            crate::term::rows::padding_rects(
+                &self.rows,
+                dims.width,
+                dims.height,
+                dims.cell_width,
+                dims.cell_height,
+                colors.background,
+            )
+            .into_iter()
+            .map(|(rect, color)| Instance::solid(rect, rgba(color))),
         );
         self.bg_start = out.len() as u32;
         for row in &self.rows {
@@ -933,7 +852,12 @@ impl TerminalPane {
             .rows
             .iter()
             .enumerate()
-            .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
+            .flat_map(|(r, row)| {
+                row.read
+                    .virtual_runs
+                    .iter()
+                    .map(move |run| (r as u16, *run))
+            })
             .collect();
         let staged = crate::term::images::frame_draws(
             &self.terminal,
@@ -1091,117 +1015,15 @@ fn draw_badge(ui: &egui::Ui, rect: egui::Rect, text: &str) {
 /// glyphs, kept apart so all backgrounds draw before any text.
 #[derive(Default)]
 struct RowInstances {
+    /// The row as the terminal core read it (src/term/rows.rs).
+    read: crate::term::rows::Row,
     bg: Vec<Instance>,
     text: Vec<Instance>,
-    /// Each cell's background, the default one included, for the padding.
-    edge: Vec<[u8; 4]>,
-    /// Whether the padding above or below may take this row's colours.
-    extend: bool,
-    /// The row's Kitty Unicode placeholder runs (src/placeholders.rs).
-    virtual_runs: Vec<crate::placeholders::Placement>,
 }
 
-/// The padding around the grid in the colours of the nearest cells, as
-/// Ghostty's `window-padding-color = extend` draws it (src/renderer/
-/// generic.zig and shaders.metal at 108cacb1): a full-screen app with its
-/// own background, such as Helix, then fills the pane without a frame in
-/// the terminal's default colour. The sides always take the edge cells'
-/// colours; the top and bottom only when the nearest row allows it
-/// (`extends`). Colours equal to the default `background` are skipped, as
-/// the pane is already that colour.
-fn padding_rects(
-    rows: &[RowInstances],
-    dims: Dimensions,
-    background: [u8; 4],
-) -> Vec<([f32; 4], [u8; 4])> {
-    let (cw, ch) = (dims.cell_width, dims.cell_height);
-    let mut out = Vec::new();
-    // One strip of the padding above or below a row, in runs of one colour.
-    let strip = |edge: &[[u8; 4]], y: f32, h: f32, out: &mut Vec<([f32; 4], [u8; 4])>| {
-        let mut run: Option<(f32, [u8; 4])> = None;
-        for (c, &color) in edge.iter().enumerate() {
-            let start = if c == 0 { 0.0 } else { PADDING + c as f32 * cw };
-            if let Some((x, held)) = run
-                && held != color
-            {
-                out.push(([x, y, start - x, h], held));
-                run = None;
-            }
-            run.get_or_insert((start, color));
-        }
-        if let Some((x, held)) = run {
-            out.push(([x, y, dims.width - x, h], held));
-        }
-    };
-    let mut y = PADDING;
-    for row in rows {
-        if let (Some(&first), Some(&last)) = (row.edge.first(), row.edge.last()) {
-            out.push(([0.0, y, PADDING, ch], first));
-            let right = PADDING + row.edge.len() as f32 * cw;
-            out.push(([right, y, dims.width - right, ch], last));
-        }
-        y += ch;
-    }
-    if let Some(top) = rows.first().filter(|r| r.extend) {
-        strip(&top.edge, 0.0, PADDING, &mut out);
-    }
-    if let Some(bottom) = rows.last().filter(|r| r.extend) {
-        strip(&bottom.edge, y, dims.height - y, &mut out);
-    }
-    out.retain(|(rect, color)| *color != background && rect[2] > 0.0 && rect[3] > 0.0);
-    out
-}
-
-/// Whether the padding may take a row's colours (Ghostty's
-/// `neverExtendBg`, src/renderer/row.zig): not a prompt row, and no cell
-/// with the default background or a powerline glyph, which is drawn to fit
-/// its cell exactly.
-fn extends(prompt: bool, cells: &[(Option<Rgb>, Option<char>)], background: Rgb) -> bool {
-    !prompt
-        && cells.iter().all(|&(bg, first)| {
-            bg.is_some_and(|bg| bg != background) && !first.is_some_and(is_powerline)
-        })
-}
-
-fn is_powerline(c: char) -> bool {
-    matches!(c as u32, 0xE0B0..=0xE0C8 | 0xE0CA | 0xE0CC..=0xE0D2 | 0xE0D4)
-}
-
-/// Where and how one cell's glyph is drawn.
-struct Glyph {
-    face: Face,
-    x: f32,
-    y: f32,
-    fg: [u8; 4],
-    bold: bool,
-    /// How many cells it spans: 2 for a wide cell, or a narrow symbol that
-    /// takes the next cell (`SymbolSpan`).
-    cells: u8,
-}
-
-impl Glyph {
-    fn push(
-        &self,
-        atlas: &mut GlyphAtlas,
-        coverage: &Coverage,
-        out: &mut Vec<Instance>,
-        text: &str,
-        dims: Dimensions,
-    ) {
-        let place = coverage.place(self.face, dims.font_size, self.cells);
-        let fg = self.fg;
-        atlas.push_text(
-            out,
-            coverage.font(self.face),
-            self.face,
-            text,
-            self.x,
-            self.y + dims.baseline - place.rise,
-            place.font_size,
-            dims.dpi_scale,
-            Color::from_rgba(fg[0], fg[1], fg[2], fg[3]),
-            self.bold,
-        );
+impl AsRef<crate::term::rows::Row> for RowInstances {
+    fn as_ref(&self) -> &crate::term::rows::Row {
+        &self.read
     }
 }
 
@@ -1349,52 +1171,6 @@ fn key_for(k: egui::Key) -> Option<(Key, char)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A full-screen app's background reaches the pane's edges (Ghostty's
-    /// `window-padding-color = extend`); a shell's default one doesn't
-    /// draw, and a row with a default cell keeps the top or bottom plain.
-    #[test]
-    fn the_padding_takes_the_edge_cells_colours() {
-        let dims = Dimensions {
-            width: 2.0 * PADDING + 30.0 + 4.0,
-            height: 2.0 * PADDING + 40.0 + 7.0,
-            cell_width: 10.0,
-            cell_height: 20.0,
-            baseline: 15.0,
-            font_size: 13,
-            dpi_scale: 1.0,
-        };
-        let (bg, a, b) = ([0, 0, 0, 255], [1, 1, 1, 255], [2, 2, 2, 255]);
-        let row = |edge: [[u8; 4]; 3], extend| RowInstances {
-            edge: edge.to_vec(),
-            extend,
-            ..Default::default()
-        };
-        let p = PADDING;
-        let right = p + 30.0;
-        // Top: a, a, b in two runs; bottom row has a default cell.
-        let rows = [row([a, a, b], true), row([b, a, bg], false)];
-        assert_eq!(
-            padding_rects(&rows, dims, bg),
-            vec![
-                ([0.0, p, p, 20.0], a),
-                ([right, p, p + 4.0, 20.0], b),
-                ([0.0, p + 20.0, p, 20.0], b),
-                ([0.0, 0.0, p + 20.0, p], a),
-                ([p + 20.0, 0.0, dims.width - p - 20.0, p], b),
-            ]
-        );
-        let shell = [row([bg, bg, bg], false), row([bg, bg, bg], false)];
-        assert!(padding_rects(&shell, dims, bg).is_empty());
-
-        let black = Rgb { r: 0, g: 0, b: 0 };
-        let blue = Some(Rgb { r: 0, g: 0, b: 9 });
-        assert!(extends(false, &[(blue, None), (blue, Some('x'))], black));
-        assert!(!extends(true, &[(blue, None)], black), "a prompt row");
-        assert!(!extends(false, &[(blue, None), (None, None)], black));
-        assert!(!extends(false, &[(Some(black), None)], black));
-        assert!(!extends(false, &[(blue, Some('\u{e0b0}'))], black));
-    }
 
     /// tai's shell integration reports the folder with OSC 7, which the
     /// terminal keeps for `folder`. Unix only, like `reported_dir`'s test.
