@@ -36,9 +36,12 @@ egui_dock = { version = "0.21.1", optional = true }
 # checked against the OS's certificate store. =3.4.2 because 3.4.3 and
 # 3.5.0 are under two weeks old.
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
-# Images in answers: PNG, JPEG, GIF and WebP only, decoded in Rust under
-# size limits (images.rs). The version already in the lock file.
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
+# One image crate for everything (ADR 0014, step 2): Kitty images in the
+# terminal decode PNG through it in both binaries (src/term/images.rs), the
+# vendored macroquad uses it (vendor/macroquad/TAI-PATCHES.md, patch 5), and
+# the `gui` feature adds JPEG, GIF and WebP for images in answers
+# (src/bin/tai-gui/images.rs). The version eframe already brings in.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 # Checks web image URLs before they're fetched (images.rs).
 url = { version = "2.5.8", optional = true }
 serde_json = { version = "1.0.154", optional = true }
@@ -60,7 +63,9 @@ gui = [
     "dep:eframe",
     "dep:egui_dock",
     "dep:ureq",
-    "dep:image",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
     "dep:url",
     "dep:serde_json",
     "dep:getrandom",

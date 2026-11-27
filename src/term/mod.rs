@@ -3,4 +3,5 @@
 //! end's window, toolkit events and GPU calls. tai builds it as `mod term`,
 //! tai-gui through `#[path]`.
 
+pub mod images;
 pub mod setup;
