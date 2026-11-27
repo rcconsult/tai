@@ -1474,9 +1474,9 @@ fn encoder_size(dims: Dimensions) -> mouse::EncoderSize {
     }
 }
 
-/// One wheel event's travel in points, up positive. A line is a row; on
-/// macOS a slow wheel click comes as a tenth of a line, so a line event
-/// counts as at least one, as Ghostty does.
+/// One wheel event's travel in points, up positive. A line is WHEEL_ROWS
+/// rows; on macOS a slow wheel click comes as a tenth of a line, so a line
+/// event counts as at least one, as Ghostty does.
 fn wheel_points(unit: egui::MouseWheelUnit, y: f32, cell: f32, page: f32) -> f32 {
     match unit {
         egui::MouseWheelUnit::Point => y,
