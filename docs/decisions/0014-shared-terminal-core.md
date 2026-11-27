@@ -1,7 +1,7 @@
 # ADR 0014: One terminal core for tai and tai-gui, under `src/term/`
 
-- **Status:** Accepted 2026-11-27 (owner). Step 1 is on branch
-  `term-core-setup`, step 2 on `term-core-images` on top of it.
+- **Status:** Accepted 2026-11-27 (owner). Steps 1 and 2 are merged
+  (main `20f3ec6`, `fbc60ea`). Step 3 is on branch `term-core-pointer`.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host, from the owner's question that day: "what else can we refactor
   to minimize divergence and code duplication?"
@@ -89,6 +89,17 @@ three platforms.
    3. **Mouse, selection and wheel** (`term/pointer.rs`): one state
       machine fed with neutral button, position, modifier and wheel
       events.
+
+      The two front ends had drifted in eight places; the core takes one
+      rule for each: a release goes to the program only after its press
+      did; presses off the pane aren't the program's; the wheel to a
+      tracking program clears a Shift-selection and reports the pointer,
+      one press per row even within a cell; alternate scroll clears the
+      selection; no motion reaches the program while Shift is held; the
+      pane's last pixel row autoscrolls down as its first does up; and the
+      pointer shows a crosshair for a rectangle and an arrow off the grid.
+      A drag released in the frame it last moved now ends where it was
+      released.
    4. **Row to cells:** one walker producing backgrounds, glyph runs,
       fallback icons and placeholder cells. Each renderer turns them into
       its own instances.

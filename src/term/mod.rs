@@ -4,6 +4,7 @@
 //! tai-gui through `#[path]`.
 
 pub mod images;
+pub mod pointer;
 pub mod setup;
 
 /// The space between a pane's edge and its first cell, in logical units,
