@@ -134,6 +134,8 @@ mod platform {
     thread_local! {
         /// The system fallback, made once per thread: DirectWrite's COM
         /// objects aren't `Send`. `None` if DirectWrite couldn't give one.
+        // SAFETY: plain COM calls with no pointer arguments; the results
+        // are owned interface handles.
         static FALLBACK: Option<IDWriteFontFallback> = unsafe {
             DWriteCreateFactory::<IDWriteFactory2>(DWRITE_FACTORY_TYPE_SHARED)
                 .and_then(|factory| factory.GetSystemFontFallback())
@@ -146,6 +148,8 @@ mod platform {
     fn user_locale() -> Vec<u16> {
         // LOCALE_NAME_MAX_LENGTH, including the NUL.
         let mut name = [0u16; 85];
+        // SAFETY: the slice is LOCALE_NAME_MAX_LENGTH long, and the call
+        // writes at most that many u16s.
         let len = unsafe { GetUserDefaultLocaleName(&mut name) };
         if len <= 0 {
             return vec![0];
@@ -168,6 +172,8 @@ mod platform {
             let mut mapped_len = 0;
             let mut font: Option<IDWriteFont> = None;
             let mut scale = 0.0;
+            // SAFETY: `source` and the out-parameters are locals that live
+            // for the call; `len` doesn't exceed the source's text.
             unsafe {
                 fallback.MapCharacters(
                     &source,
@@ -189,6 +195,7 @@ mod platform {
         })?;
         // MapCharacters falls back to some font even for a character no
         // font has.
+        // SAFETY: a COM call on an owned font, with no pointers.
         if !unsafe { font.HasCharacter(ch as u32) }.ok()?.as_bool() {
             return None;
         }
@@ -198,6 +205,10 @@ mod platform {
     /// The file and face index behind `font`. `None` for a font that isn't
     /// a local file, such as one DirectWrite would download.
     fn file_of(font: &IDWriteFont) -> Option<FontFile> {
+        // SAFETY: `files` holds `count` slots, as GetFiles was told; `key`
+        // and `key_size` come from the file and are only passed back to its
+        // own loader while `file` keeps them alive; `path` has room for the
+        // reported length plus its NUL.
         unsafe {
             let face = font.CreateFontFace().ok()?;
             let mut count = 0;

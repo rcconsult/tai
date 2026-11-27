@@ -10,10 +10,13 @@ embeddable terminal library). It runs on Linux, macOS and Windows 11.
   it runs `pwsh.exe` from `PATH`, or else `%COMSPEC%`, or else `cmd.exe`.
 - `tai-gui` (milestone (b), early): tab stacks with a terminal pane and
   a chat pane that talks to ppxai's engine
-  ([ADR 0011](docs/decisions/0011-native-gui-egui.md)). Chat is one-shot
-  for now: each prompt stands alone and the answer doesn't stream.
-  Streaming chat, agent runs, document previews and workspace tabs are
-  still to come.
+  ([ADR 0011](docs/decisions/0011-native-gui-egui.md)). The chat streams
+  ppxai's answers, with interrupt, consent prompts, ppxai's slash
+  commands (Tab completes them), a context meter and tool-step progress.
+  A preview pane shows the runs that `/run` and `/task` start, with their
+  sources, consent card and Resume. `/edit` opens a file in an editor in
+  a new terminal tab, and `/show` opens a text file in a viewer tab.
+  Workspace tabs are still to come.
 
 [ADR 0001](docs/decisions/0001-stack-rust-libghostty-vt-ppxai-server.md)
 explains the stack.
@@ -24,7 +27,8 @@ explains the stack.
 scripts/cargo.sh run --release
 ```
 
-Always go through `scripts/cargo.sh`. On first use it fetches the Zig
+It needs Rust 1.96 or newer, which the pinned `libghostty-vt` crate
+requires. Always go through `scripts/cargo.sh`. On first use it fetches the Zig
 version that the pinned Ghostty needs, plus the Ghostty source, into
 `.local/`. The first build takes a few minutes.
 
@@ -41,7 +45,7 @@ To run `tai-gui`:
 scripts/cargo.sh run --release --features gui --bin tai-gui
 ```
 
-It needs Rust 1.95 or newer and ppxai 1.19.5 or newer, whose
+It needs ppxai 1.19.5 or newer, whose
 `ppxai-server --owned` it starts itself. 1.19.5 isn't released yet, so
 for now that means a build of ppxai's `feature/v1.19.5` branch. It looks
 for `ppxai-server` on `TAI_PPXAI_SERVER`, then on `PATH`, then in
