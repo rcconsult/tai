@@ -10,10 +10,10 @@
 //! 3. While reading a row, keep each cell's `placeholder_cell` on a row that
 //!    has Unicode placeholders, and turn them into runs with
 //!    `crate::placeholders::row_placements`.
-//! 4. Each frame, draw `placement_draws` for `Layer::BELOW_BACKGROUND`
-//!    before the cell backgrounds, for `Layer::BELOW_TEXT` (with
-//!    `placeholder_draws`) before the glyphs, and for `Layer::ABOVE_TEXT`
-//!    after them, each image's pixels from `pixels`.
+//! 4. Each frame, take `frame_draws` and draw each `Stage` at its place:
+//!    `BelowBackground` before the cell backgrounds, `BelowText` before the
+//!    glyphs, `AboveText` after them, each image's pixels from `pixels`
+//!    through a `TextureCache`.
 
 use libghostty_vt::{
     Terminal,
@@ -23,7 +23,7 @@ use libghostty_vt::{
     style::StyleColor,
 };
 
-use crate::placeholders;
+use crate::{placeholders, term::PADDING};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -31,18 +31,21 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const STORAGE_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// Install the PNG decoder Kitty images need. It's process-global, so it
-/// goes before any terminal is created.
+/// goes before any terminal is created. If it can't be installed, the
+/// terminal still works, without PNG images, so both front ends log it and
+/// go on.
 ///
 /// # Safety
 ///
 /// No terminal may exist yet, and no other thread may call libghostty-vt
 /// (its types are `!Send`, and tai's pty threads never touch them).
 #[allow(unsafe_code)]
-pub unsafe fn install_png_decoder() -> Result<()> {
+pub unsafe fn install_png_decoder() {
     // SAFETY: the caller promises no terminal exists and no other thread
     // calls libghostty-vt.
-    unsafe { graphics::set_png_decoder(Some(Box::new(PngDecoder))) }?;
-    Ok(())
+    if let Err(e) = unsafe { graphics::set_png_decoder(Some(Box::new(PngDecoder))) } {
+        tracing::warn!("Kitty images: no PNG decoder ({e}); PNG images won't draw");
+    }
 }
 
 /// PNG to RGBA8 with the `image` crate, the one version both binaries
@@ -83,15 +86,52 @@ pub fn enable(terminal: &mut Terminal<'_, '_>) -> Result<()> {
     Ok(())
 }
 
-/// Where the grid is: its cell size in logical units, the scale to
-/// physical pixels (the protocol's unit), and the padding before the first
-/// cell.
+/// The grid's cell size in logical units, and the scale to physical pixels
+/// (the protocol's unit). The grid starts after `PADDING`.
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub cell_width: f32,
     pub cell_height: f32,
     pub dpi_scale: f32,
-    pub padding: f32,
+}
+
+/// Where an image draws among the cells, as its Kitty z layer says, in
+/// drawing order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Before the cell backgrounds.
+    BelowBackground,
+    /// Before the glyphs; Unicode placeholder images draw here too.
+    BelowText,
+    /// After the glyphs.
+    AboveText,
+}
+
+/// Every image the frame draws, in order, each with its stage: the three
+/// Kitty layers' placements and the slices that `runs` (Unicode
+/// placeholder runs, each with its viewport row) show. Both front ends draw
+/// from this one list, so the layers and their order can't differ.
+pub fn frame_draws<'t>(
+    terminal: &'t Terminal<'_, '_>,
+    placement_it: &mut PlacementIterator<'_>,
+    graphics: &Graphics<'t>,
+    runs: &[(u16, placeholders::Placement)],
+    geometry: Geometry,
+) -> Result<Vec<(Stage, Draw)>> {
+    let mut out = Vec::new();
+    for (stage, layer) in [
+        (Stage::BelowBackground, Layer::BELOW_BACKGROUND),
+        (Stage::BelowText, Layer::BELOW_TEXT),
+        (Stage::AboveText, Layer::ABOVE_TEXT),
+    ] {
+        let draws = placement_draws(terminal, placement_it, graphics, layer, geometry)?;
+        out.extend(draws.into_iter().map(|d| (stage, d)));
+        if stage == Stage::BelowText {
+            let draws = placeholder_draws(placement_it, graphics, runs, geometry)?;
+            out.extend(draws.into_iter().map(|d| (stage, d)));
+        }
+    }
+    Ok(out)
 }
 
 /// A rectangle in logical units (`dest`) or image pixels (`source`).
@@ -183,6 +223,31 @@ impl<T> TextureCache<T> {
         (&mut entry.1, fresh)
     }
 
+    // `get`, `has` and `generations` serve a front end that makes textures
+    // apart from where it learns the frame's images: tai-gui's GPU side,
+    // which can lack an image's pixels for a frame. tai makes and draws in
+    // one place, so it doesn't call them.
+
+    /// The texture for image `id`, if there is one.
+    #[allow(dead_code)]
+    pub fn get(&self, id: u32) -> Option<&T> {
+        self.entries.get(&id).map(|(_, texture, _)| texture)
+    }
+
+    /// Whether there's a texture for image `id` at `generation`.
+    #[allow(dead_code)]
+    pub fn has(&self, id: u32, generation: u64) -> bool {
+        matches!(self.entries.get(&id), Some((g, _, _)) if *g == generation)
+    }
+
+    /// The images there are textures for, with their generations.
+    #[allow(dead_code)]
+    pub fn generations(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.entries
+            .iter()
+            .map(|(id, (generation, _, _))| (*id, *generation))
+    }
+
     /// After a frame: drop the textures it didn't draw, and return their
     /// image ids.
     pub fn end_frame(&mut self) -> Vec<u32> {
@@ -208,7 +273,7 @@ impl<T> TextureCache<T> {
 /// top (`src/renderer/image.zig`, `sortUnstable` and `Id.zLessThan`,
 /// a887df42). Virtual placements (Unicode placeholders) aren't here; they
 /// come from `placeholder_draws`.
-pub fn placement_draws<'t>(
+fn placement_draws<'t>(
     terminal: &'t Terminal<'_, '_>,
     placement_it: &mut PlacementIterator<'_>,
     graphics: &Graphics<'t>,
@@ -250,10 +315,8 @@ pub fn placement_draws<'t>(
                     h: info.source_height as f32,
                 },
                 dest: Rect {
-                    x: geometry.padding + info.viewport_col as f32 * geometry.cell_width + x_offset,
-                    y: geometry.padding
-                        + info.viewport_row as f32 * geometry.cell_height
-                        + y_offset,
+                    x: PADDING + info.viewport_col as f32 * geometry.cell_width + x_offset,
+                    y: PADDING + info.viewport_row as f32 * geometry.cell_height + y_offset,
                     w: info.grid_cols as f32 * geometry.cell_width,
                     h: info.grid_rows as f32 * geometry.cell_height,
                 },
@@ -300,7 +363,7 @@ fn id_color(c: StyleColor) -> placeholders::IdColor {
 /// its viewport row. Each run's image and grid come from its virtual
 /// placement; the slice and its position are worked out as in Ghostty
 /// (`src/placeholders.rs`).
-pub fn placeholder_draws(
+fn placeholder_draws(
     placement_it: &mut PlacementIterator<'_>,
     graphics: &Graphics<'_>,
     runs: &[(u16, placeholders::Placement)],
@@ -353,12 +416,8 @@ pub fn placeholder_draws(
                 h: slice.source_height as f32,
             },
             dest: Rect {
-                x: geometry.padding
-                    + f32::from(run.x) * geometry.cell_width
-                    + slice.offset_x as f32 / scale,
-                y: geometry.padding
-                    + f32::from(*row) * geometry.cell_height
-                    + slice.offset_y as f32 / scale,
+                x: PADDING + f32::from(run.x) * geometry.cell_width + slice.offset_x as f32 / scale,
+                y: PADDING + f32::from(*row) * geometry.cell_height + slice.offset_y as f32 / scale,
                 w: slice.dest_width as f32 / scale,
                 h: slice.dest_height as f32 / scale,
             },
@@ -388,8 +447,13 @@ mod tests {
         // New data: made again.
         assert_eq!(cache.texture(7, 2, || make(&mut made)), (&mut 2, true));
         assert!(cache.end_frame().is_empty());
+        // What a front end that uploads apart asks.
+        assert!(cache.has(7, 2) && !cache.has(7, 1) && !cache.has(8, 2));
+        assert_eq!(cache.get(7), Some(&2));
+        assert_eq!(cache.generations().collect::<Vec<_>>(), vec![(7, 2)]);
         // A frame that doesn't draw it drops it.
         assert_eq!(cache.end_frame(), vec![7]);
+        assert_eq!(cache.get(7), None);
         assert_eq!(cache.texture(7, 2, || make(&mut made)), (&mut 3, true));
     }
 
@@ -408,7 +472,6 @@ mod tests {
             cell_width: 10.0,
             cell_height: 20.0,
             dpi_scale: 1.0,
-            padding: 6.0,
         };
         let draws = placement_draws(&term, &mut it, &graphics, Layer::all(), geometry).unwrap();
         let ids: Vec<u32> = draws.iter().map(|d| d.image_id).collect();

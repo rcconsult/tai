@@ -36,7 +36,7 @@ use libghostty_vt::{
     Terminal, build_info,
     color::Rgb,
     key::{self, Key},
-    kitty::graphics::{Graphics, Layer, PlacementIterator},
+    kitty::graphics::{Graphics, PlacementIterator},
     mode::Mode,
     mouse,
     point::{Coordinate, Point},
@@ -140,8 +140,9 @@ fn present_material() -> Result<Material> {
 // so feel free to tweak and tune these settings to your liking :)
 // ---------------------------------------------------------------------------
 
-/// Small padding from window edges
-const PADDING: f32 = 6.0;
+// The padding from the window's edges is the terminal core's, shared with
+// tai-gui (src/term/mod.rs).
+use crate::term::PADDING;
 
 /// Rows one notch of a mouse wheel scrolls, Ghostty's default discrete
 /// mouse-scroll-multiplier.
@@ -303,7 +304,9 @@ async fn main() -> Result<()> {
     // SAFETY: the pty's reader thread never calls libghostty (its types are
     // !Send), and no terminal exists yet.
     #[allow(unsafe_code)]
-    unsafe { term::images::install_png_decoder() }?;
+    unsafe {
+        term::images::install_png_decoder()
+    };
 
     // Create a ghostty virtual terminal with the computed grid, with the
     // options tai and tai-gui share (src/term/setup.rs). It holds all the
@@ -823,17 +826,35 @@ impl<'alloc> Renderer<'alloc> {
         }
         rows.truncate(row_index);
 
+        // Every image this frame draws, with its stage (src/term/images.rs).
+        let image_draws = match graphics.as_ref() {
+            Some(graphics) => {
+                let virtual_runs: Vec<(u16, placeholders::Placement)> = rows
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
+                    .collect();
+                term::images::frame_draws(
+                    terminal,
+                    &mut self.placement_it,
+                    graphics,
+                    &virtual_runs,
+                    image_geometry(dims),
+                )?
+            }
+            None => Vec::new(),
+        };
+        let mut draw_stage = |stage: term::images::Stage| -> Result<()> {
+            match graphics.as_ref() {
+                Some(graphics) => {
+                    Self::draw_images(&mut self.image_textures, graphics, &image_draws, stage)
+                }
+                None => Ok(()),
+            }
+        };
+
         clear_background(color(colors.background));
-        if let Some(graphics) = graphics.as_ref() {
-            Self::render_kitty_images(
-                terminal,
-                &mut self.placement_it,
-                &mut self.image_textures,
-                graphics,
-                Layer::BELOW_BACKGROUND,
-                dims,
-            )?
-        }
+        draw_stage(term::images::Stage::BelowBackground)?;
 
         // Backgrounds: one texel per cell, stretched over the grid with
         // nearest filtering, as Ghostty's cell_bg pass looks up each pixel's
@@ -873,6 +894,11 @@ impl<'alloc> Renderer<'alloc> {
             );
         }
 
+        // Images below the text, Unicode placeholder images among them, go
+        // before the glyphs, as in Ghostty and tai-gui. The text pass
+        // flushes macroquad's batch first (cells.rs), so they're under it.
+        draw_stage(term::images::Stage::BelowText)?;
+
         instances.clear();
         for row in rows.iter() {
             instances.extend_from_slice(&row.text);
@@ -883,31 +909,6 @@ impl<'alloc> Renderer<'alloc> {
             camera.matrix(),
             Some(frame.target.render_pass.raw_miniquad_id()),
         );
-
-        if let Some(graphics) = graphics.as_ref() {
-            Self::render_kitty_images(
-                terminal,
-                &mut self.placement_it,
-                &mut self.image_textures,
-                graphics,
-                Layer::BELOW_TEXT,
-                dims,
-            )?;
-            let virtual_runs: Vec<(u16, placeholders::Placement)> = rows
-                .iter()
-                .enumerate()
-                .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
-                .collect();
-            if !virtual_runs.is_empty() {
-                Self::render_virtual_placements(
-                    &mut self.placement_it,
-                    &mut self.image_textures,
-                    graphics,
-                    &virtual_runs,
-                    dims,
-                )?;
-            }
-        }
 
         if let Some((x, y)) = cursor {
             let cursor_color = colors.cursor.unwrap_or(colors.foreground);
@@ -920,16 +921,7 @@ impl<'alloc> Renderer<'alloc> {
             );
         }
 
-        if let Some(graphics) = graphics.as_ref() {
-            Self::render_kitty_images(
-                terminal,
-                &mut self.placement_it,
-                &mut self.image_textures,
-                graphics,
-                Layer::ABOVE_TEXT,
-                dims,
-            )?
-        }
+        draw_stage(term::images::Stage::AboveText)?;
 
         // Textures of images this frame didn't draw go.
         self.image_textures.end_frame();
@@ -997,47 +989,15 @@ impl<'alloc> Renderer<'alloc> {
         gl_use_default_material();
     }
 
-    /// Draw the image slices that Unicode placeholder runs show; where
-    /// each goes is worked out in src/term/images.rs.
-    fn render_virtual_placements(
-        placement_it: &mut PlacementIterator<'_>,
-        textures: &mut term::images::TextureCache<Texture2D>,
-        graphics: &Graphics<'_>,
-        runs: &[(u16, placeholders::Placement)],
-        dims: Dimensions,
-    ) -> Result<()> {
-        let draws =
-            term::images::placeholder_draws(placement_it, graphics, runs, image_geometry(dims))?;
-        Self::draw_images(textures, graphics, &draws)
-    }
-
-    /// Draw one layer's image placements (src/term/images.rs).
-    fn render_kitty_images<'t>(
-        terminal: &'t Terminal<'_, '_>,
-        placement_it: &mut PlacementIterator<'_>,
-        textures: &mut term::images::TextureCache<Texture2D>,
-        graphics: &Graphics<'t>,
-        layer: Layer,
-        dims: Dimensions,
-    ) -> Result<()> {
-        let draws = term::images::placement_draws(
-            terminal,
-            placement_it,
-            graphics,
-            layer,
-            image_geometry(dims),
-        )?;
-        Self::draw_images(textures, graphics, &draws)
-    }
-
-    /// Draw images from their textures, made when an image is new or its
-    /// data changed.
+    /// Draw one stage's images from their textures, made when an image is
+    /// new or its data changed.
     fn draw_images(
         textures: &mut term::images::TextureCache<Texture2D>,
         graphics: &Graphics<'_>,
-        draws: &[term::images::Draw],
+        draws: &[(term::images::Stage, term::images::Draw)],
+        stage: term::images::Stage,
     ) -> Result<()> {
-        for draw in draws {
+        for (_, draw) in draws.iter().filter(|(s, _)| *s == stage) {
             let Some(pixels) = term::images::pixels(graphics, draw.image_id)? else {
                 continue;
             };
@@ -1264,7 +1224,6 @@ fn image_geometry(dims: Dimensions) -> term::images::Geometry {
         cell_width: dims.cell_width,
         cell_height: dims.cell_height,
         dpi_scale: dims.dpi_scale,
-        padding: PADDING,
     }
 }
 

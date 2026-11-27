@@ -1032,9 +1032,7 @@ fn main() -> eframe::Result {
     // process-global, so it goes before any terminal is created.
     // SAFETY: no terminal exists yet, and only this thread uses
     // libghostty-vt (its types are !Send; the pty threads never touch it).
-    if let Err(e) = unsafe { term::images::install_png_decoder() } {
-        tracing::warn!("PNG decoder for Kitty images: {e}");
-    }
+    unsafe { term::images::install_png_decoder() };
 
     let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,

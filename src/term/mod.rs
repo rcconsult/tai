@@ -5,3 +5,7 @@
 
 pub mod images;
 pub mod setup;
+
+/// The space between a pane's edge and its first cell, in logical units,
+/// in both front ends.
+pub const PADDING: f32 = 6.0;

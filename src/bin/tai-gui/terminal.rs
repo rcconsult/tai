@@ -22,7 +22,7 @@ use libghostty_vt::{
     color::Rgb,
     effect::SemanticPromptKind,
     key::{self, Key},
-    kitty::graphics::{Layer, PlacementIterator},
+    kitty::graphics::PlacementIterator,
     mode::Mode,
     mouse,
     point::{Coordinate, Point},
@@ -38,15 +38,17 @@ use macroquad::color::Color;
 use crate::{
     cells::{GlyphAtlas, Instance},
     fonts::{Coverage, Face, SymbolSpan},
-    gpu::{AtlasUpload, CellFrame, ImageData, ImageStage},
+    gpu::{AtlasUpload, CellFrame, ImageStage, ImageUpload, ImagesHeld},
     pty::{Child, Pty, PtyError},
     selection, shortcuts,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Space between the pane's edge and the grid, as in the macroquad build.
-const PADDING: f32 = 6.0;
+// Space between the pane's edge and the grid: the terminal core's, shared
+// with tai (src/term/mod.rs).
+use crate::term::PADDING;
+
 /// Space added to the glyph height for each row, as in the macroquad build.
 const ROW_GAP: f32 = 12.0;
 /// How long one frame may spend feeding pty output to the terminal; it
@@ -176,7 +178,7 @@ pub struct TerminalPane {
     /// Kitty images (src/term/images.rs): placements, and each drawn
     /// image's pixels, copied once per generation for the GPU side.
     placement_it: PlacementIterator<'static>,
-    image_pixels: crate::term::images::TextureCache<Arc<Vec<u8>>>,
+    images_held: ImagesHeld,
     /// Translates Sixel in the pty's output into Kitty images (ADR 0006).
     sixel: crate::sixel::Translator,
     built_for: Option<(Dimensions, Option<(u16, u16)>)>,
@@ -330,7 +332,7 @@ impl TerminalPane {
             bg_start: 0,
             text_start: 0,
             placement_it: PlacementIterator::new()?,
-            image_pixels: Default::default(),
+            images_held: Default::default(),
             sixel: crate::sixel::Translator::new(),
             built_for: None,
             rows: Vec::new(),
@@ -654,7 +656,7 @@ impl TerminalPane {
                     .to_vec(),
             }
         });
-        let (images, image_data) = self.image_frame().unwrap_or_else(|e| {
+        let (images, image_uploads) = self.image_frame().unwrap_or_else(|e| {
             tracing::warn!("images: {e}");
             Default::default()
         });
@@ -669,7 +671,8 @@ impl TerminalPane {
                     bg_start: self.bg_start,
                     text_start: self.text_start,
                     images,
-                    image_data,
+                    image_uploads,
+                    images_held: Arc::clone(&self.images_held),
                 },
             ));
         if let Some(badge) = &self.badge {
@@ -1270,10 +1273,10 @@ impl TerminalPane {
         Ok(true)
     }
 
-    /// This frame's Kitty images, in drawing order, and the pixels of each:
-    /// what src/term/images.rs works out, as tai draws it.
+    /// This frame's Kitty images in drawing order (src/term/images.rs), and
+    /// the pixels of those the GPU side holds no texture for.
     #[allow(clippy::type_complexity)]
-    fn image_frame(&mut self) -> Result<(Vec<(ImageStage, u32, Instance)>, Vec<ImageData>)> {
+    fn image_frame(&mut self) -> Result<(Vec<(ImageStage, u32, u64, Instance)>, Vec<ImageUpload>)> {
         let Some(graphics) = self.terminal.kitty_graphics()? else {
             return Ok(Default::default());
         };
@@ -1281,7 +1284,6 @@ impl TerminalPane {
             cell_width: self.dims.cell_width,
             cell_height: self.dims.cell_height,
             dpi_scale: self.dims.dpi_scale,
-            padding: PADDING,
         };
         let runs: Vec<(u16, crate::placeholders::Placement)> = self
             .rows
@@ -1289,62 +1291,45 @@ impl TerminalPane {
             .enumerate()
             .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
             .collect();
-        let mut staged = Vec::new();
-        for (stage, layer) in [
-            (ImageStage::BelowBackground, Layer::BELOW_BACKGROUND),
-            (ImageStage::BelowText, Layer::BELOW_TEXT),
-            (ImageStage::AboveText, Layer::ABOVE_TEXT),
-        ] {
-            let draws = crate::term::images::placement_draws(
-                &self.terminal,
-                &mut self.placement_it,
-                &graphics,
-                layer,
-                geometry,
-            )?;
-            staged.extend(draws.into_iter().map(|d| (stage, d)));
-            // Placeholder images draw with the layer below the text, as
-            // in tai.
-            if stage == ImageStage::BelowText {
-                let draws = crate::term::images::placeholder_draws(
-                    &mut self.placement_it,
-                    &graphics,
-                    &runs,
-                    geometry,
-                )?;
-                staged.extend(draws.into_iter().map(|d| (stage, d)));
-            }
-        }
+        let staged = crate::term::images::frame_draws(
+            &self.terminal,
+            &mut self.placement_it,
+            &graphics,
+            &runs,
+            geometry,
+        )?;
+        let held = self
+            .images_held
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default();
         let mut images = Vec::with_capacity(staged.len());
-        let mut data: Vec<ImageData> = Vec::new();
+        let mut uploads: Vec<ImageUpload> = Vec::new();
         for (stage, draw) in staged {
             let Some(pixels) = crate::term::images::pixels(&graphics, draw.image_id)? else {
                 continue;
             };
-            let (rgba, _) = self
-                .image_pixels
-                .texture(draw.image_id, pixels.generation, || {
-                    Arc::new(pixels.data.to_vec())
-                });
-            if !data.iter().any(|d| d.id == draw.image_id) {
-                data.push(ImageData {
+            if held.get(&draw.image_id) != Some(&pixels.generation)
+                && !uploads.iter().any(|u| u.id == draw.image_id)
+            {
+                uploads.push(ImageUpload {
                     id: draw.image_id,
                     generation: pixels.generation,
                     size: (pixels.width, pixels.height),
-                    rgba: Arc::clone(rgba),
+                    rgba: pixels.data.to_vec(),
                 });
             }
             images.push((
                 stage,
                 draw.image_id,
+                pixels.generation,
                 Instance::textured(
                     [draw.dest.x, draw.dest.y, draw.dest.w, draw.dest.h],
                     [draw.source.x, draw.source.y, draw.source.w, draw.source.h],
                 ),
             ));
         }
-        self.image_pixels.end_frame();
-        Ok((images, data))
+        Ok((images, uploads))
     }
 
     fn handle_event(&mut self, event: &egui::Event, held: egui::Modifiers) -> Result<()> {
