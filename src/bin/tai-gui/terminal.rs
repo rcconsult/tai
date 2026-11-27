@@ -28,7 +28,9 @@ use libghostty_vt::{
     render::{CellIterator, Dirty, RenderState, RowIterator},
     report::SizeReportSize,
     screen::{CellWide, RowSemanticPrompt, Screen},
-    selection::gesture::{DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent},
+    selection::gesture::{
+        Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
+    },
     terminal::ScrollViewport,
 };
 use macroquad::color::Color;
@@ -56,6 +58,11 @@ const PARSE_BUDGET: Duration = Duration::from_millis(14);
 /// the same frame, as the macroquad build's ECHO_WAIT does. Without it a
 /// keystroke took two frames (popos-tai's typing-lag probe).
 const ECHO_WAIT: Duration = Duration::from_millis(4);
+
+/// How often a selection drag past the pane's top or bottom scrolls one
+/// row, as Ghostty's `selection_scroll_ms` (src/termio/Thread.zig at
+/// 108cacb1).
+const AUTOSCROLL_EVERY: Duration = Duration::from_millis(15);
 
 /// The pane's size and cell metrics. The pty modules size the pseudo
 /// terminal from it (`crate::Dimensions`).
@@ -174,6 +181,10 @@ pub struct TerminalPane {
     press: PressEvent<'static>,
     release: ReleaseEvent<'static>,
     drag: DragEvent<'static>,
+    autoscroll: AutoscrollTickEvent<'static>,
+    /// When the last autoscroll tick ran, while a drag past the pane's
+    /// top or bottom scrolls it.
+    last_autoscroll: Option<Instant>,
     /// Gesture times count from here.
     epoch: Instant,
     /// Whether a press in the pane started a selection drag.
@@ -328,6 +339,8 @@ impl TerminalPane {
             },
             release: ReleaseEvent::new()?,
             drag: DragEvent::new()?,
+            autoscroll: AutoscrollTickEvent::new()?,
+            last_autoscroll: None,
             epoch: Instant::now(),
             selecting: false,
             selection_changed: false,
@@ -587,6 +600,16 @@ impl TerminalPane {
                     let lines = (scroll / self.dims.cell_height).round() as isize;
                     if lines != 0 {
                         self.terminal.scroll_viewport(ScrollViewport::Delta(-lines));
+                        // A drag in progress follows the scroll: the cell
+                        // under the resting pointer is a different one now.
+                        if self.selecting
+                            && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
+                        {
+                            let held = ui.input(|i| i.modifiers);
+                            if let Err(e) = self.drag_to(pos - rect.min, held) {
+                                tracing::warn!("selection: {e}");
+                            }
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("wheel: {e}"),
@@ -889,20 +912,12 @@ impl TerminalPane {
             self.selecting = true;
             self.selection_changed = true;
         } else if self.selecting && down && moved {
-            let grid_ref = self.terminal.grid_ref(self.viewport_point(local)?)?;
-            let geometry = Geometry {
-                columns: self.terminal.cols()?.into(),
-                cell_width: self.dims.cell_width as u32,
-                padding_left: PADDING as u32,
-                screen_height: self.dims.height as u32,
-            };
-            let selection = self
-                .drag
-                .set_rectangle(rectangle_mods(mods_from(held)))?
-                .set_position(local.x.into(), local.y.into())?
-                .apply(&mut self.gesture, &self.terminal, grid_ref, geometry)?;
-            self.terminal.set_selection(selection.as_ref())?;
-            self.selection_changed = true;
+            self.drag_to(local, held)?;
+        }
+        if self.selecting && down {
+            self.autoscroll_tick(ui, local, held)?;
+        } else {
+            self.last_autoscroll = None;
         }
         // Not an else: a fast click presses and releases in one frame, and
         // a selection left open would keep the next presses from the
@@ -921,10 +936,78 @@ impl TerminalPane {
         Ok(())
     }
 
+    /// The pane as the selection gesture measures it.
+    fn geometry(&self) -> Result<Geometry> {
+        Ok(Geometry {
+            columns: self.terminal.cols()?.into(),
+            cell_width: self.dims.cell_width as u32,
+            padding_left: PADDING as u32,
+            screen_height: self.dims.height as u32,
+        })
+    }
+
+    /// Extend the selection drag to `local`. Past the pane's top or bottom
+    /// the gesture asks to autoscroll (`autoscroll_tick`).
+    fn drag_to(&mut self, local: egui::Vec2, held: egui::Modifiers) -> Result<()> {
+        let grid_ref = self.terminal.grid_ref(self.viewport_point(local)?)?;
+        let geometry = self.geometry()?;
+        let selection = self
+            .drag
+            .set_rectangle(rectangle_mods(mods_from(held)))?
+            .set_position(local.x.into(), local.y.into())?
+            .apply(&mut self.gesture, &self.terminal, grid_ref, geometry)?;
+        self.terminal.set_selection(selection.as_ref())?;
+        self.selection_changed = true;
+        Ok(())
+    }
+
+    /// While a selection drag is past the pane's top or bottom, scroll one
+    /// row and extend the selection every AUTOSCROLL_EVERY, as Ghostty's
+    /// selectionScrollTick does (src/Surface.zig at 108cacb1); the gesture
+    /// has no timer of its own (include/ghostty/vt/selection.h).
+    fn autoscroll_tick(
+        &mut self,
+        ui: &egui::Ui,
+        local: egui::Vec2,
+        held: egui::Modifiers,
+    ) -> Result<()> {
+        if matches!(self.gesture.autoscroll(&self.terminal)?, Autoscroll::None) {
+            self.last_autoscroll = None;
+            return Ok(());
+        }
+        let now = Instant::now();
+        if self
+            .last_autoscroll
+            .is_none_or(|last| now.duration_since(last) >= AUTOSCROLL_EVERY)
+        {
+            self.last_autoscroll = Some(now);
+            let at = self.viewport_coordinate(local)?;
+            let geometry = self.geometry()?;
+            let selection = self
+                .autoscroll
+                .set_rectangle(rectangle_mods(mods_from(held)))?
+                .set_position(local.x.into(), local.y.into())?
+                .apply(&mut self.gesture, &self.terminal, at, geometry)?;
+            // None: nothing to scroll, or the pressed cell left the screen
+            // and the gesture reset; the selection stays as it is.
+            if let Some(selection) = selection {
+                self.terminal.set_selection(Some(&selection))?;
+                self.selection_changed = true;
+            }
+        }
+        // Keep ticking while the pointer rests past the edge.
+        ui.ctx().request_repaint_after(AUTOSCROLL_EVERY);
+        Ok(())
+    }
+
     /// The viewport cell under a point in the pane, clamped to the grid as
     /// the macroquad build's `mouse_viewport_point` does: grid_ref rejects
     /// a point one past the last row or column.
     fn viewport_point(&self, local: egui::Vec2) -> Result<Point> {
+        Ok(Point::Viewport(self.viewport_coordinate(local)?))
+    }
+
+    fn viewport_coordinate(&self, local: egui::Vec2) -> Result<Coordinate> {
         let cols = self.terminal.cols()?;
         let rows = self.terminal.rows()?;
         let cell = |v: f32, size: f32, count: u32| {
@@ -934,10 +1017,10 @@ impl TerminalPane {
                 0
             }
         };
-        Ok(Point::Viewport(Coordinate {
+        Ok(Coordinate {
             x: cell(local.x, self.dims.cell_width, u32::from(cols)) as u16,
             y: cell(local.y, self.dims.cell_height, u32::from(rows)),
-        }))
+        })
     }
 
     /// Rebuild the instances when the screen, the pane, the cursor or the
