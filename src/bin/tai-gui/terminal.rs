@@ -22,6 +22,7 @@ use libghostty_vt::{
     color::Rgb,
     effect::SemanticPromptKind,
     key::{self, Key},
+    kitty::graphics::{Layer, PlacementIterator},
     mode::Mode,
     mouse,
     point::{Coordinate, Point},
@@ -37,7 +38,7 @@ use macroquad::color::Color;
 use crate::{
     cells::{GlyphAtlas, Instance},
     fonts::{Coverage, Face, SymbolSpan},
-    gpu::{AtlasUpload, CellFrame},
+    gpu::{AtlasUpload, CellFrame, ImageData, ImageStage},
     pty::{Child, Pty, PtyError},
     selection, shortcuts,
 };
@@ -168,6 +169,16 @@ pub struct TerminalPane {
     gpu: crate::gpu::PaneId,
     /// The last frame's instances, reused while nothing changed.
     instances: Arc<Vec<Instance>>,
+    /// Where the cell backgrounds and the glyphs start in `instances`, so
+    /// images can draw between them (gpu.rs, `ImageStage`).
+    bg_start: u32,
+    text_start: u32,
+    /// Kitty images (src/term/images.rs): placements, and each drawn
+    /// image's pixels, copied once per generation for the GPU side.
+    placement_it: PlacementIterator<'static>,
+    image_pixels: crate::term::images::TextureCache<Arc<Vec<u8>>>,
+    /// Translates Sixel in the pty's output into Kitty images (ADR 0006).
+    sixel: crate::sixel::Translator,
     built_for: Option<(Dimensions, Option<(u16, u16)>)>,
     /// Each viewport row's instances as last built, so a frame rebuilds
     /// only the rows that changed, as Ghostty's `rebuildRow` does
@@ -283,6 +294,8 @@ impl TerminalPane {
                 move || (gs.get(), cp.get())
             },
         )?;
+        // Kitty images, as tai accepts them (src/term/images.rs).
+        crate::term::images::enable(&mut terminal)?;
         terminal.on_semantic_prompt({
             let prompt = Rc::clone(&prompt);
             // A panic here aborts, so a kind these bindings don't know
@@ -314,6 +327,11 @@ impl TerminalPane {
             atlas: GlyphAtlas::new(crate::cells::ATLAS_MAX_HEIGHT),
             gpu: crate::gpu::PaneId::new(),
             instances: Arc::new(Vec::new()),
+            bg_start: 0,
+            text_start: 0,
+            placement_it: PlacementIterator::new()?,
+            image_pixels: Default::default(),
+            sixel: crate::sixel::Translator::new(),
             built_for: None,
             rows: Vec::new(),
             response: Vec::new(),
@@ -456,9 +474,12 @@ impl TerminalPane {
         }
         let mut got = false;
         let terminal = &mut self.terminal;
+        let sixel = &mut self.sixel;
+        // Sixel images become Kitty images on the way in (ADR 0006).
+        let cell_height = self.cell_pixels.get().1;
         let mut sink = |bytes: &[u8]| {
             got = true;
-            terminal.vt_write(bytes);
+            sixel.feed(bytes, cell_height, &mut |out| terminal.vt_write(out));
         };
         match self.pty.read(&mut sink, Instant::now() + PARSE_BUDGET) {
             Ok(()) => {}
@@ -633,6 +654,10 @@ impl TerminalPane {
                     .to_vec(),
             }
         });
+        let (images, image_data) = self.image_frame().unwrap_or_else(|e| {
+            tracing::warn!("images: {e}");
+            Default::default()
+        });
         ui.painter()
             .add(eframe::egui_wgpu::Callback::new_paint_callback(
                 rect,
@@ -641,6 +666,10 @@ impl TerminalPane {
                     view: rect.size(),
                     instances: Arc::clone(&self.instances),
                     atlas,
+                    bg_start: self.bg_start,
+                    text_start: self.text_start,
+                    images,
+                    image_data,
                 },
             ));
         if let Some(badge) = &self.badge {
@@ -1086,6 +1115,10 @@ impl TerminalPane {
                     Ok(RowSemanticPrompt::None) | Err(_)
                 );
                 let mut extend_cells = Vec::new();
+                // A row with Kitty Unicode placeholders: each cell's
+                // placeholder, or None (src/term/images.rs).
+                let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
+                let mut placeholder_cells = Vec::new();
                 let mut cell_it = self.cell_it.update(row)?;
                 let mut x = PADDING;
                 let mut col: u16 = 0;
@@ -1140,7 +1173,17 @@ impl TerminalPane {
                     } else if has_bg {
                         cached.bg.push(Instance::solid(cell_rect, rgba(bg)));
                     }
-                    if graphemes > 0 {
+                    // A placeholder cell shows part of an image, drawn with
+                    // the images; its own character has no glyph.
+                    let placeholder = if placeholder_row {
+                        let cell_placeholder = crate::term::images::placeholder_cell(cell)?;
+                        let is = cell_placeholder.is_some();
+                        placeholder_cells.push(cell_placeholder);
+                        is
+                    } else {
+                        false
+                    };
+                    if graphemes > 0 && !placeholder {
                         // One face for the whole cluster, trimmed to what
                         // tai draws (see walk_row in src/main.rs).
                         let face = self.coverage.cluster_face(&mut text);
@@ -1185,6 +1228,11 @@ impl TerminalPane {
                     );
                 }
                 cached.extend = extends(prompt, &extend_cells, colors.background);
+                cached.virtual_runs = if placeholder_row {
+                    crate::placeholders::row_placements(placeholder_cells)
+                } else {
+                    Vec::new()
+                };
                 row.set_dirty(false)?;
             }
             y += dims.cell_height;
@@ -1210,14 +1258,93 @@ impl TerminalPane {
                 .into_iter()
                 .map(|(rect, color)| Instance::solid(rect, color)),
         );
+        self.bg_start = out.len() as u32;
         for row in &self.rows {
             out.extend_from_slice(&row.bg);
         }
+        self.text_start = out.len() as u32;
         for row in &self.rows {
             out.extend_from_slice(&row.text);
         }
         self.instances = Arc::new(out);
         Ok(true)
+    }
+
+    /// This frame's Kitty images, in drawing order, and the pixels of each:
+    /// what src/term/images.rs works out, as tai draws it.
+    #[allow(clippy::type_complexity)]
+    fn image_frame(&mut self) -> Result<(Vec<(ImageStage, u32, Instance)>, Vec<ImageData>)> {
+        let Some(graphics) = self.terminal.kitty_graphics()? else {
+            return Ok(Default::default());
+        };
+        let geometry = crate::term::images::Geometry {
+            cell_width: self.dims.cell_width,
+            cell_height: self.dims.cell_height,
+            dpi_scale: self.dims.dpi_scale,
+            padding: PADDING,
+        };
+        let runs: Vec<(u16, crate::placeholders::Placement)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
+            .collect();
+        let mut staged = Vec::new();
+        for (stage, layer) in [
+            (ImageStage::BelowBackground, Layer::BELOW_BACKGROUND),
+            (ImageStage::BelowText, Layer::BELOW_TEXT),
+            (ImageStage::AboveText, Layer::ABOVE_TEXT),
+        ] {
+            let draws = crate::term::images::placement_draws(
+                &self.terminal,
+                &mut self.placement_it,
+                &graphics,
+                layer,
+                geometry,
+            )?;
+            staged.extend(draws.into_iter().map(|d| (stage, d)));
+            // Placeholder images draw with the layer below the text, as
+            // in tai.
+            if stage == ImageStage::BelowText {
+                let draws = crate::term::images::placeholder_draws(
+                    &mut self.placement_it,
+                    &graphics,
+                    &runs,
+                    geometry,
+                )?;
+                staged.extend(draws.into_iter().map(|d| (stage, d)));
+            }
+        }
+        let mut images = Vec::with_capacity(staged.len());
+        let mut data: Vec<ImageData> = Vec::new();
+        for (stage, draw) in staged {
+            let Some(pixels) = crate::term::images::pixels(&graphics, draw.image_id)? else {
+                continue;
+            };
+            let (rgba, _) = self
+                .image_pixels
+                .texture(draw.image_id, pixels.generation, || {
+                    Arc::new(pixels.data.to_vec())
+                });
+            if !data.iter().any(|d| d.id == draw.image_id) {
+                data.push(ImageData {
+                    id: draw.image_id,
+                    generation: pixels.generation,
+                    size: (pixels.width, pixels.height),
+                    rgba: Arc::clone(rgba),
+                });
+            }
+            images.push((
+                stage,
+                draw.image_id,
+                Instance::textured(
+                    [draw.dest.x, draw.dest.y, draw.dest.w, draw.dest.h],
+                    [draw.source.x, draw.source.y, draw.source.w, draw.source.h],
+                ),
+            ));
+        }
+        self.image_pixels.end_frame();
+        Ok((images, data))
     }
 
     fn handle_event(&mut self, event: &egui::Event, held: egui::Modifiers) -> Result<()> {
@@ -1352,6 +1479,8 @@ struct RowInstances {
     edge: Vec<[u8; 4]>,
     /// Whether the padding above or below may take this row's colours.
     extend: bool,
+    /// The row's Kitty Unicode placeholder runs (src/placeholders.rs).
+    virtual_runs: Vec<crate::placeholders::Placement>,
 }
 
 /// The padding around the grid in the colours of the nearest cells, as

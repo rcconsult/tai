@@ -35,6 +35,8 @@ mod identity;
 #[cfg(unix)]
 #[path = "../../locale.rs"]
 mod locale;
+#[path = "../../placeholders.rs"]
+mod placeholders;
 #[cfg(windows)]
 #[path = "../../pty_windows.rs"]
 #[allow(dead_code)]
@@ -53,6 +55,8 @@ mod shell_integration;
 #[path = "../../shortcuts.rs"]
 #[allow(dead_code)]
 mod shortcuts;
+#[path = "../../sixel.rs"]
+mod sixel;
 #[path = "../../term/mod.rs"]
 mod term;
 
@@ -1023,6 +1027,14 @@ fn main() -> eframe::Result {
             }),
         )
         .init();
+
+    // The PNG decoder Kitty images need (src/term/images.rs). It's
+    // process-global, so it goes before any terminal is created.
+    // SAFETY: no terminal exists yet, and only this thread uses
+    // libghostty-vt (its types are !Send; the pty threads never touch it).
+    if let Err(e) = unsafe { term::images::install_png_decoder() } {
+        tracing::warn!("PNG decoder for Kitty images: {e}");
+    }
 
     let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,

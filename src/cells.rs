@@ -54,6 +54,16 @@ impl Instance {
         }
     }
 
+    /// A textured quad: `src` in the texture's pixels, drawn over `dest`.
+    /// tai-gui draws Kitty images with these (src/term/images.rs).
+    pub fn textured(dest: [f32; 4], src: [f32; 4]) -> Self {
+        Self {
+            dest,
+            src,
+            color: [255; 4],
+        }
+    }
+
     pub fn as_bytes(instances: &[Self]) -> &[u8] {
         // SAFETY: Instance is repr(C) plain data with no padding (36 bytes:
         // eight f32 and four u8), so every byte is initialized.
