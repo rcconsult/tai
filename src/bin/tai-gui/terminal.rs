@@ -1514,8 +1514,14 @@ fn wheel_travel(input: &egui::InputState, cell: f32, page: f32) -> f32 {
 }
 
 /// Add `travel` to the pending travel and take whole rows from it, toward
-/// zero, keeping the rest for later events (Ghostty's scrollCallback).
+/// zero, keeping the rest for later events (Ghostty's scrollCallback). A
+/// change of direction drops what was pending the other way, as tai's
+/// take_rows does: a trackpad's leftover fraction made the next notch back
+/// scroll 2 rows instead of 3 (macos-tai).
 fn wheel_rows(pending: &mut f32, travel: f32, cell: f32) -> i32 {
+    if travel != 0.0 && *pending != 0.0 && pending.signum() != travel.signum() {
+        *pending = 0.0;
+    }
     *pending += travel;
     let rows = (*pending / cell).trunc();
     *pending -= rows * cell;
@@ -1722,8 +1728,10 @@ mod tests {
         assert_eq!(wheel_rows(&mut pending, 10.0, 24.0), 0);
         assert_eq!(wheel_rows(&mut pending, 10.0, 24.0), 1);
         assert!((pending - 6.0).abs() < 1e-4);
-        // Turning back undoes what is pending first.
-        assert_eq!(wheel_rows(&mut pending, -6.0, 24.0), 0);
+        // Turning back drops what was pending the other way: a notch's 72
+        // points are three rows, not two and the rest of the six.
+        assert_eq!(wheel_rows(&mut pending, -72.0, 24.0), -3);
+        assert!(pending.abs() < 1e-4);
         assert_eq!(wheel_rows(&mut pending, -50.0, 24.0), -2);
         // A line (a notch) is WHEEL_ROWS rows, as in Ghostty; a page is
         // the screen.
