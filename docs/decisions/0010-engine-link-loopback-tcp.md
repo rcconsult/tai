@@ -189,7 +189,10 @@ their contract test pins a commit and expects churn.
   ones to tai-gui's own actions (only `run.controller` so far), the rest to
   `POST /command/<name>`. `/run <prompt>` stays on `/v1/oneshot`, which
   returns the sources `/v1/agent/run` drops, until ppxai's citation rework
-  lands. tai-gui speaks as client `web`, since ppxai rejects ids it
+  lands. (2026-11-22: it landed as ppxai ADR 0019, which gives a run its
+  `sources`, and `/run` now goes to `/v1/agent/run` as a background run in
+  the preview pane, as the web app's RunController does. `/v1/oneshot`
+  is left to the contract test.) tai-gui speaks as client `web`, since ppxai rejects ids it
   doesn't know. With tools on, ppxai sends the answer whole in
   `stream_end` rather than streaming it (`engine/chat.py`
   `chat_with_tools`). The contract test covers these routes.

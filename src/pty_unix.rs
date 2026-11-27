@@ -101,6 +101,11 @@ impl Pty {
 
         // forkpty() combines openpty + fork + login_tty into one call.
         // In the child it sets up the slave side as stdin/stdout/stderr.
+        // SAFETY: forkpty is unsafe because a forked child of a threaded
+        // process may only make async-signal-safe calls until exec. The fd
+        // closing and signal resets below are; building the Command
+        // allocates, which is not (a malloc lock held by another thread at
+        // the fork would deadlock the child). Known and not yet fixed.
         match unsafe { nix::pty::forkpty(&dims.to_winsize(), None)? } {
             // Child process -- replace ourselves with the shell.
             // TERM tells programs what escape sequences we understand.
@@ -139,6 +144,8 @@ impl Pty {
                     signal::Signal::SIGPIPE,
                     signal::Signal::SIGCHLD,
                 ] {
+                    // SAFETY: SigDfl installs no handler of ours, and no
+                    // other thread exists in the child to race it.
                     _ = unsafe { signal::signal(sig, signal::SigHandler::SigDfl) };
                 }
                 _ = signal::sigprocmask(
@@ -271,6 +278,8 @@ impl Pty {
     /// for this ioctl and feed the new window size to it.
     pub fn resize(&self, dims: Dimensions) {
         nix::ioctl_write_ptr_bad!(tiocswinsz, nix::libc::TIOCSWINSZ, nix::pty::Winsize);
+        // SAFETY: the fd is our open master, and the pointer is to a
+        // Winsize that lives for the call, which TIOCSWINSZ only reads.
         _ = unsafe { tiocswinsz(self.fd.as_raw_fd(), &dims.to_winsize()) };
     }
 }
@@ -301,6 +310,7 @@ fn read_loop(fd: &OwnedFd, tx: &mpsc::SyncSender<Chunk>, wake_up: &Wake) {
             revents: 0,
         }];
         // Errors other than EINTR show up on the read below.
+        // SAFETY: fds is a live array of one pollfd, matching nfds = 1.
         _ = unsafe { nix::libc::poll(fds.as_mut_ptr(), 1, -1) };
         let mut filled = 0;
         loop {
@@ -358,6 +368,7 @@ impl std::io::Write for MasterWriter {
                         revents: 0,
                     }];
                     // Errors other than EINTR show up on the next write.
+                    // SAFETY: fds is a live array of one pollfd, matching nfds = 1.
                     _ = unsafe { nix::libc::poll(fds.as_mut_ptr(), 1, -1) };
                 }
                 Err(err) => return Err(err.into()),
@@ -449,6 +460,8 @@ fn close_inherited_fds() {
     let max = unsafe { nix::libc::sysconf(nix::libc::_SC_OPEN_MAX) };
     let max = if max <= 0 { 1024 } else { max.min(65536) } as i32;
     for fd in 3..max {
+        // SAFETY: as above. The child never drops its copies of tai's fd
+        // handles: it execs or calls exit, which runs no destructors.
         unsafe { nix::libc::close(fd) };
     }
 }
