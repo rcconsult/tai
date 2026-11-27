@@ -561,7 +561,7 @@ struct BytesLoader {
 
 impl EguiBytesLoader for BytesLoader {
     fn id(&self) -> &str {
-        "tai::images::BytesLoader"
+        "tai::answer_images::BytesLoader"
     }
 
     fn load(&self, ctx: &Context, uri: &str) -> BytesLoadResult {
@@ -651,7 +651,7 @@ struct ImageLoader {
 
 impl EguiImageLoader for ImageLoader {
     fn id(&self) -> &str {
-        "tai::images::ImageLoader"
+        "tai::answer_images::ImageLoader"
     }
 
     fn load(&self, ctx: &Context, uri: &str, _size_hint: SizeHint) -> ImageLoadResult {
