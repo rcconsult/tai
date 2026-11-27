@@ -50,13 +50,10 @@ fn place(editor: &str) -> Place {
 }
 
 /// The shell a new terminal runs, whose syntax the command must follow:
-/// on Windows, pwsh or cmd.exe (`pty_windows.rs`); elsewhere a POSIX-like
-/// shell, which all take `&&`.
+/// pwsh or cmd.exe on Windows (`pty_windows.rs`), $SHELL or the passwd
+/// entry elsewhere (`pty_unix.rs`), which can be pwsh too (popos-tai).
 pub fn shell() -> PathBuf {
-    #[cfg(windows)]
-    return crate::pty::default_shell();
-    #[cfg(not(windows))]
-    PathBuf::from("sh")
+    crate::pty::default_shell()
 }
 
 /// `exit` after the editor, only when it quit cleanly. PowerShell 7 takes
