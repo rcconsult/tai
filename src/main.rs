@@ -1694,8 +1694,8 @@ fn pointer_pane(dims: Dimensions) -> term::pointer::Pane {
 
 /// Configuration for macroquad.
 ///
-/// By default the window is resizable and DPI-aware,
-/// while prioritizing Wayland over X11 on Linux.
+/// The window is resizable and DPI-aware, and on Linux it is an X11
+/// window, through XWayland on a Wayland session.
 /// OpenGL on every platform: the cell renderer has no Metal shaders, and
 /// macroquad's Metal backend leaked GPU memory on the macOS dev host (about
 /// 1.2 MB/s while htop redrew) where OpenGL stayed flat (ADR 0012).
@@ -1705,8 +1705,13 @@ fn macroquad_conf() -> Conf {
         window_resizable: true,
         high_dpi: true,
         platform: conf::Platform {
-            // Default to Wayland and fallback to X11 on Linux.
-            linux_backend: conf::LinuxBackend::WaylandWithX11Fallback,
+            // X11 only: miniquad 0.4.11's Wayland backend can't run tai.
+            // Without server-side decorations or a libdecor plugin
+            // (GNOME) it asserts on a missing xdg_toplevel, and its EGL
+            // context is OpenGL ES 2 (no eglBindAPI), where tai needs
+            // desktop OpenGL 3.2. Through XWayland, tai's X11 input
+            // method covers Wayland too (ADR 0015 decision 5).
+            linux_backend: conf::LinuxBackend::X11Only,
             apple_gfx_api: conf::AppleGfxApi::OpenGl,
             ..Default::default()
         },
