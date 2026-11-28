@@ -2,8 +2,10 @@
 
 - **Status:** Proposed 2026-11-28. The owner asked for it ("we go for
   it") after the macOS session found that dead keys don't compose in
-  either app. It waits for review by the macOS and Linux sessions and the
-  owner's acceptance.
+  either app. The macOS session reviewed it the same day; its
+  corrections are folded in: commits, clearing the preedit, shortcuts
+  while composing, and the AppKit details. It waits for the Linux
+  session's review and the owner's acceptance.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host.
 - **Supersedes:** decision 7 of [ADR 0012](0012-cjk-font-fallback.md)
@@ -124,15 +126,34 @@ CJK through an input method fails in both apps on every platform
    - **committed text**, from the input method or a dead key;
    - **the preedit**: its text and the cursor within it, or none.
 
-   The core applies Ghostty's rules for all three:
-   - A composing key goes to the encoder with `set_composing(true)`. Its
-     release follows the press rule of step 5.
-   - Committed text is the program's input. If a key is pending, it goes
-     out as that key's text; otherwise it is written as UTF-8. ASCII
-     isn't filtered out.
+   The core applies Ghostty's rules for all three
+   (`SurfaceView_AppKit.swift` `keyDown`, around lines 1219–1290):
+   - A key that arrives while composing goes to the encoder with
+     `set_composing(true)`. The legacy encoding sends nothing for it; the
+     Kitty encoding sends only plain modifiers.
+   - **A commit that ends a composition is text only.** It goes through
+     the encoder as a key event with no key, no modifiers, composing off
+     and the committed text (Ghostty's `committedTextAction`). It is
+     never the pending key's text, and never raw bytes, because it must
+     count as typed input, not as a paste.
+   - **A commit with no composition before it is the key's text**, as
+     today: plain typing, and Option+a giving å.
+   - Text with no key at all (the emoji picker, dictation) is a
+     text-only commit too.
+   - ASCII isn't filtered out of commits.
    - Control characters that arrive while composing are dropped.
-   - The preedit is state, never written to the pty, and is cleared on
-     commit.
+   - The committing key isn't replayed. Ghostty replays Up, Down and
+     Right after a commit (and Left with a modifier), for Korean input
+     methods. winit swallows that key, so tai-gui can't replay it, and
+     tai does the same.
+   - The committing key's release has no press that reached the
+     program, so the press rule of ADR 0014 step 5 drops it. The core
+     gets a test for that.
+   - The preedit is state and is never written to the pty. It is
+     cleared on commit, on focus loss, when the input method is
+     disabled (where the front end learns of it), and when an ordinary
+     key arrives while the core still holds a preedit (both toolkits
+     send keys again only once composing has ended).
 2. **The preedit is drawn by the core's row reader.**
    - `term/rows.rs` overlays it at the cursor, as cells measured with
      libghostty-vt's width table (ADR 0003 rule 5).
@@ -149,7 +170,19 @@ CJK through an input method fails in both apps on every platform
    - The pane sets egui's `PlatformOutput::ime` to the cursor cell's
      rectangle.
    - It feeds `Event::Ime` preedit and commit to the core.
-   - It marks the keys egui reports during a composition as composing.
+   - It has almost no keys to mark as composing. With IME allowed, winit
+     holds back the keys an input method uses on macOS and Linux, and
+     sends none while there is marked text unless `doCommandBySelector`
+     fired (winit 0.30.13 macOS `view.rs`). On Windows, egui-winit
+     filters `VK_PROCESSKEY` presses and their releases (egui-winit
+     0.36.2 `lib.rs`, around lines 577–588).
+   - egui-winit 0.36.2 ignores `Ime::Enabled` and `Ime::Disabled`
+     (`lib.rs`, around line 721), so tai-gui doesn't learn of an input
+     source switch. The core's other clearing rules (decision 1) cover
+     it.
+   - Shortcuts (Cmd+C, Cmd+V, Cmd+=) don't fire while composing: winit
+     hands those keys to the input method. tai does the same (decision
+     5), so the two apps agree.
    - That covers dead keys and input methods on macOS, X11 (XIM) and
      Wayland (text-input-v3), through winit.
 5. **tai** gets the same three reports through a vendored miniquad.
@@ -161,6 +194,23 @@ CJK through an input method fails in both apps on every platform
      - `setMarkedText`, `unmarkText` and `insertText`;
      - `hasMarkedText` and `markedRange`;
      - `firstRectForCharacterRange`, from `set_ime_position`.
+
+     From Ghostty's view as well:
+     - **Input source switch:** a key during which the keyboard layout
+       changed, with no marked text before it, is dropped; it was the
+       switch shortcut. `setMarkedText` outside `keyDown` (a layout
+       switched while a dead key is pending) updates the preedit at
+       once.
+     - **Key equivalents:** `performKeyEquivalent` lets Ctrl+Return
+       through as it is and turns Ctrl+/ into Ctrl+_, so AppKit doesn't
+       beep. `doCommandBySelector` swallows unhandled commands, such as
+       Cmd+. (`cancel:`), without a beep.
+     - **Surrogate pairs:** a high and a low UTF-16 surrogate that
+       `insertText` delivers in two calls (as the emoji picker can) are
+       joined.
+     - **Shortcuts:** tai checks them only after the text input system
+       has had the key, so they don't fire while composing, as in
+       tai-gui (decision 4).
    - **X11:** `XOpenIM`, `XCreateIC`, `XFilterEvent` and
      `Xutf8LookupString`. That covers dead keys, Compose and XIM input
      methods. XIM's preedit callbacks give the preedit where the input
@@ -183,13 +233,23 @@ CJK through an input method fails in both apps on every platform
    4. tai on X11 (XIM).
    5. tai on Windows (inline preedit and candidate position).
 7. **What the checks cover:**
-   - **Dead keys:** macOS Option+e e and Option+u o; Windows
-     US-International ' e; X11 `dead_acute` and Compose.
+   - **Dead keys:**
+     - macOS: Option+e e and Option+u o on U.S.; the háček and čárka on
+       Czech and Slovak QWERTY; ^ and ¨ on French and Swiss French;
+     - Windows: US-International ' e;
+     - X11: `dead_acute` and Compose.
    - **An input method per platform:** macOS Japanese (Kotoeri) and
-     Pinyin; Windows Microsoft IME (Japanese); Linux IBus or fcitx.
-   - **Bytes:** a probe in legacy mode and with Kitty flags 11. A
-     composition sends nothing until it commits; then both apps send the
-     same bytes.
+     Pinyin, once the owner allows enabling them; Windows Microsoft IME
+     (Japanese); Linux IBus or fcitx.
+   - **Bytes:** a probe in legacy mode and with Kitty flags 11, 8 and
+     16. A composition sends nothing until it commits; then both apps
+     send the same bytes, with no orphan release.
+   - **macOS only:**
+     - the emoji picker (Ctrl+Cmd+Space), dictation and press-and-hold
+       (the accent menu, whose choice may replace a letter already sent);
+     - a layout switch while a dead key is pending;
+     - Ctrl+/, Ctrl+Return and Cmd+.;
+     - Cmd shortcuts pressed during a composition.
    - **Edge cases:** Backspace and Escape inside a composition cancel it
      without reaching the program, and the candidate window sits at the
      cursor.
@@ -224,6 +284,9 @@ CJK through an input method fails in both apps on every platform
   copy's patches that it covers.
 - tai moves to winit, or to tai-gui's renderer. Then tai takes tai-gui's
   path and the vendored miniquad goes.
+- A Korean input method user loses the arrow key that ended a syllable
+  (decision 1, no replay). Then look for a way to get that key from
+  winit, and replay it in both apps as Ghostty does.
 - An input method that the core's rules get wrong (a Korean IME
   committing on every syllable, or a voice-input commit). Then compare
   with Ghostty's handling of the same input method before changing the
