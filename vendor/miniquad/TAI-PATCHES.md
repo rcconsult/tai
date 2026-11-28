@@ -50,3 +50,14 @@ need changes miniquad doesn't have.
    the context's focus; `set_ime_area` sets the spot (the cell's
    bottom-left), only when it moves. The variadic Xlib calls are looked
    up with `dlsym`.
+8. Windows input method (ADR 0015 part 6), `src/native/windows.rs`, as
+   winit 0.30 does it: `WM_IME_COMPOSITION`'s result string is an
+   `ime_commit_event` (whole UTF-16, so surrogate pairs survive; it was
+   sent as characters one code unit at a time) and its composition
+   string an `ime_preedit_event`; the message isn't passed to
+   DefWindowProc and `WM_IME_SETCONTEXT` clears
+   `ISC_SHOWUICOMPOSITIONWINDOW`, so the IME draws no composition window
+   of its own; `WM_IME_ENDCOMPOSITION` commits what a Korean IME leaves
+   and ends the preedit; the composition and candidate windows go to the
+   `set_ime_area` cell (candidates beside it, `CFS_EXCLUDE`) instead of
+   the caret tai never sets.
