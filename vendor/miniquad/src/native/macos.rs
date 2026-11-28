@@ -681,6 +681,12 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
                 event_handler.key_down_event(key, mods, repeat);
             }
         }
+        // A Ctrl chord types nothing: the text system hands over the key's
+        // own character for some (Ctrl+/ gives "/"), which would lose the
+        // Ctrl. tai-gui gets no text with Ctrl either (egui-winit).
+        if mods.ctrl {
+            return;
+        }
         if texts.is_empty() {
             if let Some(character) = get_event_char(event) {
                 if let Some(event_handler) = payload.context() {
@@ -820,6 +826,29 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
                 }
             }
         }
+    }
+
+    // Cmd+. is AppKit's cancel key equivalent: the window handles it
+    // before keyDown, so the key never reached the app. Send it on as a
+    // key, as Ghostty's performKeyEquivalent does for keys AppKit would
+    // otherwise take (SurfaceView_AppKit.swift at 108cacb1).
+    extern "C" fn perform_key_equivalent(this: &Object, _sel: Sel, event: ObjcId) -> BOOL {
+        unsafe {
+            let flags: u64 = msg_send![event, modifierFlags];
+            let cmd = flags & NSEventModifierFlags::NSCommandKeyMask as u64 != 0;
+            let chars: ObjcId = msg_send![event, charactersIgnoringModifiers];
+            let window: ObjcId = msg_send![this, window];
+            let first: ObjcId = msg_send![window, firstResponder];
+            if cmd
+                && chars != nil
+                && nsstring_to_string(chars) == "."
+                && first == this as *const Object as ObjcId
+            {
+                key_down(this, sel!(keyDown:), event);
+                return YES;
+            }
+        }
+        NO
     }
 
     // Commands the text system has no text for (moveLeft:, cancel:, a Ctrl
@@ -1103,6 +1132,10 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
     decl.add_method(
         sel!(doCommandBySelector:),
         do_command_by_selector as extern "C" fn(&Object, Sel, Sel),
+    );
+    decl.add_method(
+        sel!(performKeyEquivalent:),
+        perform_key_equivalent as extern "C" fn(&Object, Sel, ObjcId) -> BOOL,
     );
     decl.add_method(
         sel!(draggingEntered:),

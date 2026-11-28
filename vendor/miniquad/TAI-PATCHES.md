@@ -33,7 +33,10 @@ need changes miniquad doesn't have.
      outside `keyDown` (emoji picker, dictation) commits, joining a
      surrogate pair split over two calls; `firstRectForCharacterRange`
      answers with the `set_ime_area` cell; `doCommandBySelector`
-     swallows commands so AppKit doesn't beep.
+     swallows commands so AppKit doesn't beep. A Ctrl chord types no
+     text (the system gives Ctrl+/ a "/"; tai-gui gets none with Ctrl
+     either), and `performKeyEquivalent` sends Cmd+. on as a key, which
+     AppKit otherwise takes as cancel before `keyDown`.
 7. X11 input method (ADR 0015 part 4), `src/native/linux_x11/xim.rs` and
    `src/native/linux_x11.rs`, set up as winit 0.30 does: `LC_CTYPE` from
    the environment (restored if Xlib can't use it), `XOpenIM` with the
