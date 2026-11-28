@@ -316,6 +316,48 @@ reference)
    - **Wayland:** dead keys, Compose and an input method in both apps,
      once a host with a Wayland session can run them.
 
+
+## Implementation notes (2026-11-28)
+
+Facts found while building parts 1-4, recorded without changing the
+decisions above.
+
+- **Checked live so far.**
+  - Part 1 (core) and part 2 (tai-gui): macOS (US, Czech, Slovak,
+    French and Swiss French dead keys; Kotoeri; Pinyin), Linux X11
+    (dead keys and Compose through Xlib's own input method; IBus
+    libpinyin) and Windows (Swiss French dead keys). The bytes match
+    xterm on Linux, legacy and Kitty flags 11.
+  - Part 4 (tai on X11): the same Linux checks, byte-identical to
+    tai-gui and xterm.
+- **tai-gui loses fast-typed keys through IBus on X11** (15 ms per key;
+  40 ms is clean). A trace in winit 0.30.13 shows a key press going into
+  `XFilterEvent` and never coming back from ibus-x11, while the keys
+  around it do. xterm and tai's own XIM (part 4), plain Xlib loops,
+  get every key, so the loss is in how winit drives XIM, not in IBus.
+  It isn't winit #4777: with the cursor area never re-sent while typing,
+  keys are still lost. Without IME allowed (main), tai-gui loses
+  nothing. Open: a winit fix or patch.
+- **The candidate window on X11** opens at the bottom-left of the
+  window in both apps with IBus: with on-the-spot preedit callbacks,
+  ibus-x11 seems to ignore the spot location; xterm, over-the-spot, gets
+  it at the cursor. Open.
+- **tai-gui on macOS: the emoji picker and dictation** don't reach the
+  pane: winit 0.30.13 `insertText` commits only while there is marked
+  text, and tai-gui has no Edit menu for the picker's shortcut. tai
+  (part 3) handles both.
+- **A dead key cancelled by Backspace, Escape or an arrow on macOS**
+  commits the accent (Option+u then Backspace sends ¨), as Ghostty's
+  `committedTextAction` does; not compared with a running Ghostty.
+- **Wayland without an input method** (a compositor with no
+  text-input-v3 method): winit composes from xkbcommon itself and egui
+  reports a dead key as a plain key, so under the Kitty protocol it
+  still leaks in tai-gui, as on main.
+- **tai has no focus-lost signal** from miniquad on every platform, so
+  a composition left open when tai loses the focus ends at the next key.
+- **tai sets `LC_CTYPE` on X11** (part 4), as winit does for tai-gui;
+  XIM can't commit without it (`src/locale.rs`).
+
 ## Why this and not the alternatives
 
 - **tai-gui only.** It's the smaller half, but it leaves the two apps
