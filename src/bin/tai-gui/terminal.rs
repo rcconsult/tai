@@ -963,6 +963,16 @@ impl TerminalPane {
                     return Ok(());
                 };
                 let mods = mods_from(*modifiers);
+                // An app shortcut's key is the app's, as in tai: egui zooms
+                // for Cmd+= / Ctrl+= at the end of the frame, after this
+                // pane has read the key. Its release then has no press and
+                // keys.rs drops it.
+                if *pressed
+                    && shortcut_key(*key)
+                        .is_some_and(|kc| shortcuts::action_for(kc, mods, macos).is_some())
+                {
+                    return Ok(());
+                }
                 if !pressed {
                     return self.encode_key(key::Action::Release, k, ucp, mods, None);
                 }
@@ -1112,6 +1122,21 @@ fn mods_from(m: egui::Modifiers) -> key::Mods {
     mods
 }
 
+/// The key tai's shortcut table (shortcuts.rs) names for an egui key, for
+/// the keys it binds. egui reports Shift+= as Plus.
+fn shortcut_key(k: egui::Key) -> Option<macroquad::input::KeyCode> {
+    use egui::Key as E;
+    use macroquad::input::KeyCode as K;
+    Some(match k {
+        E::C => K::C,
+        E::V => K::V,
+        E::Equals | E::Plus => K::Equal,
+        E::Minus => K::Minus,
+        E::Num0 => K::Key0,
+        _ => return None,
+    })
+}
+
 /// The libghostty key and unshifted codepoint for an egui key.
 fn key_for(k: egui::Key) -> Option<(Key, char)> {
     use egui::Key as E;
@@ -1214,6 +1239,28 @@ mod tests {
             "{:?}",
             terminal.pwd()
         );
+    }
+
+    /// tai's shortcuts hold in tai-gui too: their keys never reach the
+    /// program, and plain Ctrl+C still does off macOS.
+    #[test]
+    fn app_shortcuts_are_tais() {
+        use libghostty_vt::key::Mods;
+        let is_shortcut = |k: egui::Key, mods: Mods, macos: bool| {
+            super::shortcut_key(k)
+                .is_some_and(|kc| crate::shortcuts::action_for(kc, mods, macos).is_some())
+        };
+        assert!(is_shortcut(egui::Key::Equals, Mods::SUPER, true));
+        assert!(is_shortcut(
+            egui::Key::Plus,
+            Mods::SUPER | Mods::SHIFT,
+            true
+        ));
+        assert!(is_shortcut(egui::Key::C, Mods::SUPER, true));
+        assert!(is_shortcut(egui::Key::Minus, Mods::CTRL, false));
+        assert!(is_shortcut(egui::Key::C, Mods::CTRL | Mods::SHIFT, false));
+        assert!(!is_shortcut(egui::Key::C, Mods::CTRL, false));
+        assert!(!is_shortcut(egui::Key::A, Mods::SUPER, true));
     }
 
     /// A command from ppxai's `run_shell` is typed, never run: no newline,

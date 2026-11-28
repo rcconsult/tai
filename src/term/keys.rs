@@ -34,6 +34,8 @@ pub struct KeyIn<'a> {
 pub struct Keys {
     encoder: key::Encoder<'static>,
     event: key::Event<'static>,
+    /// Keys whose press went to the program and that aren't released yet.
+    down: Vec<Key>,
 }
 
 impl Keys {
@@ -41,6 +43,7 @@ impl Keys {
         Ok(Self {
             encoder: key::Encoder::new()?,
             event: key::Event::new()?,
+            down: Vec::new(),
         })
     }
 
@@ -51,6 +54,19 @@ impl Keys {
         k: KeyIn<'_>,
         out: &mut Vec<u8>,
     ) -> Result<()> {
+        // A release goes to the program only after its press did, as a
+        // mouse button's does (pointer.rs): a key whose press was an app
+        // shortcut (Cmd+C, Cmd+=), or was pressed before the terminal had
+        // the focus, would send a Kitty release with no press.
+        if k.action == key::Action::Release {
+            let Some(i) = self.down.iter().position(|&d| d == k.key) else {
+                return Ok(());
+            };
+            self.down.swap_remove(i);
+        } else if !self.down.contains(&k.key) {
+            self.down.push(k.key);
+        }
+
         // Windows reports AltGr as Ctrl+Alt. When it produced a character
         // (AltGr+2 gives '@' on Swiss and German layouts), that character
         // is the input: with Ctrl+Alt left in, the encoder sends ESC NUL or
@@ -213,16 +229,47 @@ mod tests {
     fn releases_reach_only_a_program_that_asked() {
         let mut terminal = Terminal::new(80, 24).unwrap();
         let mut keys = Keys::new().unwrap();
+        let a = press(Key::A, 'a', key::Mods::empty(), None);
         let release = KeyIn {
             action: key::Action::Release,
-            ..press(Key::A, 'a', key::Mods::empty(), None)
+            ..a
         };
         let mut out = Vec::new();
+        keys.encode(&terminal, a, &mut out).unwrap();
+        out.clear();
         keys.encode(&terminal, release, &mut out).unwrap();
         assert!(out.is_empty(), "{out:?}");
         // Disambiguate and report event types.
         terminal.vt_write(b"\x1b[>3u");
+        keys.encode(&terminal, a, &mut out).unwrap();
+        out.clear();
         keys.encode(&terminal, release, &mut out).unwrap();
         assert_eq!(out, b"\x1b[97;1:3u");
+    }
+
+    /// A release whose press never reached the program (an app shortcut
+    /// took it) sends nothing, even to a program that asked for releases.
+    #[test]
+    fn a_release_goes_out_only_after_its_press() {
+        let mut terminal = Terminal::new(80, 24).unwrap();
+        terminal.vt_write(b"\x1b[>3u");
+        let mut keys = Keys::new().unwrap();
+        let c = press(Key::C, 'c', key::Mods::SUPER, None);
+        let release = KeyIn {
+            action: key::Action::Release,
+            ..c
+        };
+        let mut out = Vec::new();
+        keys.encode(&terminal, release, &mut out).unwrap();
+        assert!(out.is_empty(), "{out:?}");
+        keys.encode(&terminal, c, &mut out).unwrap();
+        let pressed = out.len();
+        assert!(pressed > 0);
+        keys.encode(&terminal, release, &mut out).unwrap();
+        assert!(out.len() > pressed, "{out:?}");
+        // Released once: a second release has no press.
+        let released = out.len();
+        keys.encode(&terminal, release, &mut out).unwrap();
+        assert_eq!(out.len(), released);
     }
 }
