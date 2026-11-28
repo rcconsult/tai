@@ -710,18 +710,17 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         }
     }
 
+    // The ranges and index answer as Ghostty's do ({0, 0} and 0, not
+    // NSNotFound): with NSNotFound, Kotoeri asked selectedRange on Enter
+    // and never committed its candidate (macOS session, 2026-11-28).
     extern "C" fn marked_range(this: &Object, _sel: Sel) -> NSRange {
         let payload = get_window_payload(this);
         let len = payload.marked_text.encode_utf16().count() as u64;
-        if len == 0 {
-            NSRange::new(NS_NOT_FOUND, 0)
-        } else {
-            NSRange::new(0, len)
-        }
+        NSRange::new(0, len)
     }
 
     extern "C" fn selected_range(_this: &Object, _sel: Sel) -> NSRange {
-        NSRange::new(NS_NOT_FOUND, 0)
+        NSRange::new(0, 0)
     }
 
     extern "C" fn set_marked_text(
@@ -763,7 +762,7 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
     }
 
     extern "C" fn character_index_for_point(_this: &Object, _sel: Sel, _point: NSPoint) -> u64 {
-        NS_NOT_FOUND
+        0
     }
 
     extern "C" fn first_rect_for_character_range(
@@ -1237,9 +1236,6 @@ pub fn define_metal_view_class() -> *const Class {
 
     decl.register()
 }
-
-// tai patch 5.
-const NS_NOT_FOUND: u64 = i64::MAX as u64;
 
 /// The text of an NSString or NSAttributedString the text system hands
 /// over.
