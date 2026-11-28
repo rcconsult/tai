@@ -3,7 +3,10 @@
 - **Status:** Accepted 2026-11-28 (owner), with the no-replay rule of
   decision 1 confirmed. Wayland for tai (decision 5): X11 only for now
   (owner, 2026-11-28: it builds and tests on Linux today); the native
-  way stays on its branch. Proposed
+  way stays on its branch. Implemented 2026-11-28 (parts 1-4 and 6,
+  merged with the owner's go): checked live on macOS and Linux X11, and
+  on Windows for dead keys; the owner skipped an interactive CJK test on
+  Windows. Proposed
   2026-11-28. The owner asked for it ("we go for
   it") after the macOS session found that dead keys don't compose in
   either app. The macOS session reviewed it the same day; its
@@ -367,6 +370,11 @@ decisions above.
   a composition left open when tai loses the focus ends at the next key.
 - **tai sets `LC_CTYPE` on X11** (part 4), as winit does for tai-gui;
   XIM can't commit without it (`src/locale.rs`).
+- **Windows (part 6)** is checked for dead keys and plain keys only: the
+  Microsoft IME couldn't be driven by simulated input, and the owner
+  skipped an interactive CJK test (2026-11-28).
+- **The keypad** goes to the program as the main keys in both apps, as
+  egui gives it (ADR 0014 step 5, open item: Ghostty's keypad keys).
 
 ## Why this and not the alternatives
 

@@ -110,11 +110,16 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
 
 ## Known gaps
 
-- CJK text renders and can be pasted, but typing it through an input
-  method (IME) doesn't work yet, in either binary, and on macOS dead keys
-  (Option+e then e) don't compose. ADR 0015 plans both.
-  `docs/lessons/from-libghostty-projects.md` (lesson 2) has what other
-  projects learned.
+- Input methods and dead keys (ADR 0015) work in both binaries on macOS
+  and on Linux under X11; on Windows dead keys are checked and the input
+  method path is untested by hand. Open: on X11 the input method's
+  candidate window opens at the window's bottom-left, not at the cursor;
+  on macOS the emoji picker and dictation don't reach `tai-gui`; `tai`
+  doesn't end a composition when it loses the focus. ADR 0015's
+  implementation notes list them.
+- On Linux `tai` runs on X11 only, through XWayland on a Wayland
+  session (ADR 0015 decision 5); the native Wayland work is on branch
+  `tai-wayland-native`.
 - Emoji are monochrome; colour emoji aren't drawn yet.
 - tai doesn't shape text, so scripts that need shaping, such as Arabic or
   Devanagari, draw poorly. A grapheme cluster draws its first character
