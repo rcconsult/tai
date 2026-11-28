@@ -34,6 +34,23 @@ pub const EGL_HEIGHT: u32 = 12374;
 pub const EGL_SURFACE_TYPE: u32 = 12339;
 pub const EGL_NONE: u32 = 12344;
 pub const EGL_CONTEXT_CLIENT_VERSION: u32 = 12440;
+// tai patch 2: desktop OpenGL through EGL.
+pub const EGL_RENDERABLE_TYPE: u32 = 0x3040;
+pub const EGL_OPENGL_BIT: u32 = 0x0008;
+pub const EGL_OPENGL_ES2_BIT: u32 = 0x0004;
+pub const EGL_OPENGL_API: u32 = 0x30A2;
+pub const EGL_CONTEXT_MAJOR_VERSION: u32 = 0x3098;
+pub const EGL_CONTEXT_MINOR_VERSION: u32 = 0x30FB;
+
+/// Which client API an EGL context is for (tai patch 2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EglApi {
+    /// OpenGL ES 2, miniquad's choice everywhere it uses EGL.
+    Gles2,
+    /// Desktop OpenGL, as GLX gives on X11: version 2.1 asked for, and the
+    /// compatibility profile, so the driver returns its highest version.
+    DesktopGl,
+}
 
 pub type NativeDisplayType = EGLNativeDisplayType;
 pub type NativePixmapType = EGLNativePixmapType;
@@ -52,6 +69,8 @@ crate::declare_module! {
     "libEGL.so.1",
     ...
     ...
+    // tai patch 2.
+    pub fn eglBindAPI(u32) -> EGLBoolean,
     pub fn eglChooseConfig(
         EGLDisplay,
         *const EGLint,
@@ -172,6 +191,7 @@ pub unsafe fn create_egl_context(
     display: *mut std::ffi::c_void,
     alpha: bool,
     sample_count: i32,
+    api: EglApi,
 ) -> Result<(EGLContext, EGLConfig, EGLDisplay), EglError> {
     let display = (egl.eglGetDisplay)(display as _);
     if display.is_null() {
@@ -183,10 +203,20 @@ pub unsafe fn create_egl_context(
         return Err(EglError::InitializeFailed);
     }
 
+    let renderable = match api {
+        EglApi::Gles2 => EGL_OPENGL_ES2_BIT,
+        EglApi::DesktopGl => {
+            if (egl.eglBindAPI)(EGL_OPENGL_API) == 0 {
+                return Err(EglError::CreateContextFailed);
+            }
+            EGL_OPENGL_BIT
+        }
+    };
     let alpha_size = if alpha { 8 } else { 0 };
     #[rustfmt::skip]
     let cfg_attributes = [
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, renderable,
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
@@ -237,7 +267,16 @@ pub unsafe fn create_egl_context(
     if !exact_cfg_found {
         config = available_cfgs[0];
     }
-    let ctx_attributes = [EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE];
+    let ctx_attributes = match api {
+        EglApi::Gles2 => [EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE, EGL_NONE, EGL_NONE],
+        EglApi::DesktopGl => [
+            EGL_CONTEXT_MAJOR_VERSION,
+            2,
+            EGL_CONTEXT_MINOR_VERSION,
+            1,
+            EGL_NONE,
+        ],
+    };
     let context = (egl.eglCreateContext)(
         display,
         config,

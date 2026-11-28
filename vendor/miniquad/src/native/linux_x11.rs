@@ -559,6 +559,7 @@ where
         display.display as *mut _,
         conf.platform.framebuffer_alpha,
         conf.sample_count,
+        egl::EglApi::Gles2,
     )
     .unwrap();
 

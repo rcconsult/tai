@@ -430,6 +430,7 @@ where
             std::ptr::null_mut(), /* EGL_DEFAULT_DISPLAY */
             conf.platform.framebuffer_alpha,
             conf.sample_count,
+            crate::native::egl::EglApi::Gles2,
         )
         .expect("Cant create EGL context");
 

@@ -150,6 +150,16 @@ impl Decorations {
             );
             (libdecor.libdecor_frame_map)(frame);
             display.xdg_toplevel = (libdecor.libdecor_frame_get_xdg_toplevel)(frame);
+            // tai patch 3: libdecor with no plugin installed (GNOME without
+            // libdecor-0-plugin-1-gtk) prints "No plugins found, falling back
+            // on no decorations" and gives no xdg surface at all, and
+            // miniquad then asserts on the missing toplevel. With no surface
+            // made, the wl_surface is still free: draw miniquad's own border.
+            if display.xdg_toplevel.is_null()
+                && (libdecor.libdecor_frame_get_xdg_surface)(frame).is_null()
+            {
+                return Decorations::fallback(display);
+            }
             use extensions::libdecor::LIBDECOR_ACTION_RESIZE as RESIZE;
             if resizable {
                 (libdecor.libdecor_frame_set_capabilities)(frame, RESIZE);

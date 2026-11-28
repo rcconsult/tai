@@ -127,6 +127,7 @@ yeslogic-fontconfig-sys = "6.0.1"
 # Vendored macroquad with a clipboard fix; see vendor/macroquad/TAI-PATCHES.md.
 [patch.crates-io]
 macroquad = { path = "vendor/macroquad" }
+miniquad = { path = "vendor/miniquad" }
 
 # Optimize dependencies in dev builds. Font parsing and glyph rasterizing
 # live in dependencies: when tai used fontdue, a font-size step took ~1.1 s

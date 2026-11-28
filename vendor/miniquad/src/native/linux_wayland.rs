@@ -1134,6 +1134,8 @@ where
             wdisplay as *mut _,
             conf.platform.framebuffer_alpha,
             conf.sample_count,
+            // tai patch 2: desktop OpenGL, as GLX gives on X11.
+            egl::EglApi::DesktopGl,
         )
         .unwrap();
 
