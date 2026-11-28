@@ -153,6 +153,11 @@ pub struct TerminalPane {
     keys: crate::term::keys::Keys,
     /// The key pressed last, waiting for its text.
     pending_key: Option<PendingKey>,
+    /// Where the input method's candidate window opens (ADR 0015).
+    caret: crate::term::ime::Caret,
+    /// Whether the pane had the keyboard last frame, to end a composition
+    /// when it loses it.
+    had_focus: bool,
     atlas: GlyphAtlas,
     /// This pane's GPU objects, its own as its atlas is (gpu.rs).
     gpu: crate::gpu::PaneId,
@@ -299,6 +304,8 @@ impl TerminalPane {
             cell_it: CellIterator::new()?,
             keys: crate::term::keys::Keys::new()?,
             pending_key: None,
+            caret: Default::default(),
+            had_focus: false,
             atlas: GlyphAtlas::new(crate::cells::ATLAS_MAX_HEIGHT),
             gpu: crate::gpu::PaneId::new(),
             instances: Arc::new(Vec::new()),
@@ -549,7 +556,14 @@ impl TerminalPane {
             });
         }
 
-        if response.has_focus() && !under_dialog && !self.exited() {
+        let focused = response.has_focus() && !under_dialog && !self.exited();
+        if self.had_focus && !focused {
+            // A composition can't go on without the keyboard, and keys held
+            // now are released where the pane doesn't see it.
+            self.keys.focus_lost();
+        }
+        self.had_focus = focused;
+        if focused {
             let (events, held) = ui.input(|i| (i.events.clone(), i.modifiers));
             for event in &events {
                 if let Err(e) = self.handle_event(event, held) {
@@ -600,6 +614,32 @@ impl TerminalPane {
                 }
             }
             Err(e) => tracing::warn!("render: {e}"),
+        }
+        // Input methods and dead keys (ADR 0015): while the pane has the
+        // keyboard, egui-winit lets winit's input method see the keys, and
+        // its candidate window opens at the cursor's cell once the cursor
+        // has settled there (src/term/ime.rs).
+        if focused {
+            let cursor = self.built_for.and_then(|(_, cursor)| cursor);
+            if let Some((col, row)) = self.caret.update(cursor) {
+                let d = self.dims;
+                let cell = egui::Rect::from_min_size(
+                    rect.min
+                        + egui::vec2(
+                            PADDING + f32::from(col) * d.cell_width,
+                            PADDING + f32::from(row) * d.cell_height,
+                        ),
+                    egui::vec2(d.cell_width, d.cell_height),
+                );
+                ui.ctx().output_mut(|o| {
+                    o.ime = Some(egui::output::IMEOutput {
+                        purpose: egui::IMEPurpose::Terminal,
+                        rect: cell,
+                        cursor_rect: cell,
+                        should_interrupt_composition: false,
+                    });
+                });
+            }
         }
         let atlas = self.atlas.take_dirty_rows().map(|(start, end)| {
             let (w, h) = self.atlas.size();
@@ -961,6 +1001,16 @@ impl TerminalPane {
                     self.typed = true;
                 }
             },
+            // The input method's text being composed, drawn at the cursor;
+            // an empty one ends the composition.
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                self.keys.set_preedit(Some(text));
+            }
+            // Its result, typed input for the program (src/term/keys.rs).
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                self.typed = true;
+                self.keys.commit(&self.terminal, text, &mut self.response)?;
+            }
             egui::Event::Paste(text) => {
                 let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
                 self.response
