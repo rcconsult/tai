@@ -69,8 +69,10 @@ reference)
 
 **tai on Windows**
 
-- `TranslateMessage` composes dead keys before `WM_CHAR`, so they should
-  already work. Not checked live yet.
+- `TranslateMessage` composes dead keys before `WM_CHAR`, so they work:
+  checked live on 2026-11-28, Swiss French chosen with Win+Space, where
+  `^ e` gives `ê` and `^ space` gives `^`, in pwsh. Not checked under
+  the Kitty protocol.
 - miniquad already sends an IME's committed text as characters
   (`WM_IME_COMPOSITION` with `GCS_RESULTSTR`).
 - It places the candidate window from `GetCaretPos`, but tai never sets
@@ -88,7 +90,8 @@ reference)
 - With IME off on macOS, a dead key arrives as a key with no text:
   egui-winit falls back from the dead logical key to the physical key.
 - On Windows, winit composes dead keys into the key event's text either
-  way. Not checked live yet.
+  way: the same live check as tai's gives `ê` and `^`. Not checked under
+  the Kitty protocol, where the dead key may leak as on X11.
 - On X11 with IME off, winit skips `XFilterEvent`
   (`x11/event_processor.rs`, around line 152) and composes from
   xkbcommon's compose tables itself (`common/xkb/mod.rs`). Live on
