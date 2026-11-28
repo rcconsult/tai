@@ -6,6 +6,9 @@
   and `1010780`. tai-gui's wide cells came in `41af9c6`, and the chat
   pane's fallback in `b39c84e`. There's no CI yet, so decision 2's CI
   item has nothing to apply to. IME (decision 7) is on hold.)
+- **Superseded by:** in part, [ADR 0015](0015-ime-and-dead-keys.md)
+  (2026-11-28), which replaces decision 7 with IME and dead keys in both
+  apps.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host, with input from the macOS and Linux sessions.
 - **Supersedes:** in part, decision 2 of

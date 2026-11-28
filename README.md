@@ -111,7 +111,8 @@ iTerm2's `imgcat` doesn't work: it uses iTerm2's own escape sequence
 ## Known gaps
 
 - CJK text renders and can be pasted, but typing it through an input
-  method (IME) doesn't work yet, in either binary. The work is on hold;
+  method (IME) doesn't work yet, in either binary, and on macOS dead keys
+  (Option+e then e) don't compose. ADR 0015 plans both.
   `docs/lessons/from-libghostty-projects.md` (lesson 2) has what other
   projects learned.
 - Emoji are monochrome; colour emoji aren't drawn yet.
