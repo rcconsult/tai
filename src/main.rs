@@ -38,17 +38,10 @@ use libghostty_vt::{
     key::{self, Key},
     kitty::graphics::{Graphics, PlacementIterator},
     mode::Mode,
-    mouse,
-    point::{Coordinate, Point},
-    render::{CellIteration, CellIterator, Colors, Dirty, RenderState, RowIterator},
-    screen::{CellWide, Screen},
-    selection::gesture::{
-        Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
-    },
-    terminal::ScrollViewport,
+    render::{CellIterator, Dirty, RenderState, RowIterator},
 };
 
-use crate::fonts::{Coverage, Face, SymbolSpan, Typeface};
+use crate::fonts::{Coverage, Face, Typeface};
 use crate::pty::{Child, Pty, PtyError};
 use crate::shortcuts::Action;
 
@@ -82,17 +75,6 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// lost ("out of space, 16 bytes required", seen in tai-gui). Every key and
 /// mouse sequence fits in this.
 const ENCODE_ROOM: usize = 64;
-/// The modes that set the mouse encoder's tracking mode and format.
-const MOUSE_MODES: [Mode; 8] = [
-    Mode::X10_MOUSE,
-    Mode::NORMAL_MOUSE,
-    Mode::BUTTON_MOUSE,
-    Mode::ANY_MOUSE,
-    Mode::UTF8_MOUSE,
-    Mode::SGR_MOUSE,
-    Mode::URXVT_MOUSE,
-    Mode::SGR_PIXELS_MOUSE,
-];
 
 /// A material that copies a texture to the screen without blending.
 ///
@@ -144,10 +126,6 @@ fn present_material() -> Result<Material> {
 // tai-gui (src/term/mod.rs).
 use crate::term::PADDING;
 
-/// Rows one notch of a mouse wheel scrolls, Ghostty's default discrete
-/// mouse-scroll-multiplier.
-const WHEEL_ROWS: f32 = 3.0;
-
 /// Notches of a mouse wheel in miniquad's wheel travel, which differs by
 /// platform (miniquad 0.4.11 src/native): WM_MOUSEWHEEL's WHEEL_DELTA,
 /// 120, on Windows; on macOS a line delta times 10, or a trackpad's
@@ -161,17 +139,6 @@ fn wheel_notches(travel: f32) -> f32 {
         travel
     } else {
         travel / 10.0
-    }
-}
-
-/// The arrow key the wheel sends under alternate scroll, in the cursor key
-/// mode (DECCKM) the program set; tai-gui's `arrow_seq` is the same.
-fn arrow_seq(up: bool, application: bool) -> &'static [u8] {
-    match (up, application) {
-        (true, true) => b"\x1bOA",
-        (false, true) => b"\x1bOB",
-        (true, false) => b"\x1b[A",
-        (false, false) => b"\x1b[B",
     }
 }
 
@@ -206,31 +173,6 @@ fn capture_mouse(held: bool, captured: &mut bool) {
     }
     *captured = held;
 }
-
-/// Add `rows` of travel to `pending` and take the whole rows out, keeping
-/// the fraction for the next frame. A change of direction drops the
-/// fraction left from the other way.
-fn take_rows(pending: &mut f32, rows: f32) -> isize {
-    if rows == 0.0 {
-        return 0;
-    }
-    if pending.signum() != rows.signum() {
-        *pending = 0.0;
-    }
-    *pending += rows;
-    let whole = pending.trunc();
-    *pending -= whole;
-    whole as isize
-}
-
-/// Presses closer together than this are a double or triple click; a
-/// Shift-click further from the last press extends the selection.
-const CLICK_INTERVAL: Duration = Duration::from_millis(500);
-
-/// How often a selection drag past the window's top or bottom scrolls one
-/// row, as Ghostty's `selection_scroll_ms` (src/termio/Thread.zig at
-/// 108cacb1).
-const AUTOSCROLL_EVERY: Duration = Duration::from_millis(15);
 
 /// Horizontal gap between cells. This is usually not necessary for
 /// TrueType fonts, but for bitmap fonts like macroquad's builtin font
@@ -380,9 +322,7 @@ async fn main() -> Result<()> {
         // (the user shell) is still active or not. We only want to keep
         // processing inputs and communicate with the child when it's
         // alive, and when it's exited we should handle cleanup properly.
-        input
-            .selection
-            .update_mouse_cursor(&terminal, dims, matches!(child, Child::Active(_)))?;
+        input.update_mouse_cursor(&terminal, dims, matches!(child, Child::Active(_)))?;
 
         // Typing or output can move or clear the selection.
         let mut content_changed = false;
@@ -622,10 +562,17 @@ struct CellGrid {
 /// One viewport row, as last built.
 #[derive(Default)]
 struct RowCells {
+    /// The row as the terminal core read it (src/term/rows.rs).
+    read: term::rows::Row,
     /// A colour per cell; transparent where the terminal's background shows.
     bg: Vec<[u8; 4]>,
     text: Vec<cells::Instance>,
-    virtual_runs: Vec<placeholders::Placement>,
+}
+
+impl AsRef<term::rows::Row> for RowCells {
+    fn as_ref(&self) -> &term::rows::Row {
+        &self.read
+    }
 }
 
 impl CellGrid {
@@ -727,6 +674,10 @@ impl<'alloc> Renderer<'alloc> {
         }
         grid.dims = Some(dims);
 
+        // The cursor is drawn into its cell (term::rows::read_row), so the
+        // rows it left and entered are read again.
+        let old_cursor_row = self.frame.as_ref().and_then(|f| f.cursor).map(|(_, y)| y);
+        let cursor_row = cursor.map(|(_, y)| y);
         if self.frame.as_ref().is_none_or(|f| f.dims != dims) {
             let target = render_target(
                 (dims.window_width * dims.dpi_scale).round() as u32,
@@ -759,10 +710,9 @@ impl<'alloc> Renderer<'alloc> {
             ..
         } = grid;
 
+        let cursor_color = colors.cursor.unwrap_or(colors.foreground);
         let mut row_it = self.row_it.update(&snapshot)?;
         let mut text = String::with_capacity(16);
-        let mut icons: Vec<Icon> = Vec::new();
-        let mut placeholder_cells: Vec<Option<placeholders::PlaceholderCell>> = Vec::new();
         let mut row_index = 0;
         let mut y = PADDING;
 
@@ -770,56 +720,47 @@ impl<'alloc> Renderer<'alloc> {
             if rows.len() <= row_index {
                 rows.push(RowCells::default());
             }
-            if !rebuild && !row.dirty()? {
+            let index = row_index as u16;
+            if !rebuild
+                && !row.dirty()?
+                && old_cursor_row != Some(index)
+                && cursor_row != Some(index)
+            {
                 y += dims.cell_height;
                 row_index += 1;
                 continue;
             }
             let built = &mut rows[row_index];
+            // The row, read by the terminal core tai-gui shares
+            // (src/term/rows.rs), into a texel per cell and glyphs.
+            let on_row = cursor
+                .filter(|&(_, cy)| cy == index)
+                .map(|(col, _)| term::rows::Cursor {
+                    col,
+                    color: cursor_color,
+                });
+            built.read =
+                term::rows::read_row(row, &mut self.cell_it, &colors, coverage, on_row, &mut text)?;
             built.bg.clear();
+            built.bg.extend(
+                built
+                    .read
+                    .bg
+                    .iter()
+                    .map(|bg| bg.map_or([0; 4], |c| [c.r, c.g, c.b, 255])),
+            );
             built.text.clear();
-            built.virtual_runs.clear();
-            let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
-            let mut cell_it = self.cell_it.update(row)?;
-            walk_row(
-                &mut cell_it,
-                placeholder_row,
-                y,
-                dims,
-                &colors,
+            term::rows::push_glyphs(
+                atlas,
                 coverage,
-                &mut text,
-                &mut icons,
-                &mut placeholder_cells,
-                &mut GridRow {
-                    atlas,
-                    row: built,
-                    font: coverage.font(Face::Primary),
-                    y,
-                    dims,
-                },
-            )?;
-
-            // Icons go after the row's text, so one that overhangs into a
-            // blank next cell isn't covered by it.
-            for icon in icons.drain(..) {
-                let place = coverage.place(icon.face, dims.font_size, icon.cells);
-                atlas.push_text(
-                    &mut built.text,
-                    coverage.font(icon.face),
-                    icon.face,
-                    &icon.text,
-                    icon.x,
-                    icon.y + dims.baseline - place.rise,
-                    place.font_size,
-                    dims.dpi_scale,
-                    icon.fg,
-                    icon.bold,
-                );
-            }
-            if placeholder_row {
-                built.virtual_runs = placeholders::row_placements(placeholder_cells.drain(..));
-            }
+                &mut built.text,
+                &built.read,
+                y,
+                dims.cell_width,
+                dims.baseline,
+                dims.font_size,
+                dims.dpi_scale,
+            );
             row.set_dirty(false)?;
             y += dims.cell_height;
             row_index += 1;
@@ -832,7 +773,12 @@ impl<'alloc> Renderer<'alloc> {
                 let virtual_runs: Vec<(u16, placeholders::Placement)> = rows
                     .iter()
                     .enumerate()
-                    .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
+                    .flat_map(|(r, row)| {
+                        row.read
+                            .virtual_runs
+                            .iter()
+                            .map(move |run| (r as u16, *run))
+                    })
                     .collect();
                 term::images::frame_draws(
                     terminal,
@@ -854,6 +800,18 @@ impl<'alloc> Renderer<'alloc> {
         };
 
         clear_background(color(colors.background));
+        // The padding in the edge cells' colours, as tai-gui and Ghostty's
+        // window-padding-color = extend (src/term/rows.rs).
+        for (rect, fill) in term::rows::padding_rects(
+            rows,
+            dims.window_width,
+            dims.window_height,
+            dims.cell_width,
+            dims.cell_height,
+            colors.background,
+        ) {
+            draw_rectangle(rect[0], rect[1], rect[2], rect[3], color(fill));
+        }
         draw_stage(term::images::Stage::BelowBackground)?;
 
         // Backgrounds: one texel per cell, stretched over the grid with
@@ -909,17 +867,6 @@ impl<'alloc> Renderer<'alloc> {
             camera.matrix(),
             Some(frame.target.render_pass.raw_miniquad_id()),
         );
-
-        if let Some((x, y)) = cursor {
-            let cursor_color = colors.cursor.unwrap_or(colors.foreground);
-            draw_rectangle(
-                PADDING + x as f32 * dims.cell_width,
-                PADDING + y as f32 * dims.cell_height,
-                dims.cell_width,
-                dims.cell_height,
-                color(cursor_color),
-            );
-        }
 
         draw_stage(term::images::Stage::AboveText)?;
 
@@ -1023,174 +970,6 @@ impl<'alloc> Renderer<'alloc> {
         }
         Ok(())
     }
-}
-
-/// Read one row's cells and work out what each shows: colours (inverse and
-/// selection swap them), Kitty placeholder cells, and which font draws each
-/// grapheme. Backgrounds and primary-font text go to `sink` as they're
-/// read. Fallback-font icons go to `icons`, complete once the row is read,
-/// because an icon spreads into the next cell when that one is blank. On a placeholder row, every cell's placeholder or `None`
-/// goes to `placeholder_cells`.
-#[allow(clippy::too_many_arguments)]
-fn walk_row(
-    cell_it: &mut CellIteration<'_, '_>,
-    placeholder_row: bool,
-    y: f32,
-    dims: Dimensions,
-    colors: &Colors,
-    coverage: &Coverage,
-    text: &mut String,
-    icons: &mut Vec<Icon>,
-    placeholder_cells: &mut Vec<Option<placeholders::PlaceholderCell>>,
-    sink: &mut GridRow<'_>,
-) -> Result<()> {
-    placeholder_cells.clear();
-    let mut x = PADDING;
-    // Whether the last cell drew an icon, which may take this cell.
-    let mut icon_open = false;
-    let mut span = SymbolSpan::default();
-    while let Some(cell) = cell_it.next() {
-        // Selection membership is computed by libghostty from the
-        // terminal-owned selection. Selected cells use reverse-video colors,
-        // matching the common terminal behavior.
-        let selected = cell.is_selected()?;
-        let graphemes = cell.graphemes_len()?;
-        let bg = cell.bg_color()?;
-        if graphemes > 0 {
-            // The whole grapheme cluster as UTF-8 text.
-            cell.graphemes_utf8(text)?;
-        }
-        let grow = span.next((graphemes > 0).then(|| text.chars().next()).flatten());
-        if std::mem::take(&mut icon_open)
-            && grow
-            && let Some(icon) = icons.last_mut()
-        {
-            icon.cells = 2;
-        }
-
-        // A placeholder cell shows part of an image, drawn later; its own
-        // character has no glyph.
-        if placeholder_row {
-            if let Some(placeholder) = term::images::placeholder_cell(cell)? {
-                placeholder_cells.push(Some(placeholder));
-                sink.background(x, bg);
-                x += dims.cell_width;
-                continue;
-            }
-            placeholder_cells.push(None);
-        }
-
-        if graphemes == 0 {
-            // No text, but maybe a background (e.g. from an erase with a
-            // colour set), or the selection's.
-            sink.background(
-                x,
-                if selected {
-                    Some(colors.foreground)
-                } else {
-                    bg
-                },
-            );
-        } else {
-            // fg_color and bg_color flatten style colours, content-tag
-            // colours and palette lookups into one RGB value, `None` when
-            // the cell uses the terminal default.
-            let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-            let mut has_bg = bg.is_some();
-            let mut bg = bg.unwrap_or(colors.background);
-            let mut bold = false;
-            if cell.has_styling()? {
-                let style = cell.style()?;
-                // Inverse (reverse video) swaps foreground and background.
-                if style.inverse {
-                    std::mem::swap(&mut fg, &mut bg);
-                    has_bg = true;
-                }
-                bold = style.bold;
-            }
-            if selected {
-                std::mem::swap(&mut fg, &mut bg);
-                has_bg = true;
-            }
-            sink.background(x, has_bg.then_some(bg));
-
-            // A fallback font draws what the primary lacks (e.g. Nerd Font
-            // icons). One face draws the whole cluster, trimmed to what tai
-            // can draw without a shaper (`Coverage::cluster_face`).
-            let face = coverage.cluster_face(text);
-            if matches!(
-                face,
-                Face::Symbols | Face::Iosevka | Face::Emoji | Face::Discovered(_)
-            ) {
-                // A wide cell spans two cells; a narrow symbol may take
-                // the next cell too (`SymbolSpan`).
-                let wide = cell.raw_cell()?.wide()? == CellWide::Wide;
-                icons.push(Icon {
-                    text: text.clone(),
-                    face,
-                    x,
-                    y,
-                    fg: color(fg),
-                    bold,
-                    cells: if wide { 2 } else { 1 },
-                });
-                icon_open = !wide;
-            } else if face == Face::Primary {
-                sink.text(text, x, fg, bold);
-            }
-        }
-        x += dims.cell_width;
-    }
-    Ok(())
-}
-
-/// The cell renderer's row buffers (ADR 0008).
-struct GridRow<'a> {
-    atlas: &'a mut cells::GlyphAtlas,
-    row: &'a mut RowCells,
-    font: &'a Typeface,
-    y: f32,
-    dims: Dimensions,
-}
-
-impl GridRow<'_> {
-    /// The next cell's background; `None` where the terminal's own
-    /// background shows.
-    fn background(&mut self, _x: f32, bg: Option<Rgb>) {
-        // One texel per cell; transparent shows the terminal's background.
-        self.row
-            .bg
-            .push(bg.map_or([0; 4], |c| [c.r, c.g, c.b, 255]));
-    }
-
-    /// A cell's text in the primary font, at `x`.
-    fn text(&mut self, text: &str, x: f32, fg: Rgb, bold: bool) {
-        self.atlas.push_text(
-            &mut self.row.text,
-            self.font,
-            Face::Primary,
-            text,
-            x,
-            self.y + self.dims.baseline,
-            self.dims.font_size,
-            self.dims.dpi_scale,
-            color(fg),
-            bold,
-        );
-    }
-}
-
-/// A fallback-font glyph waiting to be drawn at the end of its row.
-struct Icon {
-    text: String,
-    face: Face,
-    x: f32,
-    y: f32,
-    fg: Color,
-    bold: bool,
-    /// How many cells it spans: 2 for a wide cell, or a narrow one whose
-    /// next cell is blank.
-    cells: u8,
 }
 
 /// The size of `text` in `font`, as macroquad's `measure_text` measured it
@@ -1421,13 +1200,11 @@ struct PendingKey {
 struct Input<'alloc> {
     key_encoder: key::Encoder<'alloc>,
     key_event: key::Event<'alloc>,
-    mouse_encoder: mouse::Encoder<'alloc>,
-    mouse_event: mouse::Event<'alloc>,
-    /// The mouse modes and size the encoder was last given; setting either
-    /// makes it forget the last reported cell.
-    mouse_encoder_for: Option<([bool; MOUSE_MODES.len()], mouse::EncoderSize)>,
     response: Vec<u8>,
-    selection: SelectionState<'alloc>,
+    /// The mouse: reports, selection and wheel (src/term/pointer.rs).
+    pointer: term::pointer::Pointer,
+    /// The cursor icon last set, so it is only set again when it changes.
+    cursor: Cell<Option<CursorIcon>>,
     /// App shortcuts pressed this frame, run by the main loop.
     actions: Vec<Action>,
     /// Keys whose press was a shortcut, so their release is swallowed too.
@@ -1454,20 +1231,15 @@ struct Input<'alloc> {
     mouse_captured: bool,
     /// This frame's wheel travel in notches, from the input stream.
     wheel: f32,
-    /// Wheel travel not yet a whole row, as Ghostty's `pending_scroll_y`
-    /// (src/Surface.zig at 108cacb1, scrollCallback).
-    pending_rows: f32,
 }
 impl<'alloc> Input<'alloc> {
     fn new() -> Result<Self> {
         Ok(Self {
             key_encoder: key::Encoder::new()?,
             key_event: key::Event::new()?,
-            mouse_encoder: mouse::Encoder::new()?,
-            mouse_event: mouse::Event::new()?,
-            mouse_encoder_for: None,
             response: Vec::with_capacity(64),
-            selection: SelectionState::new()?,
+            pointer: term::pointer::Pointer::new()?,
+            cursor: Cell::new(None),
             actions: Vec::new(),
             swallowed: Vec::new(),
             held: None,
@@ -1485,7 +1257,6 @@ impl<'alloc> Input<'alloc> {
             #[cfg(windows)]
             mouse_captured: false,
             wheel: 0.0,
-            pending_rows: 0.0,
         })
     }
 
@@ -1810,199 +1581,87 @@ impl<'alloc> Input<'alloc> {
     /// to the pty.  The encoder handles tracking mode (X10, normal, button,
     /// any-event) and output format (X10, UTF8, SGR, URxvt, SGR-Pixels)
     /// based on what the terminal application has requested.
+    /// One frame of the mouse through the terminal core
+    /// (src/term/pointer.rs), which tai-gui shares: this turns macroquad's
+    /// state into its input.
     fn handle_mouse_input(
         &mut self,
         terminal: &mut Terminal<'alloc, '_>,
         dims: Dimensions,
     ) -> Result<()> {
-        // Track whether any button is currently held — the encoder uses
-        // this to distinguish drags from plain motion.
-        let any_pressed = Self::ALL_MOUSE_BUTTONS
-            .into_iter()
-            .any(|(m, _)| is_mouse_button_down(m));
-
+        use term::pointer::{Click, Input as PointerInput, Pos, WHEEL_ROWS};
         let mods = Self::keyboard_mods();
-
-        // The encoder works in surface pixels, which are physical pixels
-        // (include/ghostty/vt/mouse/encoder.h). macroquad reports logical
-        // points, so scale them. SGR-Pixels reports (mode 1016) then share
-        // units with the window size tai reports (ws_xpixel, CSI 14 t), and
-        // programs that divide one by the other land on the right cell on
-        // Retina displays too. Ghostty's app does the same: its
-        // mouse_encode.zig posToPixels (at a887df42) reports surface pixels.
-        let scale = dims.dpi_scale;
         let (x, y) = mouse_position();
-        self.mouse_event
-            .set_mods(mods)
-            .set_position(mouse::Position {
-                x: x * scale,
-                y: y * scale,
-            });
-
-        let (cell_width, cell_height) = dims.cell_pixels();
-        let padding = (PADDING * scale) as u32;
-        // The encoder's tracking mode and format follow the terminal's,
-        // and it needs the geometry to find cells. Both are set only when
-        // they change: setting either makes the encoder forget the last
-        // cell (src/terminal/c/mouse_encode.zig at 108cacb1), and every
-        // move within a cell was then reported.
-        let size = mouse::EncoderSize {
-            screen_width: (dims.window_width * scale) as u32,
-            screen_height: (dims.window_height * scale) as u32,
-            cell_width,
-            cell_height,
-            padding_top: padding,
-            padding_bottom: padding,
-            padding_left: padding,
-            padding_right: padding,
-        };
-        let mut modes = [false; MOUSE_MODES.len()];
-        for (on, mode) in modes.iter_mut().zip(MOUSE_MODES) {
-            *on = terminal.mode(mode)?;
-        }
-        if self.mouse_encoder_for != Some((modes, size)) {
-            self.mouse_encoder
-                .set_options_from_terminal(terminal)
-                .set_size(size)?
-                // Motion within the cell reported last is dropped.
-                .set_track_last_cell(true);
-            self.mouse_encoder_for = Some((modes, size));
-        }
-        self.mouse_encoder.set_any_button_pressed(any_pressed);
-
-        // Each button's press and release this frame. A fast click or a
-        // touchpad tap presses and releases within one frame, and both
-        // count: the press first, unless the button is down again, when a
-        // release came before a new press.
-        for (mb, btn) in Self::ALL_MOUSE_BUTTONS {
-            let actions: &[mouse::Action] =
-                match (is_mouse_button_pressed(mb), is_mouse_button_released(mb)) {
-                    (true, true) if is_mouse_button_down(mb) => {
-                        &[mouse::Action::Release, mouse::Action::Press]
-                    }
-                    (true, true) => &[mouse::Action::Press, mouse::Action::Release],
-                    (true, false) => &[mouse::Action::Press],
-                    (false, true) => &[mouse::Action::Release],
-                    (false, false) => continue,
-                };
-            for &action in actions {
-                match action {
-                    // The release of a press that started a selection ends
-                    // it rather than reaching the program.
-                    mouse::Action::Release
-                        if mb == MouseButton::Left && self.selection.is_selecting() =>
-                    {
-                        self.selection.on_release(terminal, dims)?;
-                        continue;
-                    }
-                    mouse::Action::Press
-                        if mb == MouseButton::Left
-                            && Self::selection_allowed_with_mods(terminal, mods)? =>
-                    {
-                        self.selection.on_click(terminal, x, y, dims, mods)?;
-                        continue;
-                    }
-                    _ => {}
-                }
-                // A button the program gets clears the terminal's selection,
-                // and the gesture forgets its click, as Ghostty's
-                // mouseButtonCallback does (src/Surface.zig at 108cacb1):
-                // the program handles the mouse now. Shift keeps the mouse
-                // the terminal's, and without tracking nothing is reported.
-                if terminal.is_mouse_tracking()? && !mods.contains(key::Mods::SHIFT) {
-                    if terminal.selection()?.is_some() {
-                        terminal.set_selection(None)?;
-                    }
-                    self.selection.gesture.reset(terminal);
-                }
-                self.mouse_event.set_action(action).set_button(Some(btn));
-                self.response.reserve(ENCODE_ROOM);
-                self.mouse_encoder
-                    .encode_to_vec(&self.mouse_event, &mut self.response)?;
-            }
-        }
-
-        // Mouse motion — send a motion event with whatever button is held
-        // (or no button for pure motion in any-event tracking mode).
+        let pos = Pos { x, y };
         let delta = mouse_delta_position();
-        if delta.x.abs() > 1e-6 || delta.y.abs() > 1e-6 {
-            if self.selection.is_selecting() {
-                self.selection.on_drag(terminal, x, y, dims, mods)?;
-            } else {
-                self.mouse_event
-                    .set_action(mouse::Action::Motion)
-                    .set_button(
-                        Self::ALL_MOUSE_BUTTONS
-                            .into_iter()
-                            .find(|(mb, _)| is_mouse_button_down(*mb))
-                            .map(|(_, btn)| btn),
-                    );
-                self.response.reserve(ENCODE_ROOM);
-                self.mouse_encoder
-                    .encode_to_vec(&self.mouse_event, &mut self.response)?;
+        let mut input = PointerInput {
+            pointer: Some(pos),
+            moved: delta.x.abs() > 1e-6 || delta.y.abs() > 1e-6,
+            mods,
+            // Notches from the input stream (wheel_notches), WHEEL_ROWS each.
+            wheel_rows: std::mem::take(&mut self.wheel) * WHEEL_ROWS,
+            ..Default::default()
+        };
+        for (mb, button) in Self::ALL_MOUSE_BUTTONS {
+            input.down[button as usize] = is_mouse_button_down(mb);
+            // A fast click or a tap presses and releases within one frame,
+            // and both count: the press first, unless the button is down
+            // again, when a release came before a new press.
+            let order: &[bool] = match (is_mouse_button_pressed(mb), is_mouse_button_released(mb)) {
+                (true, true) if is_mouse_button_down(mb) => &[false, true],
+                (true, true) => &[true, false],
+                (true, false) => &[true],
+                (false, true) => &[false],
+                (false, false) => &[],
+            };
+            for &pressed in order {
+                input.clicks.push(Click {
+                    button,
+                    pressed,
+                    pos,
+                    mods,
+                });
             }
         }
-
-        // Scroll wheel handling.  When a mouse tracking mode is active the
-        // wheel events are forwarded to the application as button 4/5
-        // presses. On the alternate screen under alternate scroll they're
-        // arrow keys. Otherwise we scroll the viewport through the
-        // scrollback buffer so the user can review history.
-        // Rows of travel, WHEEL_ROWS per notch as Ghostty's default
-        // mouse-scroll-multiplier (src/config/Config.zig at 108cacb1), with
-        // fractions carried to the next frame. Positive is up.
-        let notches = std::mem::take(&mut self.wheel);
-        let rows = take_rows(&mut self.pending_rows, notches * WHEEL_ROWS);
-        if rows != 0 {
-            if terminal.is_mouse_tracking()? {
-                let scroll_btn = if rows > 0 {
-                    mouse::Button::Four
-                } else {
-                    mouse::Button::Five
-                };
-                // One press per row and no release, as Ghostty reports the
-                // wheel (src/Surface.zig at 108cacb1, scrollCallback): hx
-                // counts an SGR release of button 4 or 5 as another scroll
-                // (popos-tai).
-                self.mouse_event
-                    .set_button(Some(scroll_btn))
-                    .set_action(mouse::Action::Press);
-                for _ in 0..rows.unsigned_abs() {
-                    self.response.reserve(ENCODE_ROOM);
-                    self.mouse_encoder
-                        .encode_to_vec(&self.mouse_event, &mut self.response)?;
-                }
-            } else if terminal.active_screen()? == Screen::Alternate
-                && terminal.mode(Mode::ALT_SCROLL)?
-            {
-                // Alternate scroll (mode 1007, on by default): a program on
-                // the alternate screen that doesn't track the mouse, such
-                // as less, gets an arrow key per row, and the selection
-                // goes, as in Ghostty (src/Surface.zig at 108cacb1,
-                // scrollCallback). tai-gui does the same.
-                if terminal.selection()?.is_some() {
-                    terminal.set_selection(None)?;
-                }
-                let seq = arrow_seq(rows > 0, terminal.mode(Mode::DECCKM)?);
-                for _ in 0..rows.unsigned_abs() {
-                    self.response.extend_from_slice(seq);
-                }
-            } else {
-                // Scroll the viewport through scrollback: negative is up,
-                // into history.
-                terminal.scroll_viewport(ScrollViewport::Delta(-rows));
-                // A drag in progress follows the scroll: the cell under the
-                // resting pointer is a different one now.
-                if self.selection.is_selecting() {
-                    self.selection.on_drag(terminal, x, y, dims, mods)?;
-                }
-            }
-        }
-        if self.selection.is_selecting() {
-            self.selection.autoscroll_tick(terminal, x, y, dims, mods)?;
-        }
+        self.pointer
+            .frame(terminal, pointer_pane(dims), &input, &mut self.response)?;
         #[cfg(windows)]
-        capture_mouse(any_pressed, &mut self.mouse_captured);
+        capture_mouse(input.down.iter().any(|&d| d), &mut self.mouse_captured);
+        Ok(())
+    }
+
+    /// The pointer's shape (src/term/pointer.rs), set only when it changes:
+    /// on Windows set_mouse_cursor calls SetCursor right away, and doing
+    /// that every frame overwrote the resize arrows Windows shows on the
+    /// window border, so the cursor flickered and the border was hard to
+    /// grab.
+    fn update_mouse_cursor(
+        &self,
+        terminal: &Terminal<'alloc, '_>,
+        dims: Dimensions,
+        input_enabled: bool,
+    ) -> Result<()> {
+        use term::pointer::{Pos, Shape};
+        let shape = if input_enabled {
+            let (x, y) = mouse_position();
+            self.pointer.shape(
+                terminal,
+                pointer_pane(dims),
+                Some(Pos { x, y }),
+                Self::keyboard_mods(),
+            )?
+        } else {
+            Shape::Default
+        };
+        let cursor = match shape {
+            Shape::Default => CursorIcon::Default,
+            Shape::Text => CursorIcon::Text,
+            Shape::Crosshair => CursorIcon::Crosshair,
+        };
+        if self.cursor.get() != Some(cursor) {
+            set_mouse_cursor(cursor);
+            self.cursor.set(Some(cursor));
+        }
         Ok(())
     }
 
@@ -2024,92 +1683,11 @@ impl<'alloc> Input<'alloc> {
         mods
     }
 
-    // Match Ghostty's rectangular-selection modifier convention so Ghostling feels
-    // the same across platforms: Option alone on macOS, Ctrl/Super+Alt elsewhere.
-    fn selection_rectangle_mods(mods: key::Mods) -> bool {
-        let is_alt = mods.contains(key::Mods::ALT);
-        if cfg!(target_os = "macos") {
-            is_alt
-        } else {
-            is_alt && (mods.contains(key::Mods::CTRL) || mods.contains(key::Mods::SUPER))
-        }
-    }
-
-    /// Decide whether a mouse gesture should manipulate terminal selection or be
-    /// forwarded to the running application.  Applications that request mouse
-    /// tracking get normal events, but Shift provides the common terminal-emulator
-    /// escape hatch for selecting text anyway.
-    fn selection_allowed_with_mods(
-        terminal: &Terminal<'alloc, '_>,
-        mods: key::Mods,
-    ) -> Result<bool> {
-        let mouse_tracking = terminal.is_mouse_tracking()?;
-
-        // When an application has enabled mouse tracking, normal mouse events
-        // belong to the application.  Holding Shift overrides that so users can
-        // still select text in full-screen apps such as vim and tmux.
-        Ok(!mouse_tracking || mods.contains(key::Mods::SHIFT))
-    }
-
-    /// Convert the current mouse position to a clamped viewport grid point.
-    /// Clamping lets users start or continue a drag slightly outside the padded
-    /// terminal area while still extending to the nearest visible cell.
-    fn mouse_viewport_point(terminal: &Terminal<'alloc, '_>, dims: Dimensions) -> Result<Point> {
-        let cols = terminal.cols()?;
-        let rows = terminal.rows()?;
-        let (xpos, ypos) = mouse_position();
-
-        // Clamp to the last cell, not one past it: grid_ref rejects x == cols
-        // or y == rows with InvalidValue, and the right and bottom padding
-        // (where a window-corner drag starts) map there.
-        let x = if xpos > PADDING {
-            ((xpos - PADDING) / dims.cell_width).clamp(0.0, cols.saturating_sub(1) as f32) as u16
-        } else {
-            0
-        };
-        let y = if ypos > PADDING {
-            ((ypos - PADDING) / dims.cell_height).clamp(0.0, rows.saturating_sub(1) as f32) as u32
-        } else {
-            0
-        };
-
-        Ok(Point::Viewport(Coordinate { x, y }))
-    }
-
-    // Decide whether the mouse is over an area where a selection drag can begin.
-    // Blank cells are included because terminal selections can start in empty grid
-    // space; the check is about selectable geometry, not text contents.
-    fn mouse_over_selectable_text(
-        terminal: &Terminal<'alloc, '_>,
-        dims: Dimensions,
-    ) -> Result<bool> {
-        // Test the real terminal grid bounds rather than using the window dimensions:
-        // padding and any partially visible trailing pixels are not selectable cells,
-        // and the I-beam cursor should not appear there.
-        let cols = terminal.cols()?;
-        let rows = terminal.rows()?;
-
-        let (xpos, ypos) = mouse_position();
-        let left = PADDING;
-        let top = PADDING;
-        let right = left + cols as f32 * dims.cell_width;
-        let bottom = top + rows as f32 * dims.cell_height;
-
-        if xpos < left || xpos >= right || ypos < top || ypos >= bottom {
-            return Ok(false);
-        }
-
-        if !Self::selection_allowed_with_mods(terminal, Self::keyboard_mods())? {
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    /// All macroquad mouse buttons we want to check with their libghostty equivalent.
-    const ALL_MOUSE_BUTTONS: [(MouseButton, mouse::Button); 3] = [
-        (MouseButton::Left, mouse::Button::Left),
-        (MouseButton::Right, mouse::Button::Right),
-        (MouseButton::Middle, mouse::Button::Middle),
+    /// macroquad's mouse buttons, as the terminal core counts them.
+    const ALL_MOUSE_BUTTONS: [(MouseButton, term::pointer::Button); 3] = [
+        (MouseButton::Left, term::pointer::Button::Left),
+        (MouseButton::Right, term::pointer::Button::Right),
+        (MouseButton::Middle, term::pointer::Button::Middle),
     ];
 
     /// All macroquad keys we want to check for press/repeat/release events,
@@ -2196,222 +1774,15 @@ impl<'alloc> Input<'alloc> {
     ];
 }
 
-#[derive(Debug)]
-struct SelectionState<'alloc> {
-    gesture: Gesture<'alloc>,
-    press_event: PressEvent<'alloc>,
-    release_event: ReleaseEvent<'alloc>,
-    drag_event: DragEvent<'alloc>,
-    autoscroll_event: AutoscrollTickEvent<'alloc>,
-    /// When the last autoscroll tick ran, while a drag past the window's
-    /// top or bottom scrolls it.
-    last_autoscroll: Option<Instant>,
-    /// When the left button last pressed for a selection, for Shift-click.
-    last_press: Option<Instant>,
-    start_time: Instant,
-    /// The cursor last set, so it is only set again when it changes.
-    cursor: Cell<Option<CursorIcon>>,
-    /// A left press started a selection and hasn't been released yet.
-    held: bool,
-}
-
-impl SelectionState<'_> {
-    fn new() -> Result<Self> {
-        let mut press_event = PressEvent::new()?;
-        press_event.set_repeat_interval(CLICK_INTERVAL)?;
-
-        Ok(Self {
-            gesture: Gesture::new()?,
-            press_event,
-            release_event: ReleaseEvent::new()?,
-            drag_event: DragEvent::new()?,
-            autoscroll_event: AutoscrollTickEvent::new()?,
-            last_autoscroll: None,
-            last_press: None,
-            start_time: Instant::now(),
-            cursor: Cell::new(None),
-            held: false,
-        })
-    }
-
-    /// Whether a left press started a selection that its release hasn't
-    /// ended. Asking whether the left button is down, as this did, was
-    /// false in the release's own frame, so the release went to the program
-    /// and the gesture was never ended; every later left drag then counted
-    /// as a selection and its motion didn't reach the program.
-    fn is_selecting(&self) -> bool {
-        self.held
-    }
-
-    /// Update the selection state upon a left click.
-    fn on_click(
-        &mut self,
-        terminal: &Terminal<'_, '_>,
-        x: f32,
-        y: f32,
-        dims: Dimensions,
-        mods: key::Mods,
-    ) -> Result<()> {
-        // Shift-click extends the selection there instead of starting a new
-        // one, as Ghostty's mouseButtonCallback does (src/Surface.zig at
-        // 108cacb1): with a selection, a click the gesture remembers, and
-        // that click longer ago than a double click, the press continues
-        // the old click's drag.
-        let since_press = self.last_press.map(|at| at.elapsed());
-        self.last_press = Some(Instant::now());
-        if mods.contains(key::Mods::SHIFT)
-            && terminal.selection()?.is_some()
-            && self.gesture.click_count(terminal)? > 0
-            && since_press.is_some_and(|since| since > CLICK_INTERVAL)
-        {
-            self.held = true;
-            return self.on_drag(terminal, x, y, dims, mods);
-        }
-        let point = Input::mouse_viewport_point(terminal, dims)?;
-        let grid_ref = terminal.grid_ref(point)?;
-
-        let selection = self
-            .press_event
-            .set_repeat_distance(dims.cell_width.into())?
-            .set_time(self.start_time.elapsed())?
-            .set_position(x.into(), y.into())?
-            .apply(&mut self.gesture, terminal, grid_ref)?;
-
-        terminal.set_selection(selection.as_ref())?;
-        self.held = true;
-        Ok(())
-    }
-
-    /// Potentially reset the selection state when the mouse is released.
-    fn on_release(&mut self, terminal: &Terminal<'_, '_>, dims: Dimensions) -> Result<()> {
-        let point = Input::mouse_viewport_point(terminal, dims)?;
-        // The point might fall outside the grid, which is completely okay in this case.
-        let grid_ref = terminal.grid_ref(point).ok();
-
-        self.release_event
-            .apply(&mut self.gesture, terminal, grid_ref)?;
-        self.held = false;
-        self.last_autoscroll = None;
-        Ok(())
-    }
-
-    /// While a selection drag is past the window's top or bottom, scroll one
-    /// row and extend the selection every AUTOSCROLL_EVERY, as Ghostty's
-    /// selectionScrollTick does (src/Surface.zig at 108cacb1); the gesture
-    /// has no timer of its own (include/ghostty/vt/selection.h). The frame
-    /// loop redraws every frame while the button is down.
-    fn autoscroll_tick(
-        &mut self,
-        terminal: &Terminal<'_, '_>,
-        x: f32,
-        y: f32,
-        dims: Dimensions,
-        mods: key::Mods,
-    ) -> Result<()> {
-        if matches!(self.gesture.autoscroll(terminal)?, Autoscroll::None) {
-            self.last_autoscroll = None;
-            return Ok(());
-        }
-        let now = Instant::now();
-        if self
-            .last_autoscroll
-            .is_some_and(|last| now.duration_since(last) < AUTOSCROLL_EVERY)
-        {
-            return Ok(());
-        }
-        self.last_autoscroll = Some(now);
-        let Point::Viewport(at) = Input::mouse_viewport_point(terminal, dims)? else {
-            return Ok(());
-        };
-        let selection = self
-            .autoscroll_event
-            .set_rectangle(Input::selection_rectangle_mods(mods))?
-            .set_position(x.into(), y.into())?
-            .apply(
-                &mut self.gesture,
-                terminal,
-                at,
-                Self::geometry(terminal, dims)?,
-            )?;
-        // None: nothing to scroll, or the pressed cell left the screen and
-        // the gesture reset; the selection stays as it is.
-        if let Some(selection) = selection {
-            terminal.set_selection(Some(&selection))?;
-        }
-        Ok(())
-    }
-
-    /// The window as the selection gesture measures it. The gesture
-    /// autoscrolls down only past `screen_height - 1`
-    /// (src/terminal/SelectionGesture.zig at 108cacb1), which Ghostty's
-    /// apprts reach because they report a drag outside the window. miniquad
-    /// reports nothing there on Windows or (popos-tai, under Xvfb) X11, so
-    /// the last pixel row would never count; a height one less makes it
-    /// count, as the top row does for up. screen_height only feeds that test.
-    fn geometry(terminal: &Terminal<'_, '_>, dims: Dimensions) -> Result<Geometry> {
-        Ok(Geometry {
-            columns: terminal.cols()?.into(),
-            cell_width: dims.cell_width as u32,
-            padding_left: PADDING as u32,
-            screen_height: (dims.window_height as u32).saturating_sub(1),
-        })
-    }
-
-    /// Update the selection state during and after a mouse drag.
-    fn on_drag(
-        &mut self,
-        terminal: &Terminal<'_, '_>,
-        x: f32,
-        y: f32,
-        dims: Dimensions,
-        mods: key::Mods,
-    ) -> Result<()> {
-        let point = Input::mouse_viewport_point(terminal, dims)?;
-        let grid_ref = terminal.grid_ref(point)?;
-        let geometry = Self::geometry(terminal, dims)?;
-
-        let selection = self
-            .drag_event
-            .set_rectangle(Input::selection_rectangle_mods(mods))?
-            .set_position(x.into(), y.into())?
-            .apply(&mut self.gesture, terminal, grid_ref, geometry)?;
-
-        terminal.set_selection(selection.as_ref())?;
-        Ok(())
-    }
-
-    /// Update the platform cursor to advertise selection affordance.
-    ///
-    /// This is kept separate from [`Input::handle_mouse`] so the cursor
-    /// changes on hover even when no mouse button event is being processed.
-    fn update_mouse_cursor(
-        &self,
-        terminal: &Terminal<'_, '_>,
-        dims: Dimensions,
-        input_enabled: bool,
-    ) -> Result<()> {
-        let selectable = input_enabled
-            && (self.is_selecting() || Input::mouse_over_selectable_text(terminal, dims)?);
-        let rectangle = Input::selection_rectangle_mods(Input::keyboard_mods());
-
-        let cursor = if selectable {
-            if rectangle {
-                CursorIcon::Crosshair
-            } else {
-                CursorIcon::Text
-            }
-        } else {
-            CursorIcon::Default
-        };
-        // On Windows set_mouse_cursor calls SetCursor right away. Doing that
-        // every frame overwrote the resize arrows Windows shows on the
-        // window border, so the cursor flickered and the border was hard
-        // to grab.
-        if self.cursor.get() != Some(cursor) {
-            set_mouse_cursor(cursor);
-            self.cursor.set(Some(cursor));
-        }
-        Ok(())
+/// The window as the terminal core's mouse handling measures it.
+fn pointer_pane(dims: Dimensions) -> term::pointer::Pane {
+    term::pointer::Pane {
+        width: dims.window_width,
+        height: dims.window_height,
+        cell_width: dims.cell_width,
+        cell_height: dims.cell_height,
+        dpi_scale: dims.dpi_scale,
+        cell_pixels: dims.cell_pixels(),
     }
 }
 
@@ -2462,7 +1833,8 @@ mod pty;
 
 #[cfg(test)]
 mod tests {
-    use super::{Dimensions, Input, PADDING, WHEEL_ROWS, arrow_seq, take_rows, wheel_notches};
+    use super::{Dimensions, Input, PADDING, wheel_notches};
+    use crate::term::pointer::WHEEL_ROWS;
 
     #[test]
     fn a_wheel_notch_scrolls_three_rows_on_each_platform() {
@@ -2474,40 +1846,12 @@ mod tests {
         } else {
             10.0
         };
-        let mut pending = 0.0;
-        assert_eq!(
-            take_rows(&mut pending, wheel_notches(notch) * WHEEL_ROWS),
-            3
-        );
-        assert_eq!(
-            take_rows(&mut pending, wheel_notches(-notch) * WHEEL_ROWS),
-            -3
-        );
+        assert_eq!(wheel_notches(notch) * WHEEL_ROWS, 3.0);
+        assert_eq!(wheel_notches(-notch) * WHEEL_ROWS, -3.0);
         // Several notches in one frame all count: each event is converted
         // on its own, then summed, as KeyEvents does.
         let four: f32 = (0..4).map(|_| wheel_notches(notch)).sum();
-        assert_eq!(take_rows(&mut pending, four * WHEEL_ROWS), 12);
-    }
-
-    #[test]
-    fn fractions_of_a_row_carry_until_the_direction_changes() {
-        let mut pending = 0.0;
-        // A trackpad's small steps add up instead of rounding to nothing.
-        let steps: isize = (0..10).map(|_| take_rows(&mut pending, 0.25)).sum();
-        assert_eq!(steps, 2);
-        assert!((pending - 0.5).abs() < 1e-6);
-        // Turning around drops the half row left from going up.
-        assert_eq!(take_rows(&mut pending, -0.75), 0);
-        assert!((pending + 0.75).abs() < 1e-6);
-        assert_eq!(take_rows(&mut pending, 0.0), 0);
-    }
-
-    #[test]
-    fn alternate_scroll_sends_the_arrow_for_the_cursor_key_mode() {
-        assert_eq!(arrow_seq(true, false), b"\x1b[A");
-        assert_eq!(arrow_seq(false, false), b"\x1b[B");
-        assert_eq!(arrow_seq(true, true), b"\x1bOA");
-        assert_eq!(arrow_seq(false, true), b"\x1bOB");
+        assert_eq!(four * WHEEL_ROWS, 12.0);
     }
 
     fn dims(window: (f32, f32), cell: (f32, f32), dpi_scale: f32) -> Dimensions {
@@ -2540,7 +1884,7 @@ mod tests {
 
     /// The first row's cells after `line` is written, with grapheme
     /// clustering (mode 2027) on or off: each cell's text and width, as
-    /// walk_row reads them. Spacer cells are left out.
+    /// term::rows::read_row reads them. Spacer cells are left out.
     fn first_row_cells(
         line: &str,
         clustering: bool,

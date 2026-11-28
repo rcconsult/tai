@@ -24,20 +24,14 @@ use libghostty_vt::{
     key::{self, Key},
     kitty::graphics::PlacementIterator,
     mode::Mode,
-    mouse,
-    point::{Coordinate, Point},
     render::{CellIterator, Dirty, RenderState, RowIterator},
-    screen::{CellWide, RowSemanticPrompt, Screen},
-    selection::gesture::{
-        Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
-    },
+    screen::Screen,
     terminal::ScrollViewport,
 };
-use macroquad::color::Color;
 
 use crate::{
     cells::{GlyphAtlas, Instance},
-    fonts::{Coverage, Face, SymbolSpan},
+    fonts::{Coverage, Face},
     gpu::{AtlasUpload, CellFrame, ImageStage, ImageUpload, ImagesHeld},
     pty::{Child, Pty, PtyError},
     selection, shortcuts,
@@ -60,15 +54,6 @@ const PARSE_BUDGET: Duration = Duration::from_millis(14);
 /// the same frame, as the macroquad build's ECHO_WAIT does. Without it a
 /// keystroke took two frames (popos-tai's typing-lag probe).
 const ECHO_WAIT: Duration = Duration::from_millis(4);
-
-/// Presses closer together than this are a double or triple click; a
-/// Shift-click further from the last press extends the selection.
-const CLICK_INTERVAL: Duration = Duration::from_millis(500);
-
-/// How often a selection drag past the pane's top or bottom scrolls one
-/// row, as Ghostty's `selection_scroll_ms` (src/termio/Thread.zig at
-/// 108cacb1).
-const AUTOSCROLL_EVERY: Duration = Duration::from_millis(15);
 
 /// The pane's size and cell metrics. The pty modules size the pseudo
 /// terminal from it (`crate::Dimensions`).
@@ -191,22 +176,9 @@ pub struct TerminalPane {
     response: Vec<u8>,
     /// Set by the pty's reader when it has woken egui, cleared by pump.
     wake_pending: Arc<AtomicBool>,
-    /// Mouse selection, through libghostty-vt's gesture API as in the
-    /// macroquad build (`SelectionState` in src/main.rs).
-    gesture: Gesture<'static>,
-    press: PressEvent<'static>,
-    release: ReleaseEvent<'static>,
-    drag: DragEvent<'static>,
-    autoscroll: AutoscrollTickEvent<'static>,
-    /// When the left button last pressed for a selection, for Shift-click.
-    last_press: Option<Instant>,
-    /// When the last autoscroll tick ran, while a drag past the pane's
-    /// top or bottom scrolls it.
-    last_autoscroll: Option<Instant>,
-    /// Gesture times count from here.
-    epoch: Instant,
-    /// Whether a press in the pane started a selection drag.
-    selecting: bool,
+    /// The mouse: reports, selection and wheel, as tai handles it
+    /// (src/term/pointer.rs).
+    pointer: crate::term::pointer::Pointer,
     /// The selection changed this frame, so the cells must be redrawn: the
     /// render state's dirty flags track contents, not the selection.
     selection_changed: bool,
@@ -216,18 +188,6 @@ pub struct TerminalPane {
     copy_requested: bool,
     /// A key or typed text queued input this frame (paste doesn't count).
     typed: bool,
-    /// Mouse reporting to the program, as the macroquad build's
-    /// `handle_mouse_input` does.
-    mouse_encoder: mouse::Encoder<'static>,
-    mouse_event: mouse::Event<'static>,
-    /// The buttons (left, right, middle) whose press went to the program,
-    /// so their release goes there too, wherever the pointer is then.
-    reported: [bool; 3],
-    /// Wheel travel not yet a whole row, in points, as Ghostty's
-    /// `pending_scroll_y` (src/Surface.zig at 108cacb1, scrollCallback).
-    pending_scroll: f32,
-    /// The mouse modes and size the encoder was last given (`sync_encoder`).
-    encoder_for: Option<([bool; MOUSE_MODES.len()], mouse::EncoderSize)>,
     /// Take the focus next frame: a command was typed for the user.
     want_focus: bool,
     /// A command to type once a new shell has drawn its prompt, and
@@ -338,28 +298,11 @@ impl TerminalPane {
             rows: Vec::new(),
             response: Vec::new(),
             wake_pending,
-            gesture: Gesture::new()?,
-            press: {
-                let mut press = PressEvent::new()?;
-                press.set_repeat_interval(CLICK_INTERVAL)?;
-                press
-            },
-            release: ReleaseEvent::new()?,
-            drag: DragEvent::new()?,
-            autoscroll: AutoscrollTickEvent::new()?,
-            last_press: None,
-            last_autoscroll: None,
-            epoch: Instant::now(),
-            selecting: false,
+            pointer: crate::term::pointer::Pointer::new()?,
             selection_changed: false,
             badge: None,
             copy_requested: false,
             typed: false,
-            mouse_encoder: mouse::Encoder::new()?,
-            mouse_event: mouse::Event::new()?,
-            reported: [false; 3],
-            pending_scroll: 0.0,
-            encoder_for: None,
             want_focus: false,
             pending_command: None,
             last_output: None,
@@ -551,20 +494,44 @@ impl TerminalPane {
             self.resize(dims);
         }
 
-        if let Err(e) = self.report_pointer(ui, rect) {
-            tracing::warn!("mouse: {e}");
+        // The mouse, through the terminal core tai shares
+        // (src/term/pointer.rs).
+        let input = self.pointer_input(ui, rect, response.hovered());
+        let pane = self.pointer_pane();
+        let mut out = Vec::new();
+        match self
+            .pointer
+            .frame(&mut self.terminal, pane, &input, &mut out)
+        {
+            Ok(outcome) => {
+                if outcome.redraw {
+                    self.selection_changed = true;
+                }
+                // Keep ticking while a drag rests past the edge.
+                if let Some(within) = outcome.tick_within {
+                    ui.ctx().request_repaint_after(within);
+                }
+            }
+            Err(e) => tracing::warn!("mouse: {e}"),
         }
-        if let Err(e) = self.handle_pointer(ui, rect) {
-            tracing::warn!("selection: {e}");
+        if !out.is_empty() {
+            self.pty.write(&out);
         }
         if response.hovered() {
-            // An arrow while the program has the mouse, as Ghostty shows.
-            let program = self.terminal.is_mouse_tracking().unwrap_or(false)
-                && !ui.input(|i| i.modifiers.shift);
-            ui.ctx().set_cursor_icon(if program {
-                egui::CursorIcon::Default
-            } else {
-                egui::CursorIcon::Text
+            use crate::term::pointer::Shape;
+            let shape = self
+                .pointer
+                .shape(
+                    &self.terminal,
+                    self.pointer_pane(),
+                    input.pointer,
+                    input.mods,
+                )
+                .unwrap_or(Shape::Text);
+            ui.ctx().set_cursor_icon(match shape {
+                Shape::Default => egui::CursorIcon::Default,
+                Shape::Text => egui::CursorIcon::Text,
+                Shape::Crosshair => egui::CursorIcon::Crosshair,
             });
         }
 
@@ -601,35 +568,6 @@ impl TerminalPane {
                 Ok(Some(text)) => ui.ctx().copy_text(text),
                 Ok(None) => {}
                 Err(e) => tracing::warn!("copy: {e}"),
-            }
-        }
-        if response.hovered() {
-            match self.wheel_to_program(ui, rect) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Whole rows of the wheel's travel, the rest kept for
-                    // the next frame. Rounding egui's smoothed per-frame
-                    // delta lost the fractions, so fast notches scrolled
-                    // about a row for five (popos-tai).
-                    let cell = self.dims.cell_height;
-                    let page = cell * f32::from(self.terminal.rows().unwrap_or(1));
-                    let travel = ui.input(|i| wheel_travel(i, cell, page));
-                    let lines = wheel_rows(&mut self.pending_scroll, travel, cell) as isize;
-                    if lines != 0 {
-                        self.terminal.scroll_viewport(ScrollViewport::Delta(-lines));
-                        // A drag in progress follows the scroll: the cell
-                        // under the resting pointer is a different one now.
-                        if self.selecting
-                            && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
-                        {
-                            let held = ui.input(|i| i.modifiers);
-                            if let Err(e) = self.drag_to(pos - rect.min, held) {
-                                tracing::warn!("selection: {e}");
-                            }
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("wheel: {e}"),
             }
         }
 
@@ -704,20 +642,37 @@ impl TerminalPane {
         self.pty.resize(dims);
     }
 
-    /// Send the buttons and motion to the program while it tracks the
-    /// mouse, as the macroquad build's `handle_mouse_input` does. Shift
-    /// keeps a press for selection instead. The encoder follows the
-    /// program's tracking mode and format, and drops motion within a cell.
-    fn report_pointer(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Result<()> {
-        if !self.terminal.is_mouse_tracking()? {
-            self.reported = [false; 3];
-            return Ok(());
+    /// The pane as the terminal core's mouse handling measures it.
+    fn pointer_pane(&self) -> crate::term::pointer::Pane {
+        crate::term::pointer::Pane {
+            width: self.dims.width,
+            height: self.dims.height,
+            cell_width: self.dims.cell_width,
+            cell_height: self.dims.cell_height,
+            dpi_scale: self.dims.dpi_scale,
+            cell_pixels: self.dims.cell_pixels(),
         }
-        // The button events in the order they came: a fast click, or a
-        // touchpad tap, presses and releases within one frame, and both
-        // must reach the program (popos-tai's test of gui-mouse).
-        let (buttons, pos, held, downs, moved) = ui.input(|i| {
-            let buttons: Vec<_> = i
+    }
+
+    /// This frame's mouse, from egui, for the terminal core: the button
+    /// events in the order they came (a fast click presses and releases in
+    /// one frame), the pointer, the buttons held, and the wheel's rows
+    /// while the pointer is over the pane.
+    fn pointer_input(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        hovered: bool,
+    ) -> crate::term::pointer::Input {
+        use crate::term::pointer::{Button, Click, Input, Pos};
+        let local = |p: egui::Pos2| Pos {
+            x: p.x - rect.min.x,
+            y: p.y - rect.min.y,
+        };
+        let cell = self.dims.cell_height;
+        let page = cell * f32::from(self.terminal.rows().unwrap_or(1));
+        ui.input(|i| Input {
+            clicks: i
                 .events
                 .iter()
                 .filter_map(|e| match e {
@@ -726,345 +681,33 @@ impl TerminalPane {
                         button,
                         pressed,
                         modifiers,
-                    } => {
-                        let index = BUTTONS.iter().position(|(b, _)| b == button)?;
-                        Some((index, *pos, *pressed, *modifiers))
-                    }
+                    } => Some(Click {
+                        button: match button {
+                            egui::PointerButton::Primary => Button::Left,
+                            egui::PointerButton::Secondary => Button::Right,
+                            egui::PointerButton::Middle => Button::Middle,
+                            _ => return None,
+                        },
+                        pressed: *pressed,
+                        pos: local(*pos),
+                        mods: mods_from(*modifiers),
+                    }),
                     _ => None,
                 })
-                .collect();
-            (
-                buttons,
-                i.pointer.latest_pos(),
-                i.modifiers,
-                BUTTONS.map(|(b, _)| i.pointer.button_down(b)),
-                i.pointer.delta() != egui::Vec2::ZERO,
-            )
-        });
-        let mut out = Vec::new();
-        self.sync_encoder()?;
-        for (index, at, pressed, mods) in buttons {
-            let action = if pressed {
-                if !rect.contains(at) || mods.shift || self.selecting {
-                    continue;
-                }
-                self.reported[index] = true;
-                mouse::Action::Press
-            } else if self.reported[index] {
-                self.reported[index] = false;
-                mouse::Action::Release
+                .collect(),
+            pointer: i.pointer.latest_pos().map(local),
+            moved: i.pointer.delta() != egui::Vec2::ZERO,
+            down: [
+                i.pointer.button_down(egui::PointerButton::Primary),
+                i.pointer.button_down(egui::PointerButton::Secondary),
+                i.pointer.button_down(egui::PointerButton::Middle),
+            ],
+            mods: mods_from(i.modifiers),
+            wheel_rows: if hovered {
+                wheel_travel(i, cell, page) / cell
             } else {
-                continue;
-            };
-            // A button the program gets clears the terminal's selection, and
-            // the gesture forgets its click, as Ghostty's mouseButtonCallback
-            // does (src/Surface.zig at 108cacb1): the program handles the
-            // mouse now. Shift keeps the mouse the terminal's.
-            if !mods.shift {
-                if self.terminal.selection()?.is_some() {
-                    self.terminal.set_selection(None)?;
-                    self.selection_changed = true;
-                }
-                self.gesture.reset(&self.terminal);
-            }
-            let position = self.surface_position(at - rect.min);
-            self.mouse_encoder
-                .set_any_button_pressed(self.reported.iter().any(|&r| r));
-            self.mouse_event
-                .set_mods(mods_from(mods))
-                .set_position(position)
-                .set_action(action)
-                .set_button(Some(BUTTONS[index].1));
-            self.mouse_encoder
-                .encode_to_vec(&self.mouse_event, &mut out)?;
-        }
-        let dragging = self.reported.iter().any(|&r| r);
-        // With Shift the mouse is the terminal's, as for the press above.
-        // A Shift-press starts its selection only in handle_pointer, after
-        // this, so `selecting` was still false in that frame and its motion
-        // went to the program with the left button down: hx took it as a
-        // drag and grew its own selection (popos-tai).
-        if let Some(pos) = pos
-            && moved
-            && !self.selecting
-            && !held.shift
-            && (dragging || rect.contains(pos))
-        {
-            let button = BUTTONS
-                .iter()
-                .zip(downs)
-                .find(|&(_, down)| down)
-                .map(|(&(_, b), _)| b);
-            let position = self.surface_position(pos - rect.min);
-            self.mouse_encoder.set_any_button_pressed(dragging);
-            self.mouse_event
-                .set_mods(mods_from(held))
-                .set_position(position)
-                .set_action(mouse::Action::Motion)
-                .set_button(button);
-            self.mouse_encoder
-                .encode_to_vec(&self.mouse_event, &mut out)?;
-        }
-        if !out.is_empty() {
-            self.pty.write(&out);
-        }
-        Ok(())
-    }
-
-    /// Give the encoder the program's mouse modes and the pane's size, but
-    /// only when they changed: setting either makes it forget the last
-    /// reported cell (src/terminal/c/mouse_encode.zig at 108cacb1), and
-    /// every small move within a cell was then reported (popos-tai).
-    fn sync_encoder(&mut self) -> Result<()> {
-        let mut modes = [false; MOUSE_MODES.len()];
-        for (on, mode) in modes.iter_mut().zip(MOUSE_MODES) {
-            *on = self.terminal.mode(mode)?;
-        }
-        let key = (modes, encoder_size(self.dims));
-        if self.encoder_for != Some(key) {
-            self.mouse_encoder
-                .set_options_from_terminal(&self.terminal)
-                .set_size(key.1)?
-                .set_track_last_cell(true);
-            self.encoder_for = Some(key);
-        }
-        Ok(())
-    }
-
-    /// Send the wheel to the program, as Ghostty's scrollCallback does
-    /// (src/Surface.zig at 108cacb1): while it tracks the mouse, as button
-    /// 4 and 5 presses, one per row of travel; on the alternate screen with
-    /// alternate scroll (mode 1007) and no tracking, as arrow keys, which
-    /// is how `less` and `man` scroll. Returns false when the wheel isn't
-    /// the program's, so it scrolls the scrollback.
-    fn wheel_to_program(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Result<bool> {
-        let tracking = self.terminal.is_mouse_tracking()?;
-        let alternate = !tracking
-            && self.terminal.active_screen()? == Screen::Alternate
-            && self.terminal.mode(Mode::ALT_SCROLL)?;
-        if !tracking && !alternate {
-            return Ok(false);
-        }
-        let cell = self.dims.cell_height;
-        let page = cell * f32::from(self.terminal.rows()?);
-        let (travel, pos, held) = ui.input(|i| {
-            (
-                wheel_travel(i, cell, page),
-                i.pointer.latest_pos(),
-                i.modifiers,
-            )
-        });
-        let rows = wheel_rows(&mut self.pending_scroll, travel, cell);
-        if rows == 0 {
-            return Ok(true);
-        }
-        let mut out = Vec::new();
-        if tracking {
-            let Some(pos) = pos else {
-                return Ok(true);
-            };
-            // The selection a Shift drag made goes, as in Ghostty.
-            if self.terminal.selection()?.is_some() {
-                self.terminal.set_selection(None)?;
-                self.selection_changed = true;
-            }
-            let at = self.surface_position(pos - rect.min);
-            self.mouse_event
-                .set_mods(mods_from(held))
-                .set_position(at)
-                .set_action(mouse::Action::Press)
-                .set_button(Some(if rows > 0 {
-                    mouse::Button::Four
-                } else {
-                    mouse::Button::Five
-                }));
-            self.sync_encoder()?;
-            self.mouse_encoder
-                .set_any_button_pressed(self.reported.iter().any(|&r| r))
-                // Every row is a report, even within one cell.
-                .set_track_last_cell(false);
-            for _ in 0..rows.unsigned_abs() {
-                self.mouse_encoder
-                    .encode_to_vec(&self.mouse_event, &mut out)?;
-            }
-            self.mouse_encoder.set_track_last_cell(true);
-        } else {
-            let seq = arrow_seq(rows > 0, self.terminal.mode(Mode::DECCKM)?);
-            for _ in 0..rows.unsigned_abs() {
-                out.extend_from_slice(seq);
-            }
-        }
-        self.pty.write(&out);
-        Ok(true)
-    }
-
-    /// A point in the pane as the encoder takes it: surface pixels, which
-    /// are physical pixels (include/ghostty/vt/mouse/encoder.h). The
-    /// macroquad build scales macroquad's points the same way, so SGR-Pixels
-    /// reports (mode 1016) share units with the size tai reports.
-    fn surface_position(&self, local: egui::Vec2) -> mouse::Position {
-        mouse::Position {
-            x: local.x * self.dims.dpi_scale,
-            y: local.y * self.dims.dpi_scale,
-        }
-    }
-
-    /// Start, extend and end a selection from the primary button, as the
-    /// macroquad build does. While a program tracks the mouse the buttons
-    /// are its (`report_pointer`), except with Shift held.
-    fn handle_pointer(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Result<()> {
-        let (pos, pressed, down, released, moved, held) = ui.input(|i| {
-            (
-                i.pointer.interact_pos(),
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-                i.pointer.delta() != egui::Vec2::ZERO,
-                i.modifiers,
-            )
-        });
-        let Some(pos) = pos else {
-            return Ok(());
-        };
-        let local = pos - rect.min;
-        if pressed && rect.contains(pos) {
-            if self.terminal.is_mouse_tracking()? && !held.shift {
-                return Ok(());
-            }
-            // Shift-click extends the selection there instead of starting
-            // a new one, as Ghostty's mouseButtonCallback does
-            // (src/Surface.zig at 108cacb1): with a selection, a click the
-            // gesture remembers, and that click longer ago than a double
-            // click, the press continues the old click's drag.
-            let since_press = self.last_press.map(|at| at.elapsed());
-            self.last_press = Some(Instant::now());
-            if held.shift
-                && self.terminal.selection()?.is_some()
-                && self.gesture.click_count(&self.terminal)? > 0
-                && since_press.is_some_and(|since| since > CLICK_INTERVAL)
-            {
-                self.drag_to(local, held)?;
-            } else {
-                let grid_ref = self.terminal.grid_ref(self.viewport_point(local)?)?;
-                let selection = self
-                    .press
-                    .set_repeat_distance(self.dims.cell_width.into())?
-                    .set_time(self.epoch.elapsed())?
-                    .set_position(local.x.into(), local.y.into())?
-                    .apply(&mut self.gesture, &self.terminal, grid_ref)?;
-                self.terminal.set_selection(selection.as_ref())?;
-                self.selection_changed = true;
-            }
-            self.selecting = true;
-        } else if self.selecting && down && moved {
-            self.drag_to(local, held)?;
-        }
-        if self.selecting && down {
-            self.autoscroll_tick(ui, local, held)?;
-        } else {
-            self.last_autoscroll = None;
-        }
-        // Not an else: a fast click presses and releases in one frame, and
-        // a selection left open would keep the next presses from the
-        // program (popos-tai's test of gui-mouse).
-        if self.selecting && released {
-            // Released outside the grid is fine: no cell, no change.
-            let grid_ref = self
-                .viewport_point(local)
-                .ok()
-                .and_then(|p| self.terminal.grid_ref(p).ok());
-            self.release
-                .apply(&mut self.gesture, &self.terminal, grid_ref)?;
-            self.selecting = false;
-            self.selection_changed = true;
-        }
-        Ok(())
-    }
-
-    /// The pane as the selection gesture measures it.
-    fn geometry(&self) -> Result<Geometry> {
-        Ok(Geometry {
-            columns: self.terminal.cols()?.into(),
-            cell_width: self.dims.cell_width as u32,
-            padding_left: PADDING as u32,
-            screen_height: self.dims.height as u32,
-        })
-    }
-
-    /// Extend the selection drag to `local`. Past the pane's top or bottom
-    /// the gesture asks to autoscroll (`autoscroll_tick`).
-    fn drag_to(&mut self, local: egui::Vec2, held: egui::Modifiers) -> Result<()> {
-        let grid_ref = self.terminal.grid_ref(self.viewport_point(local)?)?;
-        let geometry = self.geometry()?;
-        let selection = self
-            .drag
-            .set_rectangle(rectangle_mods(mods_from(held)))?
-            .set_position(local.x.into(), local.y.into())?
-            .apply(&mut self.gesture, &self.terminal, grid_ref, geometry)?;
-        self.terminal.set_selection(selection.as_ref())?;
-        self.selection_changed = true;
-        Ok(())
-    }
-
-    /// While a selection drag is past the pane's top or bottom, scroll one
-    /// row and extend the selection every AUTOSCROLL_EVERY, as Ghostty's
-    /// selectionScrollTick does (src/Surface.zig at 108cacb1); the gesture
-    /// has no timer of its own (include/ghostty/vt/selection.h).
-    fn autoscroll_tick(
-        &mut self,
-        ui: &egui::Ui,
-        local: egui::Vec2,
-        held: egui::Modifiers,
-    ) -> Result<()> {
-        if matches!(self.gesture.autoscroll(&self.terminal)?, Autoscroll::None) {
-            self.last_autoscroll = None;
-            return Ok(());
-        }
-        let now = Instant::now();
-        if self
-            .last_autoscroll
-            .is_none_or(|last| now.duration_since(last) >= AUTOSCROLL_EVERY)
-        {
-            self.last_autoscroll = Some(now);
-            let at = self.viewport_coordinate(local)?;
-            let geometry = self.geometry()?;
-            let selection = self
-                .autoscroll
-                .set_rectangle(rectangle_mods(mods_from(held)))?
-                .set_position(local.x.into(), local.y.into())?
-                .apply(&mut self.gesture, &self.terminal, at, geometry)?;
-            // None: nothing to scroll, or the pressed cell left the screen
-            // and the gesture reset; the selection stays as it is.
-            if let Some(selection) = selection {
-                self.terminal.set_selection(Some(&selection))?;
-                self.selection_changed = true;
-            }
-        }
-        // Keep ticking while the pointer rests past the edge.
-        ui.ctx().request_repaint_after(AUTOSCROLL_EVERY);
-        Ok(())
-    }
-
-    /// The viewport cell under a point in the pane, clamped to the grid as
-    /// the macroquad build's `mouse_viewport_point` does: grid_ref rejects
-    /// a point one past the last row or column.
-    fn viewport_point(&self, local: egui::Vec2) -> Result<Point> {
-        Ok(Point::Viewport(self.viewport_coordinate(local)?))
-    }
-
-    fn viewport_coordinate(&self, local: egui::Vec2) -> Result<Coordinate> {
-        let cols = self.terminal.cols()?;
-        let rows = self.terminal.rows()?;
-        let cell = |v: f32, size: f32, count: u32| {
-            if v > PADDING {
-                ((v - PADDING) / size).clamp(0.0, count.saturating_sub(1) as f32) as u32
-            } else {
-                0
-            }
-        };
-        Ok(Coordinate {
-            x: cell(local.x, self.dims.cell_width, u32::from(cols)) as u16,
-            y: cell(local.y, self.dims.cell_height, u32::from(rows)),
+                0.0
+            },
         })
     }
 
@@ -1110,132 +753,45 @@ impl TerminalPane {
                 || cursor_row == Some(row_index);
             if rebuild {
                 let cached = &mut self.rows[index];
+                // The row, read by the terminal core tai shares
+                // (src/term/rows.rs), into this renderer's quads.
+                let on_row = cursor.filter(|&(_, cy)| cy == row_index).map(|(col, _)| {
+                    crate::term::rows::Cursor {
+                        col,
+                        color: cursor_color,
+                    }
+                });
+                cached.read = crate::term::rows::read_row(
+                    row,
+                    &mut self.cell_it,
+                    &colors,
+                    &self.coverage,
+                    on_row,
+                    &mut text,
+                )?;
                 cached.bg.clear();
                 cached.text.clear();
-                cached.edge.clear();
-                let prompt = !matches!(
-                    row.raw_row()?.semantic_prompt(),
-                    Ok(RowSemanticPrompt::None) | Err(_)
-                );
-                let mut extend_cells = Vec::new();
-                // A row with Kitty Unicode placeholders: each cell's
-                // placeholder, or None (src/term/images.rs).
-                let placeholder_row = row.raw_row()?.has_kitty_virtual_placeholder()?;
-                let mut placeholder_cells = Vec::new();
-                let mut cell_it = self.cell_it.update(row)?;
                 let mut x = PADDING;
-                let mut col: u16 = 0;
-                let mut span = SymbolSpan::default();
-                let mut held: Option<(Glyph, String)> = None;
-                while let Some(cell) = cell_it.next() {
-                    let graphemes = cell.graphemes_len()?;
-                    if graphemes > 0 {
-                        cell.graphemes_utf8(&mut text)?;
-                    }
-                    let grow = span.next((graphemes > 0).then(|| text.chars().next()).flatten());
-                    if let Some((mut glyph, held_text)) = held.take() {
-                        if grow {
-                            glyph.cells = 2;
-                        }
-                        glyph.push(
-                            &mut self.atlas,
-                            &self.coverage,
-                            &mut cached.text,
-                            &held_text,
-                            dims,
-                        );
-                    }
-                    let selected = cell.is_selected()?;
-                    let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-                    let bg = cell.bg_color()?;
-                    extend_cells.push((bg, (graphemes > 0).then(|| text.chars().next()).flatten()));
-                    let mut has_bg = bg.is_some();
-                    let mut bg = bg.unwrap_or(colors.background);
-                    let mut bold = false;
-                    if graphemes > 0 && cell.has_styling()? {
-                        let style = cell.style()?;
-                        if style.inverse {
-                            std::mem::swap(&mut fg, &mut bg);
-                            has_bg = true;
-                        }
-                        bold = style.bold;
-                    }
-                    cached.edge.push(rgba(bg));
-                    // Selected cells are drawn in reverse video, as in the
-                    // macroquad build (walk_row in src/main.rs).
-                    if selected {
-                        std::mem::swap(&mut fg, &mut bg);
-                        has_bg = true;
-                    }
-                    let cell_rect = [x, y, dims.cell_width, dims.cell_height];
-                    if cursor == Some((col, row_index)) {
-                        cached
-                            .bg
-                            .push(Instance::solid(cell_rect, rgba(cursor_color)));
-                        fg = colors.background;
-                    } else if has_bg {
-                        cached.bg.push(Instance::solid(cell_rect, rgba(bg)));
-                    }
-                    // A placeholder cell shows part of an image, drawn with
-                    // the images; its own character has no glyph.
-                    let placeholder = if placeholder_row {
-                        let cell_placeholder = crate::term::images::placeholder_cell(cell)?;
-                        let is = cell_placeholder.is_some();
-                        placeholder_cells.push(cell_placeholder);
-                        is
-                    } else {
-                        false
-                    };
-                    if graphemes > 0 && !placeholder {
-                        // One face for the whole cluster, trimmed to what
-                        // tai draws (see walk_row in src/main.rs).
-                        let face = self.coverage.cluster_face(&mut text);
-                        if face != Face::Blank && !text.is_empty() {
-                            // A wide character is drawn two cells wide, as
-                            // Ghostty's constraintWidth does (src/renderer/
-                            // cell.zig at 521cf2c5). A narrow one from a
-                            // fallback face waits for the next cell, which
-                            // it may take too (`SymbolSpan`).
-                            let wide = cell.raw_cell()?.wide()? == CellWide::Wide;
-                            let glyph = Glyph {
-                                face,
-                                x,
-                                y,
-                                fg: rgba(fg),
-                                bold,
-                                cells: if wide { 2 } else { 1 },
-                            };
-                            if wide || face == Face::Primary {
-                                glyph.push(
-                                    &mut self.atlas,
-                                    &self.coverage,
-                                    &mut cached.text,
-                                    &text,
-                                    dims,
-                                );
-                            } else {
-                                held = Some((glyph, text.clone()));
-                            }
-                        }
+                for bg in &cached.read.bg {
+                    if let Some(bg) = bg {
+                        cached.bg.push(Instance::solid(
+                            [x, y, dims.cell_width, dims.cell_height],
+                            rgba(*bg),
+                        ));
                     }
                     x += dims.cell_width;
-                    col += 1;
                 }
-                if let Some((glyph, text)) = held {
-                    glyph.push(
-                        &mut self.atlas,
-                        &self.coverage,
-                        &mut cached.text,
-                        &text,
-                        dims,
-                    );
-                }
-                cached.extend = extends(prompt, &extend_cells, colors.background);
-                cached.virtual_runs = if placeholder_row {
-                    crate::placeholders::row_placements(placeholder_cells)
-                } else {
-                    Vec::new()
-                };
+                crate::term::rows::push_glyphs(
+                    &mut self.atlas,
+                    &self.coverage,
+                    &mut cached.text,
+                    &cached.read,
+                    y,
+                    dims.cell_width,
+                    dims.baseline,
+                    dims.font_size,
+                    dims.dpi_scale,
+                );
                 row.set_dirty(false)?;
             }
             y += dims.cell_height;
@@ -1257,9 +813,16 @@ impl TerminalPane {
             rgba(colors.background),
         ));
         out.extend(
-            padding_rects(&self.rows, dims, rgba(colors.background))
-                .into_iter()
-                .map(|(rect, color)| Instance::solid(rect, color)),
+            crate::term::rows::padding_rects(
+                &self.rows,
+                dims.width,
+                dims.height,
+                dims.cell_width,
+                dims.cell_height,
+                colors.background,
+            )
+            .into_iter()
+            .map(|(rect, color)| Instance::solid(rect, rgba(color))),
         );
         self.bg_start = out.len() as u32;
         for row in &self.rows {
@@ -1289,7 +852,12 @@ impl TerminalPane {
             .rows
             .iter()
             .enumerate()
-            .flat_map(|(r, row)| row.virtual_runs.iter().map(move |run| (r as u16, *run)))
+            .flat_map(|(r, row)| {
+                row.read
+                    .virtual_runs
+                    .iter()
+                    .map(move |run| (r as u16, *run))
+            })
             .collect();
         let staged = crate::term::images::frame_draws(
             &self.terminal,
@@ -1423,17 +991,6 @@ impl TerminalPane {
     }
 }
 
-/// Whether a drag selects a rectangle: Alt on macOS, Ctrl+Alt or
-/// Super+Alt elsewhere, as in the macroquad build.
-fn rectangle_mods(mods: key::Mods) -> bool {
-    let alt = mods.contains(key::Mods::ALT);
-    if cfg!(target_os = "macos") {
-        alt
-    } else {
-        alt && mods.intersects(key::Mods::CTRL | key::Mods::SUPER)
-    }
-}
-
 /// The selection badge in the pane's bottom-right corner: a dark box with
 /// a grey outline, as in the macroquad build.
 fn draw_badge(ui: &egui::Ui, rect: egui::Rect, text: &str) {
@@ -1458,153 +1015,15 @@ fn draw_badge(ui: &egui::Ui, rect: egui::Rect, text: &str) {
 /// glyphs, kept apart so all backgrounds draw before any text.
 #[derive(Default)]
 struct RowInstances {
+    /// The row as the terminal core read it (src/term/rows.rs).
+    read: crate::term::rows::Row,
     bg: Vec<Instance>,
     text: Vec<Instance>,
-    /// Each cell's background, the default one included, for the padding.
-    edge: Vec<[u8; 4]>,
-    /// Whether the padding above or below may take this row's colours.
-    extend: bool,
-    /// The row's Kitty Unicode placeholder runs (src/placeholders.rs).
-    virtual_runs: Vec<crate::placeholders::Placement>,
 }
 
-/// The padding around the grid in the colours of the nearest cells, as
-/// Ghostty's `window-padding-color = extend` draws it (src/renderer/
-/// generic.zig and shaders.metal at 108cacb1): a full-screen app with its
-/// own background, such as Helix, then fills the pane without a frame in
-/// the terminal's default colour. The sides always take the edge cells'
-/// colours; the top and bottom only when the nearest row allows it
-/// (`extends`). Colours equal to the default `background` are skipped, as
-/// the pane is already that colour.
-fn padding_rects(
-    rows: &[RowInstances],
-    dims: Dimensions,
-    background: [u8; 4],
-) -> Vec<([f32; 4], [u8; 4])> {
-    let (cw, ch) = (dims.cell_width, dims.cell_height);
-    let mut out = Vec::new();
-    // One strip of the padding above or below a row, in runs of one colour.
-    let strip = |edge: &[[u8; 4]], y: f32, h: f32, out: &mut Vec<([f32; 4], [u8; 4])>| {
-        let mut run: Option<(f32, [u8; 4])> = None;
-        for (c, &color) in edge.iter().enumerate() {
-            let start = if c == 0 { 0.0 } else { PADDING + c as f32 * cw };
-            if let Some((x, held)) = run
-                && held != color
-            {
-                out.push(([x, y, start - x, h], held));
-                run = None;
-            }
-            run.get_or_insert((start, color));
-        }
-        if let Some((x, held)) = run {
-            out.push(([x, y, dims.width - x, h], held));
-        }
-    };
-    let mut y = PADDING;
-    for row in rows {
-        if let (Some(&first), Some(&last)) = (row.edge.first(), row.edge.last()) {
-            out.push(([0.0, y, PADDING, ch], first));
-            let right = PADDING + row.edge.len() as f32 * cw;
-            out.push(([right, y, dims.width - right, ch], last));
-        }
-        y += ch;
-    }
-    if let Some(top) = rows.first().filter(|r| r.extend) {
-        strip(&top.edge, 0.0, PADDING, &mut out);
-    }
-    if let Some(bottom) = rows.last().filter(|r| r.extend) {
-        strip(&bottom.edge, y, dims.height - y, &mut out);
-    }
-    out.retain(|(rect, color)| *color != background && rect[2] > 0.0 && rect[3] > 0.0);
-    out
-}
-
-/// Whether the padding may take a row's colours (Ghostty's
-/// `neverExtendBg`, src/renderer/row.zig): not a prompt row, and no cell
-/// with the default background or a powerline glyph, which is drawn to fit
-/// its cell exactly.
-fn extends(prompt: bool, cells: &[(Option<Rgb>, Option<char>)], background: Rgb) -> bool {
-    !prompt
-        && cells.iter().all(|&(bg, first)| {
-            bg.is_some_and(|bg| bg != background) && !first.is_some_and(is_powerline)
-        })
-}
-
-fn is_powerline(c: char) -> bool {
-    matches!(c as u32, 0xE0B0..=0xE0C8 | 0xE0CA | 0xE0CC..=0xE0D2 | 0xE0D4)
-}
-
-/// Where and how one cell's glyph is drawn.
-struct Glyph {
-    face: Face,
-    x: f32,
-    y: f32,
-    fg: [u8; 4],
-    bold: bool,
-    /// How many cells it spans: 2 for a wide cell, or a narrow symbol that
-    /// takes the next cell (`SymbolSpan`).
-    cells: u8,
-}
-
-impl Glyph {
-    fn push(
-        &self,
-        atlas: &mut GlyphAtlas,
-        coverage: &Coverage,
-        out: &mut Vec<Instance>,
-        text: &str,
-        dims: Dimensions,
-    ) {
-        let place = coverage.place(self.face, dims.font_size, self.cells);
-        let fg = self.fg;
-        atlas.push_text(
-            out,
-            coverage.font(self.face),
-            self.face,
-            text,
-            self.x,
-            self.y + dims.baseline - place.rise,
-            place.font_size,
-            dims.dpi_scale,
-            Color::from_rgba(fg[0], fg[1], fg[2], fg[3]),
-            self.bold,
-        );
-    }
-}
-
-/// The buttons reported to programs, with egui's names for them.
-const BUTTONS: [(egui::PointerButton, mouse::Button); 3] = [
-    (egui::PointerButton::Primary, mouse::Button::Left),
-    (egui::PointerButton::Secondary, mouse::Button::Right),
-    (egui::PointerButton::Middle, mouse::Button::Middle),
-];
-
-/// The modes that set the encoder's tracking mode and format.
-const MOUSE_MODES: [Mode; 8] = [
-    Mode::X10_MOUSE,
-    Mode::NORMAL_MOUSE,
-    Mode::BUTTON_MOUSE,
-    Mode::ANY_MOUSE,
-    Mode::UTF8_MOUSE,
-    Mode::SGR_MOUSE,
-    Mode::URXVT_MOUSE,
-    Mode::SGR_PIXELS_MOUSE,
-];
-
-/// The pane's geometry in surface pixels, as the encoder needs it to find
-/// the cell under a point.
-fn encoder_size(dims: Dimensions) -> mouse::EncoderSize {
-    let (cell_width, cell_height) = dims.cell_pixels();
-    let padding = (PADDING * dims.dpi_scale) as u32;
-    mouse::EncoderSize {
-        screen_width: (dims.width * dims.dpi_scale) as u32,
-        screen_height: (dims.height * dims.dpi_scale) as u32,
-        cell_width: cell_width.max(1),
-        cell_height: cell_height.max(1),
-        padding_top: padding,
-        padding_bottom: padding,
-        padding_left: padding,
-        padding_right: padding,
+impl AsRef<crate::term::rows::Row> for RowInstances {
+    fn as_ref(&self) -> &crate::term::rows::Row {
+        &self.read
     }
 }
 
@@ -1622,10 +1041,9 @@ fn wheel_points(unit: egui::MouseWheelUnit, y: f32, cell: f32, page: f32) -> f32
     }
 }
 
-/// Rows one line of a mouse wheel (a notch) scrolls: Ghostty's default
-/// discrete mouse-scroll-multiplier (src/config/Config.zig at 108cacb1).
-/// A trackpad's points stay one to one, its precision multiplier.
-const WHEEL_ROWS: f32 = 3.0;
+// Rows one line of a mouse wheel (a notch) scrolls: the terminal core's
+// (src/term/pointer.rs). A trackpad's points stay one to one.
+use crate::term::pointer::WHEEL_ROWS;
 
 /// This frame's wheel travel in points, up positive. Ctrl and Cmd with the
 /// wheel zoom in egui, so they don't count.
@@ -1645,32 +1063,6 @@ fn wheel_travel(input: &egui::InputState, cell: f32, page: f32) -> f32 {
             _ => None,
         })
         .sum()
-}
-
-/// Add `travel` to the pending travel and take whole rows from it, toward
-/// zero, keeping the rest for later events (Ghostty's scrollCallback). A
-/// change of direction drops what was pending the other way, as tai's
-/// take_rows does: a trackpad's leftover fraction made the next notch back
-/// scroll 2 rows instead of 3 (macos-tai).
-fn wheel_rows(pending: &mut f32, travel: f32, cell: f32) -> i32 {
-    if travel != 0.0 && *pending != 0.0 && pending.signum() != travel.signum() {
-        *pending = 0.0;
-    }
-    *pending += travel;
-    let rows = (*pending / cell).trunc();
-    *pending -= rows * cell;
-    rows as i32
-}
-
-/// The arrow key the wheel sends under alternate scroll, in the cursor
-/// key mode (DECCKM) the program set.
-fn arrow_seq(up: bool, application: bool) -> &'static [u8] {
-    match (up, application) {
-        (true, true) => b"\x1bOA",
-        (false, true) => b"\x1bOB",
-        (true, false) => b"\x1b[A",
-        (false, false) => b"\x1b[B",
-    }
 }
 
 fn rgba(c: Rgb) -> [u8; 4] {
@@ -1780,52 +1172,6 @@ fn key_for(k: egui::Key) -> Option<(Key, char)> {
 mod tests {
     use super::*;
 
-    /// A full-screen app's background reaches the pane's edges (Ghostty's
-    /// `window-padding-color = extend`); a shell's default one doesn't
-    /// draw, and a row with a default cell keeps the top or bottom plain.
-    #[test]
-    fn the_padding_takes_the_edge_cells_colours() {
-        let dims = Dimensions {
-            width: 2.0 * PADDING + 30.0 + 4.0,
-            height: 2.0 * PADDING + 40.0 + 7.0,
-            cell_width: 10.0,
-            cell_height: 20.0,
-            baseline: 15.0,
-            font_size: 13,
-            dpi_scale: 1.0,
-        };
-        let (bg, a, b) = ([0, 0, 0, 255], [1, 1, 1, 255], [2, 2, 2, 255]);
-        let row = |edge: [[u8; 4]; 3], extend| RowInstances {
-            edge: edge.to_vec(),
-            extend,
-            ..Default::default()
-        };
-        let p = PADDING;
-        let right = p + 30.0;
-        // Top: a, a, b in two runs; bottom row has a default cell.
-        let rows = [row([a, a, b], true), row([b, a, bg], false)];
-        assert_eq!(
-            padding_rects(&rows, dims, bg),
-            vec![
-                ([0.0, p, p, 20.0], a),
-                ([right, p, p + 4.0, 20.0], b),
-                ([0.0, p + 20.0, p, 20.0], b),
-                ([0.0, 0.0, p + 20.0, p], a),
-                ([p + 20.0, 0.0, dims.width - p - 20.0, p], b),
-            ]
-        );
-        let shell = [row([bg, bg, bg], false), row([bg, bg, bg], false)];
-        assert!(padding_rects(&shell, dims, bg).is_empty());
-
-        let black = Rgb { r: 0, g: 0, b: 0 };
-        let blue = Some(Rgb { r: 0, g: 0, b: 9 });
-        assert!(extends(false, &[(blue, None), (blue, Some('x'))], black));
-        assert!(!extends(true, &[(blue, None)], black), "a prompt row");
-        assert!(!extends(false, &[(blue, None), (None, None)], black));
-        assert!(!extends(false, &[(Some(black), None)], black));
-        assert!(!extends(false, &[(blue, Some('\u{e0b0}'))], black));
-    }
-
     /// tai's shell integration reports the folder with OSC 7, which the
     /// terminal keeps for `folder`. Unix only, like `reported_dir`'s test.
     #[cfg(unix)]
@@ -1855,18 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn wheel_travel_becomes_whole_rows() {
-        let mut pending = 0.0;
-        // Touchpad points add up until they make a row.
-        assert_eq!(wheel_rows(&mut pending, 10.0, 24.0), 0);
-        assert_eq!(wheel_rows(&mut pending, 10.0, 24.0), 0);
-        assert_eq!(wheel_rows(&mut pending, 10.0, 24.0), 1);
-        assert!((pending - 6.0).abs() < 1e-4);
-        // Turning back drops what was pending the other way: a notch's 72
-        // points are three rows, not two and the rest of the six.
-        assert_eq!(wheel_rows(&mut pending, -72.0, 24.0), -3);
-        assert!(pending.abs() < 1e-4);
-        assert_eq!(wheel_rows(&mut pending, -50.0, 24.0), -2);
+    fn wheel_units_become_points() {
         // A line (a notch) is WHEEL_ROWS rows, as in Ghostty; a page is
         // the screen.
         assert_eq!(
@@ -1883,54 +1218,5 @@ mod tests {
         } else {
             assert!((tenth - 7.2).abs() < 1e-4);
         }
-    }
-
-    #[test]
-    fn alternate_scroll_sends_the_arrow_for_the_cursor_key_mode() {
-        assert_eq!(arrow_seq(true, false), b"\x1b[A");
-        assert_eq!(arrow_seq(false, false), b"\x1b[B");
-        assert_eq!(arrow_seq(true, true), b"\x1bOA");
-        assert_eq!(arrow_seq(false, true), b"\x1bOB");
-    }
-
-    /// The encoder finds the cell under a point from `encoder_size`, at 1x
-    /// and on a 2x display, where points are scaled to surface pixels.
-    #[test]
-    fn a_press_reports_the_cell_under_the_pointer() -> Result<()> {
-        for scale in [1.0, 2.0] {
-            let dims = Dimensions {
-                width: 800.0,
-                height: 600.0,
-                cell_width: 10.0,
-                cell_height: 20.0,
-                baseline: 15.0,
-                font_size: 13,
-                dpi_scale: scale,
-            };
-            let (cols, rows) = dims.grid_size();
-            let (cw, ch) = dims.cell_pixels();
-            let mut terminal = Terminal::new(cols, rows)?;
-            terminal.resize(cols, rows, cw, ch)?;
-            // Normal tracking, SGR format.
-            terminal.vt_write(b"\x1b[?1000h\x1b[?1006h");
-            let mut encoder = mouse::Encoder::new()?;
-            encoder
-                .set_options_from_terminal(&terminal)
-                .set_size(encoder_size(dims))?;
-            let mut event = mouse::Event::new()?;
-            // Column 3 and row 1 from zero: past the padding, mid-cell.
-            let local = egui::vec2(PADDING + 3.5 * 10.0, PADDING + 1.5 * 20.0);
-            event
-                .set_action(mouse::Action::Press)
-                .set_button(Some(mouse::Button::Left))
-                .set_position(mouse::Position {
-                    x: local.x * scale,
-                    y: local.y * scale,
-                });
-            let mut out = Vec::new();
-            encoder.encode_to_vec(&event, &mut out)?;
-            assert_eq!(out, b"\x1b[<0;4;2M", "at {scale}x");
-        }
-        Ok(())
     }
 }
