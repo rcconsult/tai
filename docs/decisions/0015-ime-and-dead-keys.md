@@ -4,8 +4,10 @@
   it") after the macOS session found that dead keys don't compose in
   either app. The macOS session reviewed it the same day; its
   corrections are folded in: commits, clearing the preedit, shortcuts
-  while composing, and the AppKit details. It waits for the Linux
-  session's review and the owner's acceptance.
+  while composing, and the AppKit details. The Linux session reviewed
+  it too and probed X11 live (dead keys, Compose, IBus); its findings are
+  folded in, including tai's native Wayland backend. It waits for the
+  owner's acceptance.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host.
 - **Supersedes:** decision 7 of [ADR 0012](0012-cjk-font-fallback.md)
@@ -41,12 +43,27 @@ CJK through an input method fails in both apps on every platform
   A dead key has no characters; the next key has its plain letter.
 - `set_ime_enabled` and `set_ime_position` are no-ops there.
 
-**tai on X11**
+**tai on X11** (Linux session, live on Xvfb, 2026-11-28; xterm as the
+reference)
 
 - miniquad's `linux_x11.rs` calls `XLookupString` with no input method,
   no input context and no compose status.
-- So dead keys, the Compose key and XIM input methods (IBus, fcitx)
-  shouldn't compose either. Not checked live yet.
+- Dead keys (US international): `dead_acute e` gives `e`, and the dead
+  key sends nothing. xterm gives `é`.
+- Compose: `Multi_key ' e` gives `'e`, and `Multi_key o c` gives `oc`.
+- IBus (libpinyin): nothing composes; the keys reach the program as
+  typed.
+
+**tai on Wayland**
+
+- tai asks miniquad for `LinuxBackend::WaylandWithX11Fallback`
+  (`src/main.rs`), so on a Wayland session it runs on miniquad's native
+  Wayland backend, not through XWayland.
+- That backend's key text is a per-key `xkb_keysym_to_utf32`
+  (`linux_wayland.rs`, around line 305). It has no compose state and no
+  `zwp_text_input_v3`, so dead keys, Compose and input methods can't
+  work there either. Not checked live: no dev host has a Wayland
+  session.
 
 **tai on Windows**
 
@@ -70,6 +87,18 @@ CJK through an input method fails in both apps on every platform
   egui-winit falls back from the dead logical key to the physical key.
 - On Windows, winit composes dead keys into the key event's text either
   way. Not checked live yet.
+- On X11 with IME off, winit skips `XFilterEvent`
+  (`x11/event_processor.rs`, around line 152) and composes from
+  xkbcommon's compose tables itself (`common/xkb/mod.rs`). Live on
+  Xvfb:
+  - in legacy mode, dead keys and Compose give `é` and `©`, as in xterm;
+  - but under the Kitty protocol the dead key and each Compose key leak
+    as keys of their own (`\e[39u` before `\e[101u`), and the composed
+    text is lost;
+  - and the Escape that cancels a Compose sequence reaches the program
+    as `\x1b` (xterm swallows it).
+- IBus composes in tai-gui's chat input (preedit shown, `你` committed),
+  so winit's XIM link works; the terminal pane just never allows IME.
 
 ### How Ghostty does it (pinned `108cacb1`)
 
@@ -213,9 +242,16 @@ CJK through an input method fails in both apps on every platform
        tai-gui (decision 4).
    - **X11:** `XOpenIM`, `XCreateIC`, `XFilterEvent` and
      `Xutf8LookupString`. That covers dead keys, Compose and XIM input
-     methods. XIM's preedit callbacks give the preedit where the input
-     method supports on-the-spot style; otherwise the input method keeps
-     its own window.
+     methods. With no input method server running, Xlib's built-in
+     local input method still composes dead keys and Compose (xterm did
+     on Xvfb with no XIM server), so this covers dead keys without any
+     IME. XIM's preedit callbacks give the preedit where the input method
+     supports on-the-spot style (`XIMPreeditCallbacks`); otherwise the
+     input method keeps its own window.
+   - **Wayland:** miniquad's native Wayland backend, which tai uses on a
+     Wayland session, gets xkbcommon's compose tables (dead keys and
+     Compose, as winit does) and `zwp_text_input_v3` (input methods,
+     preedit and the cursor rectangle), as winit has for tai-gui.
    - **Windows:** the preedit from `GCS_COMPSTR`, and the candidate
      window from `set_ime_position` instead of the caret.
    - **How the reports reach tai:** through the input subscriber stream
@@ -231,7 +267,8 @@ CJK through an input method fails in both apps on every platform
    2. tai-gui on all three platforms.
    3. tai on macOS (vendored miniquad, `NSTextInputClient`).
    4. tai on X11 (XIM).
-   5. tai on Windows (inline preedit and candidate position).
+   5. tai on Wayland (compose tables and text-input-v3).
+   6. tai on Windows (inline preedit and candidate position).
 7. **What the checks cover:**
    - **Dead keys:**
      - macOS: Option+e e and Option+u o on U.S.; the háček and čárka on
@@ -254,18 +291,27 @@ CJK through an input method fails in both apps on every platform
        including when `interpretKeyEvents` ends in
        `doCommandBySelector`).
    - **Edge cases:** Backspace and Escape inside a composition cancel it
-     without reaching the program, and the candidate window sits at the
-     cursor.
+     without reaching the program, including the Escape that cancels a
+     Compose sequence (tai-gui sends it today), and the candidate window
+     sits at the cursor.
+   - **Wayland:** dead keys, Compose and an input method in both apps,
+     once a host with a Wayland session can run them.
 
 ## Why this and not the alternatives
 
 - **tai-gui only.** It's the smaller half, but it leaves the two apps
   different, which ADR 0014 exists to stop.
-- **Composing dead keys in tai itself**, from keyboard layout tables
-  (UCKeyTranslate on macOS, xkbcommon's compose tables on X11). It would
-  fix dead keys without the input-method plumbing, but not CJK input. It
-  would also copy what the OS already does, and still differ from
-  tai-gui, which uses the OS path.
+- **Composing dead keys in tai itself, alone**, from keyboard layout
+  tables (UCKeyTranslate on macOS, xkbcommon's compose tables on X11).
+  It would fix dead keys without the input-method plumbing, but not CJK
+  input. On X11 it is what winit does today with IME off, and it is the
+  path that leaks dead keys under the Kitty protocol. Where there is no
+  OS input path for it (Wayland), compose tables are part of the plan,
+  next to text-input-v3, not instead of it.
+- **Running tai on X11 only** (`LinuxBackend::X11Only`), so a Wayland
+  session reaches it through XWayland's XIM. One patch fewer, but it
+  changes how tai runs on Wayland (scaling, the window), for a gap
+  tai-gui fills natively.
 - **Waiting for upstream miniquad.** It has IME on Windows only, and
   nothing on macOS or X11 is planned that we know of.
 - **Moving tai onto winit (one renderer).** That would remove the
@@ -278,8 +324,10 @@ CJK through an input method fails in both apps on every platform
   through upgrades.
 - The macOS patch is Objective-C runtime code (`msg_send!`, a class with
   added protocol methods), in the same style as miniquad's own.
-- XIM is old. Wayland sessions reach tai through XWayland, whose XIM
-  bridge depends on the input method.
+- XIM is old, and which preedit styles IBus and fcitx offer through it
+  is unchecked.
+- No dev host has a Wayland session, so the Wayland half is untested
+  until one does.
 
 ## Triggers to revisit
 
