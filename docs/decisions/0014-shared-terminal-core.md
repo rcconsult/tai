@@ -126,7 +126,9 @@ three platforms.
       macroquad's key and character events, so typed text goes through
       the encoder too: the Kitty keyboard protocol sees printable keys,
       their repeats and releases in both apps, and Alt or Option with a
-      key sends what tai sends.
+      key sends what tai sends. A release goes out only after its press
+      did, as a button's does, and tai-gui applies tai's shortcut table,
+      so an app shortcut's key (Cmd+C, Cmd+=) never reaches the program.
 4. **Not in this decision:** drawing `tai` through tai-gui's wgpu
    renderer, so there is one renderer. That would change ADR 0008 and
    0012's choice of OpenGL for tai and needs its own record.
