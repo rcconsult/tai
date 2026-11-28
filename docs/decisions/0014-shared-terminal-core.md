@@ -1,8 +1,8 @@
 # ADR 0014: One terminal core for tai and tai-gui, under `src/term/`
 
-- **Status:** Accepted 2026-11-27 (owner). Steps 1 and 2 are merged
-  (main `20f3ec6`, `fbc60ea`). Step 3 is on branch `term-core-pointer`,
-  step 4 on `term-core-cells` on top of it.
+- **Status:** Accepted 2026-11-27 (owner). Steps 1 to 4 are merged
+  (main `20f3ec6`, `fbc60ea`, `268ac44`). Step 5 is on branch
+  `term-core-keys`.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host, from the owner's question that day: "what else can we refactor
   to minimize divergence and code duplication?"
@@ -112,8 +112,23 @@ three platforms.
       cursor is drawn into its cell, the character in the background
       colour on the cursor's (tai covered it with a block), and the
       padding takes the edge cells' colours (window-padding-color =
-      extend), which tai didn't do.
+      extend), which tai didn't do. `extend` is Ghostty's opt-in mode, not
+      its default (`background`); the owner chose to keep it (2026-11-28).
    5. **Keys:** one encoder path fed with a neutral key event.
+
+      `term/keys.rs` takes a `KeyIn` (the libghostty key, its unshifted
+      character, the modifiers and the text the platform typed for it)
+      and writes what the program gets. tai's rules are the core's:
+      AltGr's character on Windows, a Ctrl chord's own character dropped,
+      Shift consumed for a printable key, the text when the encoder has
+      no sequence, and the C0 byte for Ctrl+[ and its kind. tai-gui now
+      pairs each key with the text egui sends just after it, as tai pairs
+      macroquad's key and character events, so typed text goes through
+      the encoder too: the Kitty keyboard protocol sees printable keys,
+      their repeats and releases in both apps, and Alt or Option with a
+      key sends what tai sends. A release goes out only after its press
+      did, as a button's does, and tai-gui applies tai's shortcut table,
+      so an app shortcut's key (Cmd+C, Cmd+=) never reaches the program.
 4. **Not in this decision:** drawing `tai` through tai-gui's wgpu
    renderer, so there is one renderer. That would change ADR 0008 and
    0012's choice of OpenGL for tai and needs its own record.

@@ -149,8 +149,10 @@ pub struct TerminalPane {
     render_state: RenderState<'static>,
     row_it: RowIterator<'static>,
     cell_it: CellIterator<'static>,
-    key_encoder: key::Encoder<'static>,
-    key_event: key::Event<'static>,
+    /// Keys to the program, as tai sends them (src/term/keys.rs).
+    keys: crate::term::keys::Keys,
+    /// The key pressed last, waiting for its text.
+    pending_key: Option<PendingKey>,
     atlas: GlyphAtlas,
     /// This pane's GPU objects, its own as its atlas is (gpu.rs).
     gpu: crate::gpu::PaneId,
@@ -196,6 +198,15 @@ pub struct TerminalPane {
     /// When output last arrived, to tell a prompt that has settled.
     last_output: Option<Instant>,
     ctx: egui::Context,
+}
+
+/// A key pressed, with the text egui sent for it after it.
+struct PendingKey {
+    action: key::Action,
+    key: Key,
+    ucp: char,
+    mods: key::Mods,
+    text: String,
 }
 
 /// How long a new shell's output must have stopped before a command is
@@ -284,8 +295,8 @@ impl TerminalPane {
             render_state: RenderState::new()?,
             row_it: RowIterator::new()?,
             cell_it: CellIterator::new()?,
-            key_encoder: key::Encoder::new()?,
-            key_event: key::Event::new()?,
+            keys: crate::term::keys::Keys::new()?,
+            pending_key: None,
             atlas: GlyphAtlas::new(crate::cells::ATLAS_MAX_HEIGHT),
             gpu: crate::gpu::PaneId::new(),
             instances: Arc::new(Vec::new()),
@@ -541,6 +552,9 @@ impl TerminalPane {
                 if let Err(e) = self.handle_event(event, held) {
                     tracing::warn!("input: {e}");
                 }
+            }
+            if let Err(e) = self.flush_key() {
+                tracing::warn!("input: {e}");
             }
             // A key that sends input clears the selection, as Ghostty's
             // default selection-clear-on-typing does (src/Surface.zig at
@@ -902,14 +916,24 @@ impl TerminalPane {
 
     fn handle_event(&mut self, event: &egui::Event, held: egui::Modifiers) -> Result<()> {
         let macos = cfg!(target_os = "macos");
+        // A pending key's text comes just after it; anything else ends it.
+        if !matches!(event, egui::Event::Text(_)) {
+            self.flush_key()?;
+        }
         match event {
             // Alt+key also arrives as its plain text; the key event sends
             // the chord (ESC + key).
-            egui::Event::Text(_) if held.alt && !held.ctrl => {}
-            egui::Event::Text(text) => {
-                self.response.extend_from_slice(text.as_bytes());
-                self.typed = true;
-            }
+            // egui-winit sends a key's text just after its key event
+            // (on_keyboard_input); it belongs to that key, and the encoder
+            // gets both, as in tai (src/main.rs, flush_pending_key).
+            egui::Event::Text(text) => match &mut self.pending_key {
+                Some(pending) => pending.text.push_str(text),
+                // Text with no key: an unmapped key, or IME. As it is.
+                None => {
+                    self.response.extend_from_slice(text.as_bytes());
+                    self.typed = true;
+                }
+            },
             egui::Event::Paste(text) => {
                 let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
                 self.response
@@ -922,72 +946,84 @@ impl TerminalPane {
             // Copy is Ctrl+Shift+C off macOS and Cmd+C on it (shortcuts.rs);
             // egui reports both, and plain Ctrl+C, as Copy.
             egui::Event::Copy if macos || held.shift => self.copy_requested = true,
-            egui::Event::Copy => self.encode_key(Key::C, 'c', key::Mods::CTRL, None)?,
-            egui::Event::Cut if !macos => self.encode_key(Key::X, 'x', key::Mods::CTRL, None)?,
+            egui::Event::Copy => {
+                self.encode_key(key::Action::Press, Key::C, 'c', key::Mods::CTRL, None)?
+            }
+            egui::Event::Cut if !macos => {
+                self.encode_key(key::Action::Press, Key::X, 'x', key::Mods::CTRL, None)?
+            }
             egui::Event::Key {
                 key,
-                pressed: true,
-                repeat: _,
+                pressed,
+                repeat,
                 modifiers,
                 ..
             } => {
+                let Some((k, ucp)) = key_for(*key) else {
+                    return Ok(());
+                };
                 let mods = mods_from(*modifiers);
-                if let Some((k, ucp)) = key_for(*key) {
-                    // Plain printable keys arrive as Text too; send only
-                    // chords and keys without text from here.
-                    let chord =
-                        mods.intersects(key::Mods::CTRL | key::Mods::ALT | key::Mods::SUPER);
-                    if chord
-                        || ucp == '\0'
-                        || matches!(
-                            k,
-                            Key::Enter | Key::Tab | Key::Space | Key::Backspace | Key::Escape
-                        )
-                    {
-                        if matches!(k, Key::Space) && !chord {
-                            return Ok(());
-                        }
-                        self.encode_key(k, ucp, mods, None)?;
-                    }
+                // An app shortcut's key is the app's, as in tai: egui zooms
+                // for Cmd+= / Ctrl+= at the end of the frame, after this
+                // pane has read the key. Its release then has no press and
+                // keys.rs drops it.
+                if *pressed
+                    && shortcut_key(*key)
+                        .is_some_and(|kc| shortcuts::action_for(kc, mods, macos).is_some())
+                {
+                    return Ok(());
                 }
+                if !pressed {
+                    return self.encode_key(key::Action::Release, k, ucp, mods, None);
+                }
+                // Encoded once its text, if any, has come (flush_key).
+                self.pending_key = Some(PendingKey {
+                    action: if *repeat {
+                        key::Action::Repeat
+                    } else {
+                        key::Action::Press
+                    },
+                    key: k,
+                    ucp,
+                    mods,
+                    text: String::new(),
+                });
             }
             _ => {}
         }
         Ok(())
     }
 
-    fn encode_key(&mut self, k: Key, ucp: char, mods: key::Mods, text: Option<&str>) -> Result<()> {
-        self.typed = true;
-        let mut consumed = key::Mods::empty();
-        if ucp != '\0' && mods.contains(key::Mods::SHIFT) {
-            consumed |= key::Mods::SHIFT;
+    /// Encode the key pressed last, with the text that followed it.
+    fn flush_key(&mut self) -> Result<()> {
+        let Some(p) = self.pending_key.take() else {
+            return Ok(());
+        };
+        let text = (!p.text.is_empty()).then_some(p.text.as_str());
+        self.encode_key(p.action, p.key, p.ucp, p.mods, text)
+    }
+
+    /// A key and its text to the program, through the terminal core tai
+    /// shares (src/term/keys.rs).
+    fn encode_key(
+        &mut self,
+        action: key::Action,
+        k: Key,
+        ucp: char,
+        mods: key::Mods,
+        text: Option<&str>,
+    ) -> Result<()> {
+        if action != key::Action::Release {
+            self.typed = true;
         }
-        self.key_event
-            .set_action(key::Action::Press)
-            .set_key(k)
-            .set_mods(mods)
-            .set_consumed_mods(consumed)
-            .set_unshifted_codepoint(ucp)
-            .set_utf8(text);
-        let before = self.response.len();
-        // libghostty-vt 0.2.2's encode_to_vec retries a too-small buffer
-        // with reserve(required - remaining), and reserve counts from the
-        // length, so with bytes already queued the retry fails too and the
-        // key is lost ("out of space, 16 bytes required"). Leave room for
-        // any key sequence up front.
-        self.response.reserve(64);
-        self.key_encoder
-            .set_options_from_terminal(&self.terminal)
-            .encode_to_vec(&self.key_event, &mut self.response)?;
-        // The encoder sends nothing for Ctrl+[ ; send the classic C0 byte,
-        // as the macroquad build does.
-        if self.response.len() == before && mods == key::Mods::CTRL {
-            let upper = ucp.to_ascii_uppercase();
-            if ('@'..='_').contains(&upper) {
-                self.response.push(upper as u8 & 0x1F);
-            }
-        }
-        Ok(())
+        let k = crate::term::keys::KeyIn {
+            action,
+            key: k,
+            ucp,
+            mods,
+            text,
+        };
+        self.keys.encode(&self.terminal, k, &mut self.response)
     }
 }
 
@@ -1084,6 +1120,21 @@ fn mods_from(m: egui::Modifiers) -> key::Mods {
         mods |= key::Mods::SUPER;
     }
     mods
+}
+
+/// The key tai's shortcut table (shortcuts.rs) names for an egui key, for
+/// the keys it binds. egui reports Shift+= as Plus.
+fn shortcut_key(k: egui::Key) -> Option<macroquad::input::KeyCode> {
+    use egui::Key as E;
+    use macroquad::input::KeyCode as K;
+    Some(match k {
+        E::C => K::C,
+        E::V => K::V,
+        E::Equals | E::Plus => K::Equal,
+        E::Minus => K::Minus,
+        E::Num0 => K::Key0,
+        _ => return None,
+    })
 }
 
 /// The libghostty key and unshifted codepoint for an egui key.
@@ -1188,6 +1239,28 @@ mod tests {
             "{:?}",
             terminal.pwd()
         );
+    }
+
+    /// tai's shortcuts hold in tai-gui too: their keys never reach the
+    /// program, and plain Ctrl+C still does off macOS.
+    #[test]
+    fn app_shortcuts_are_tais() {
+        use libghostty_vt::key::Mods;
+        let is_shortcut = |k: egui::Key, mods: Mods, macos: bool| {
+            super::shortcut_key(k)
+                .is_some_and(|kc| crate::shortcuts::action_for(kc, mods, macos).is_some())
+        };
+        assert!(is_shortcut(egui::Key::Equals, Mods::SUPER, true));
+        assert!(is_shortcut(
+            egui::Key::Plus,
+            Mods::SUPER | Mods::SHIFT,
+            true
+        ));
+        assert!(is_shortcut(egui::Key::C, Mods::SUPER, true));
+        assert!(is_shortcut(egui::Key::Minus, Mods::CTRL, false));
+        assert!(is_shortcut(egui::Key::C, Mods::CTRL | Mods::SHIFT, false));
+        assert!(!is_shortcut(egui::Key::C, Mods::CTRL, false));
+        assert!(!is_shortcut(egui::Key::A, Mods::SUPER, true));
     }
 
     /// A command from ppxai's `run_shell` is typed, never run: no newline,

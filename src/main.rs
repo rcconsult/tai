@@ -67,15 +67,6 @@ mod sixel;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Room to leave in an output buffer before libghostty-vt encodes a key or
-/// mouse event into it. Its `encode_to_vec` (0.2.2, `src/key.rs` and
-/// `src/mouse.rs`) retries a too-small buffer with
-/// `reserve(required - remaining)`, and `reserve` counts from the length,
-/// so with bytes already queued the retry can fail too and the event is
-/// lost ("out of space, 16 bytes required", seen in tai-gui). Every key and
-/// mouse sequence fits in this.
-const ENCODE_ROOM: usize = 64;
-
 /// A material that copies a texture to the screen without blending.
 ///
 /// Drawing a glyph into the frame's render target blends the alpha channel
@@ -1197,9 +1188,9 @@ struct PendingKey {
     text: String,
 }
 
-struct Input<'alloc> {
-    key_encoder: key::Encoder<'alloc>,
-    key_event: key::Event<'alloc>,
+struct Input {
+    /// Keys to the program (src/term/keys.rs).
+    keys: term::keys::Keys,
     response: Vec<u8>,
     /// The mouse: reports, selection and wheel (src/term/pointer.rs).
     pointer: term::pointer::Pointer,
@@ -1232,11 +1223,10 @@ struct Input<'alloc> {
     /// This frame's wheel travel in notches, from the input stream.
     wheel: f32,
 }
-impl<'alloc> Input<'alloc> {
+impl Input {
     fn new() -> Result<Self> {
         Ok(Self {
-            key_encoder: key::Encoder::new()?,
-            key_event: key::Event::new()?,
+            keys: term::keys::Keys::new()?,
             response: Vec::with_capacity(64),
             pointer: term::pointer::Pointer::new()?,
             cursor: Cell::new(None),
@@ -1272,7 +1262,7 @@ impl<'alloc> Input<'alloc> {
     /// both: macroquad never reports a repeat as a press, so held non-text
     /// keys didn't repeat, and a frame's characters couldn't be matched to
     /// the keys that produced them, so they could be dropped or reordered.
-    fn handle_keyboard_input(&mut self, terminal: &Terminal<'alloc, '_>) -> Result<()> {
+    fn handle_keyboard_input(&mut self, terminal: &Terminal<'_, '_>) -> Result<()> {
         // macroquad also queues characters for get_char_pressed and never
         // clears that queue itself. tai reads the stream instead, so empty it.
         while get_char_pressed().is_some() {}
@@ -1360,7 +1350,14 @@ impl<'alloc> Input<'alloc> {
                         continue;
                     }
                     if let Some((key, ucp)) = Self::key_for(keycode) {
-                        self.encode_key(terminal, key::Action::Release, key, ucp, mods, None)?;
+                        let k = term::keys::KeyIn {
+                            action: key::Action::Release,
+                            key,
+                            ucp,
+                            mods,
+                            text: None,
+                        };
+                        self.keys.encode(terminal, k, &mut self.response)?;
                     }
                 }
                 KeyInput::Char(ch) => {
@@ -1460,112 +1457,21 @@ impl<'alloc> Input<'alloc> {
     }
 
     /// Encode the key pressed last, with the characters that followed it.
-    fn flush_pending_key(&mut self, terminal: &Terminal<'alloc, '_>) -> Result<()> {
+    fn flush_pending_key(&mut self, terminal: &Terminal<'_, '_>) -> Result<()> {
         let Some(pending) = self.pending_key.take() else {
             return Ok(());
         };
         let text = (!pending.text.is_empty()).then_some(pending.text.as_str());
 
-        // Windows reports AltGr as Ctrl+Alt. When it produced a character
-        // (AltGr+2 gives '@' on Swiss and German layouts), that character is
-        // the input: with Ctrl+Alt left in, the encoder sends ESC NUL or a
-        // CSI u sequence instead. Marking them consumed isn't enough (it
-        // sends NUL), so drop them.
-        #[cfg(windows)]
-        let mods = if text.is_some() && pending.mods.contains(key::Mods::CTRL | key::Mods::ALT) {
-            pending.mods - (key::Mods::CTRL | key::Mods::ALT)
-        } else {
-            pending.mods
-        };
-        #[cfg(not(windows))]
-        let mods = pending.mods;
-
-        // A Ctrl chord's own character as text ('[' for Ctrl+[ on X11) makes
-        // the encoder send CSI u. Not with Alt as well, which is AltGr on
-        // Windows and has real text.
-        let ctrl_only =
-            mods.contains(key::Mods::CTRL) && !mods.intersects(key::Mods::ALT | key::Mods::SUPER);
-        let own_char = |t: &str| {
-            let mut chars = t.chars();
-            chars
-                .next()
-                .is_some_and(|c| c.eq_ignore_ascii_case(&pending.ucp))
-                && chars.next().is_none()
-        };
-        // Only for keys with a C0 form: Ctrl+; and the like keep their text,
-        // or they would send nothing.
-        let has_c0 = Self::c0_control(pending.ucp).is_some();
-        let text = if ctrl_only && has_c0 && text.is_some_and(own_char) {
-            None
-        } else {
-            text
-        };
-
-        let before = self.response.len();
-        self.encode_key(
-            terminal,
-            pending.action,
-            pending.key,
-            pending.ucp,
-            mods,
+        // The terminal core's rules (src/term/keys.rs), which tai-gui shares.
+        let k = term::keys::KeyIn {
+            action: pending.action,
+            key: pending.key,
+            ucp: pending.ucp,
+            mods: pending.mods,
             text,
-        )?;
-        if self.response.len() == before {
-            if let Some(text) = text {
-                // A key the encoder has no sequence for still typed its text.
-                self.response.extend_from_slice(text.as_bytes());
-            } else if ctrl_only && let Some(byte) = Self::c0_control(pending.ucp) {
-                // The encoder sends nothing for Ctrl+[ (it does for Ctrl+]
-                // and Ctrl+\). Send the classic control byte: ESC for Ctrl+[.
-                self.response.push(byte);
-            }
-        }
-        Ok(())
-    }
-
-    /// The C0 control byte a Ctrl chord has always sent in terminals:
-    /// Ctrl+@ through Ctrl+_ (letters in either case) map to 0x00-0x1F.
-    fn c0_control(ucp: char) -> Option<u8> {
-        let upper = ucp.to_ascii_uppercase();
-        ('@'..='_').contains(&upper).then_some(upper as u8 & 0x1F)
-    }
-
-    fn encode_key(
-        &mut self,
-        terminal: &Terminal<'alloc, '_>,
-        action: key::Action,
-        key: Key,
-        ucp: char,
-        mods: key::Mods,
-        text: Option<&str>,
-    ) -> Result<()> {
-        // Consumed mods are modifiers the platform's text input
-        // already accounted for when producing the UTF-8 text.
-        // For printable keys, shift is consumed (it turns 'a' → 'A').
-        // For non-printable keys nothing is consumed.
-        let mut consumed = key::Mods::empty();
-        if ucp != '\0' && mods.contains(key::Mods::SHIFT) {
-            consumed |= key::Mods::SHIFT;
-        }
-
-        self.key_event
-            .set_action(action)
-            .set_key(key)
-            .set_mods(mods)
-            .set_consumed_mods(consumed)
-            // The unshifted codepoint is the character the key produces
-            // with no modifiers.  The Kitty protocol needs it to identify
-            // keys independent of the current shift state.
-            .set_unshifted_codepoint(ucp)
-            .set_utf8(text);
-
-        self.response.reserve(ENCODE_ROOM);
-        self.key_encoder
-            // Sync encoder options from the terminal so mode changes (e.g.
-            // application cursor keys, Kitty keyboard protocol) are honoured.
-            .set_options_from_terminal(terminal)
-            .encode_to_vec(&self.key_event, &mut self.response)?;
-        Ok(())
+        };
+        self.keys.encode(terminal, k, &mut self.response)
     }
 
     /// The libghostty key and unshifted codepoint for a macroquad key code.
@@ -1586,7 +1492,7 @@ impl<'alloc> Input<'alloc> {
     /// state into its input.
     fn handle_mouse_input(
         &mut self,
-        terminal: &mut Terminal<'alloc, '_>,
+        terminal: &mut Terminal<'_, '_>,
         dims: Dimensions,
     ) -> Result<()> {
         use term::pointer::{Click, Input as PointerInput, Pos, WHEEL_ROWS};
@@ -1637,7 +1543,7 @@ impl<'alloc> Input<'alloc> {
     /// grab.
     fn update_mouse_cursor(
         &self,
-        terminal: &Terminal<'alloc, '_>,
+        terminal: &Terminal<'_, '_>,
         dims: Dimensions,
         input_enabled: bool,
     ) -> Result<()> {
@@ -1833,7 +1739,7 @@ mod pty;
 
 #[cfg(test)]
 mod tests {
-    use super::{Dimensions, Input, PADDING, wheel_notches};
+    use super::{Dimensions, PADDING, wheel_notches};
     use crate::term::pointer::WHEEL_ROWS;
 
     #[test]
@@ -2034,55 +1940,5 @@ mod tests {
         assert_eq!(encode(Some("\u{f701}")), "\u{f701}".as_bytes());
         assert!(super::is_function_key_char('\u{f701}'));
         assert!(!super::is_function_key_char('a'));
-    }
-
-    #[test]
-    fn a_key_queued_after_other_bytes_isnt_lost() {
-        use libghostty_vt::{
-            Terminal,
-            key::{self, Key},
-        };
-        let mut terminal = Terminal::new(80, 24).unwrap();
-        terminal.set_scrollback_max_lines(Some(0)).unwrap();
-        // Every Kitty keyboard flag, for a long sequence.
-        terminal.vt_write(b"\x1b[>31u");
-        let mut encoder = key::Encoder::new().unwrap();
-        let mut event = key::Event::new().unwrap();
-        let all = key::Mods::CTRL | key::Mods::ALT | key::Mods::SHIFT | key::Mods::SUPER;
-        event
-            .set_action(key::Action::Press)
-            .set_key(Key::A)
-            .set_mods(all)
-            .set_consumed_mods(key::Mods::empty())
-            .set_unshifted_codepoint('a')
-            .set_utf8(Some("A"));
-        encoder.set_options_from_terminal(&terminal);
-        let mut alone = Vec::new();
-        encoder.encode_to_vec(&event, &mut alone).unwrap();
-        assert!(alone.len() >= 10, "{alone:?}");
-
-        // One byte already queued in an 8-byte buffer: libghostty-vt's
-        // retry reserves too little and the key is lost. If this starts
-        // passing, the crate is fixed and ENCODE_ROOM can go.
-        let mut queued = Vec::with_capacity(8);
-        queued.extend_from_slice(b"1234567");
-        assert!(encoder.encode_to_vec(&event, &mut queued).is_err());
-
-        // With the room reserved first, it arrives whole.
-        let mut queued = Vec::with_capacity(8);
-        queued.extend_from_slice(b"1234567");
-        queued.reserve(super::ENCODE_ROOM);
-        encoder.encode_to_vec(&event, &mut queued).unwrap();
-        assert_eq!(&queued[7..], &alone[..]);
-    }
-
-    #[test]
-    fn ctrl_chords_map_to_c0_controls() {
-        assert_eq!(Input::c0_control('['), Some(0x1B));
-        assert_eq!(Input::c0_control('c'), Some(0x03));
-        assert_eq!(Input::c0_control('@'), Some(0x00));
-        assert_eq!(Input::c0_control('_'), Some(0x1F));
-        assert_eq!(Input::c0_control('1'), None);
-        assert_eq!(Input::c0_control('='), None);
     }
 }
