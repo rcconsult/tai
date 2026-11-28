@@ -1601,7 +1601,7 @@ impl Input {
     /// i.e. character the key produces with no modifiers on a US layout. The
     /// Kitty keyboard protocol requires this to identify keys. Returns NUL
     /// for keys that don't have a natural codepoint (arrows, F-keys, etc.).
-    const ALL_KEYS: [(KeyCode, Key, char); 75] = [
+    const ALL_KEYS: [(KeyCode, Key, char); 89] = [
         (KeyCode::A, Key::A, 'a'),
         (KeyCode::B, Key::B, 'b'),
         (KeyCode::C, Key::C, 'c'),
@@ -1676,7 +1676,26 @@ impl Input {
         (KeyCode::F10, Key::F10, '\0'),
         (KeyCode::F11, Key::F11, '\0'),
         (KeyCode::F12, Key::F12, '\0'),
-        (KeyCode::KpEnter, Key::NumpadEnter, '\0'),
+        // The keypad as tai-gui sends it: egui has no keypad keys, so its
+        // digits, '.', '/', '-', '=' and Enter are the main keys there
+        // (egui-winit 0.36.2 key_from_key_code); '+' and '*' have no egui
+        // key and go as text in both apps. Ghostty sends the keypad's own
+        // keys (Numpad0..., NumpadEnter): open item in ADR 0014, step 5.
+        (KeyCode::Kp0, Key::Digit0, '0'),
+        (KeyCode::Kp1, Key::Digit1, '1'),
+        (KeyCode::Kp2, Key::Digit2, '2'),
+        (KeyCode::Kp3, Key::Digit3, '3'),
+        (KeyCode::Kp4, Key::Digit4, '4'),
+        (KeyCode::Kp5, Key::Digit5, '5'),
+        (KeyCode::Kp6, Key::Digit6, '6'),
+        (KeyCode::Kp7, Key::Digit7, '7'),
+        (KeyCode::Kp8, Key::Digit8, '8'),
+        (KeyCode::Kp9, Key::Digit9, '9'),
+        (KeyCode::KpDecimal, Key::Period, '.'),
+        (KeyCode::KpDivide, Key::Slash, '/'),
+        (KeyCode::KpSubtract, Key::Minus, '-'),
+        (KeyCode::KpEqual, Key::Equal, '='),
+        (KeyCode::KpEnter, Key::Enter, '\0'),
     ];
 }
 

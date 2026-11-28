@@ -129,6 +129,20 @@ three platforms.
       key sends what tai sends. A release goes out only after its press
       did, as a button's does, and tai-gui applies tai's shortcut table,
       so an app shortcut's key (Cmd+C, Cmd+=) never reaches the program.
+
+      **Open item, the numeric keypad (2026-11-28, owner).** Both apps
+      send the keypad as the main keys: its digits, `.`, `/`, `-`, `=`
+      and Enter as Digit0-9, Period, Slash, Minus, Equal and Enter, and
+      `+` and `*` as text. That is what tai-gui can do: egui has no
+      keypad keys (egui-winit 0.36.2 `key_from_key_code`), and tai
+      follows it. Ghostty sends the keypad's own keys (Numpad0...,
+      NumpadEnter), which the Kitty keyboard protocol reports apart from
+      the main keys. Do it Ghostty's way, in both apps, once all
+      platforms are better tested; tai-gui will need the physical key
+      from winit for it. Not a missing feature while the keypad and the
+      main keys behave the same and both work. It becomes a functional
+      defect if a program needs the keypad keys themselves, such as the
+      keypad without Num Lock used to steer a UI.
 4. **Not in this decision:** drawing `tai` through tai-gui's wgpu
    renderer, so there is one renderer. That would change ADR 0008 and
    0012's choice of OpenGL for tai and needs its own record.
