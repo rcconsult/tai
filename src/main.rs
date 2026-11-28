@@ -1111,6 +1111,32 @@ enum KeyInput {
     Char(char),
 }
 
+/// The keypad as tai-gui gets it: egui has no keypad keys, so its digits,
+/// '.', '/', '-', '=' and Enter are the main keys there (egui-winit 0.36.2
+/// `key_from_key_code`), for shortcuts and the encoder alike; '+' and '*'
+/// have no egui key and stay keypad keys here (text only). Ghostty sends
+/// the keypad's own keys: open item in ADR 0014, step 5.
+fn keypad_as_main(keycode: KeyCode) -> KeyCode {
+    match keycode {
+        KeyCode::Kp0 => KeyCode::Key0,
+        KeyCode::Kp1 => KeyCode::Key1,
+        KeyCode::Kp2 => KeyCode::Key2,
+        KeyCode::Kp3 => KeyCode::Key3,
+        KeyCode::Kp4 => KeyCode::Key4,
+        KeyCode::Kp5 => KeyCode::Key5,
+        KeyCode::Kp6 => KeyCode::Key6,
+        KeyCode::Kp7 => KeyCode::Key7,
+        KeyCode::Kp8 => KeyCode::Key8,
+        KeyCode::Kp9 => KeyCode::Key9,
+        KeyCode::KpDecimal => KeyCode::Period,
+        KeyCode::KpDivide => KeyCode::Slash,
+        KeyCode::KpSubtract => KeyCode::Minus,
+        KeyCode::KpEqual => KeyCode::Equal,
+        KeyCode::KpEnter => KeyCode::Enter,
+        other => other,
+    }
+}
+
 /// Collects the keyboard events macroquad replays to an input subscriber
 /// (`utils::repeat_all_miniquad_input`), in the order they happened, and
 /// the frame's wheel travel: macroquad's mouse_wheel() keeps only the
@@ -1129,14 +1155,14 @@ impl EventHandler for KeyEvents {
     fn draw(&mut self) {}
     fn key_down_event(&mut self, keycode: KeyCode, keymods: KeyMods, repeat: bool) {
         self.keys.push(KeyInput::Down {
-            keycode,
+            keycode: keypad_as_main(keycode),
             mods: mods_from(keymods),
             repeat,
         });
     }
     fn key_up_event(&mut self, keycode: KeyCode, keymods: KeyMods) {
         self.keys.push(KeyInput::Up {
-            keycode,
+            keycode: keypad_as_main(keycode),
             mods: mods_from(keymods),
         });
     }
@@ -1292,9 +1318,16 @@ impl Input {
                         self.drop_chars = true;
                         continue;
                     }
+                    // Keypad '+' is egui's Plus, which tai-gui's shortcut
+                    // table reads as '=' (font bigger).
+                    let shortcut_key = if keycode == KeyCode::KpAdd {
+                        KeyCode::Equal
+                    } else {
+                        keycode
+                    };
                     if !repeat
                         && let Some(shortcut) =
-                            shortcuts::action_for(keycode, mods, cfg!(target_os = "macos"))
+                            shortcuts::action_for(shortcut_key, mods, cfg!(target_os = "macos"))
                     {
                         self.actions.push(shortcut);
                         self.swallowed.push(keycode);
@@ -1324,9 +1357,19 @@ impl Input {
                     }
 
                     // A key tai has no mapping for: its character, if any,
-                    // goes to the pty as plain text.
+                    // goes to the pty as plain text. Not in a Ctrl or Cmd
+                    // chord (keypad '*' with Ctrl), which types nothing in
+                    // tai-gui: egui-winit sends no text with Ctrl or Cmd.
+                    // Ctrl with Alt is AltGr on Windows and keeps its text.
                     let Some((key, ucp)) = Self::key_for(keycode) else {
-                        self.response.extend_from_slice(lead.as_bytes());
+                        let altgr = cfg!(windows) && mods.contains(key::Mods::ALT);
+                        let chord = (mods.contains(key::Mods::CTRL) && !altgr)
+                            || mods.contains(key::Mods::SUPER);
+                        if chord {
+                            self.drop_chars = true;
+                        } else {
+                            self.response.extend_from_slice(lead.as_bytes());
+                        }
                         continue;
                     };
                     self.pending_key = Some(PendingKey {
@@ -1601,7 +1644,7 @@ impl Input {
     /// i.e. character the key produces with no modifiers on a US layout. The
     /// Kitty keyboard protocol requires this to identify keys. Returns NUL
     /// for keys that don't have a natural codepoint (arrows, F-keys, etc.).
-    const ALL_KEYS: [(KeyCode, Key, char); 89] = [
+    const ALL_KEYS: [(KeyCode, Key, char); 74] = [
         (KeyCode::A, Key::A, 'a'),
         (KeyCode::B, Key::B, 'b'),
         (KeyCode::C, Key::C, 'c'),
@@ -1676,26 +1719,6 @@ impl Input {
         (KeyCode::F10, Key::F10, '\0'),
         (KeyCode::F11, Key::F11, '\0'),
         (KeyCode::F12, Key::F12, '\0'),
-        // The keypad as tai-gui sends it: egui has no keypad keys, so its
-        // digits, '.', '/', '-', '=' and Enter are the main keys there
-        // (egui-winit 0.36.2 key_from_key_code); '+' and '*' have no egui
-        // key and go as text in both apps. Ghostty sends the keypad's own
-        // keys (Numpad0..., NumpadEnter): open item in ADR 0014, step 5.
-        (KeyCode::Kp0, Key::Digit0, '0'),
-        (KeyCode::Kp1, Key::Digit1, '1'),
-        (KeyCode::Kp2, Key::Digit2, '2'),
-        (KeyCode::Kp3, Key::Digit3, '3'),
-        (KeyCode::Kp4, Key::Digit4, '4'),
-        (KeyCode::Kp5, Key::Digit5, '5'),
-        (KeyCode::Kp6, Key::Digit6, '6'),
-        (KeyCode::Kp7, Key::Digit7, '7'),
-        (KeyCode::Kp8, Key::Digit8, '8'),
-        (KeyCode::Kp9, Key::Digit9, '9'),
-        (KeyCode::KpDecimal, Key::Period, '.'),
-        (KeyCode::KpDivide, Key::Slash, '/'),
-        (KeyCode::KpSubtract, Key::Minus, '-'),
-        (KeyCode::KpEqual, Key::Equal, '='),
-        (KeyCode::KpEnter, Key::Enter, '\0'),
     ];
 }
 
@@ -1758,8 +1781,30 @@ mod pty;
 
 #[cfg(test)]
 mod tests {
-    use super::{Dimensions, PADDING, wheel_notches};
+    use super::{Dimensions, PADDING, keypad_as_main, wheel_notches};
     use crate::term::pointer::WHEEL_ROWS;
+    use macroquad::input::KeyCode;
+
+    /// The keypad is the main keys, as egui gives it to tai-gui; '+' and
+    /// '*', which egui has no key for, stay keypad keys (text only).
+    #[test]
+    fn the_keypad_is_the_main_keys_as_in_tai_gui() {
+        let pairs = [
+            (KeyCode::Kp0, KeyCode::Key0),
+            (KeyCode::Kp9, KeyCode::Key9),
+            (KeyCode::KpDecimal, KeyCode::Period),
+            (KeyCode::KpDivide, KeyCode::Slash),
+            (KeyCode::KpSubtract, KeyCode::Minus),
+            (KeyCode::KpEqual, KeyCode::Equal),
+            (KeyCode::KpEnter, KeyCode::Enter),
+            (KeyCode::KpAdd, KeyCode::KpAdd),
+            (KeyCode::KpMultiply, KeyCode::KpMultiply),
+            (KeyCode::A, KeyCode::A),
+        ];
+        for (keypad, main) in pairs {
+            assert_eq!(keypad_as_main(keypad), main, "{keypad:?}");
+        }
+    }
 
     #[test]
     fn a_wheel_notch_scrolls_three_rows_on_each_platform() {
