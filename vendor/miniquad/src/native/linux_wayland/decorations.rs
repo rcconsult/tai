@@ -154,10 +154,14 @@ impl Decorations {
             // libdecor-0-plugin-1-gtk) prints "No plugins found, falling back
             // on no decorations" and gives no xdg surface at all, and
             // miniquad then asserts on the missing toplevel. With no surface
-            // made, the wl_surface is still free: draw miniquad's own border.
+            // made, the wl_surface is still free: release libdecor's frame and
+            // context first (their listeners stay on the display and crash the
+            // next dispatch otherwise), then draw miniquad's own border.
             if display.xdg_toplevel.is_null()
                 && (libdecor.libdecor_frame_get_xdg_surface)(frame).is_null()
             {
+                (libdecor.libdecor_frame_unref)(frame);
+                (libdecor.libdecor_unref)(context);
                 return Decorations::fallback(display);
             }
             use extensions::libdecor::LIBDECOR_ACTION_RESIZE as RESIZE;

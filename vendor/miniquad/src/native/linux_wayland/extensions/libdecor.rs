@@ -86,6 +86,9 @@ declare_module! {
     ) -> c_int,
     pub fn libdecor_frame_get_xdg_surface(*mut libdecor_frame) -> *mut xdg_surface,
     pub fn libdecor_frame_get_xdg_toplevel(*mut libdecor_frame) -> *mut xdg_toplevel,
+    // tai patch 3.
+    pub fn libdecor_frame_unref(*mut libdecor_frame),
+    pub fn libdecor_unref(*mut libdecor),
     ...
     ...
 }

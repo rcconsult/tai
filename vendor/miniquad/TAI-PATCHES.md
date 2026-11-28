@@ -24,7 +24,9 @@ need changes miniquad doesn't have.
    X11 EGL fallback and Android keep OpenGL ES 2.
 3. `src/native/linux_wayland/decorations.rs`, `try_libdecor`: when
    libdecor makes no xdg surface (no plugin installed), fall back to
-   miniquad's own decorations instead of asserting on the missing
+   miniquad's own decorations, after releasing libdecor's frame and
+   context (left attached, they crashed the next dispatch), instead of
+   asserting on the missing
    toplevel (`linux_wayland.rs`, `assert!(!display.xdg_toplevel
    .is_null())`). Seen on nested mutter with libdecor 0.1.0 and no
    plugin.
