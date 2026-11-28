@@ -20,7 +20,7 @@ Status is summarised; the record itself is authoritative.
 | [0012](0012-cjk-font-fallback.md) | Ask the OS for fonts that tai lacks, and draw every glyph with skrifa; retire the immediate renderer | ✅ Accepted 2026-11-01; decision 7 superseded by 0015 |
 | [0013](0013-terminals-by-alias.md) | Reach a terminal by its number or name, and type a command into it | ✅ Accepted 2026-11-23 |
 | [0014](0014-shared-terminal-core.md) | One terminal core for tai and tai-gui, under `src/term/`, built in five steps | ✅ Accepted 2026-11-27 |
-| [0015](0015-ime-and-dead-keys.md) | IME and dead keys in tai and tai-gui, through one input model in the core | ✅ Accepted 2026-11-28; Wayland for tai open |
+| [0015](0015-ime-and-dead-keys.md) | IME and dead keys in tai and tai-gui, through one input model in the core | ✅ Accepted 2026-11-28; implemented 2026-11-28 (tai on Linux X11 only) |
 
 Numbering is sequential. The next record is `0016`.
 
