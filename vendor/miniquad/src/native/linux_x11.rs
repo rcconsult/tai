@@ -429,6 +429,7 @@ impl X11Display {
                 ShowKeyboard(..) => {
                     eprintln!("Not implemented for X11")
                 }
+                SetImeArea { .. } => {}
                 SetImePosition { .. } => {
                     // IME position control not implemented for X11 yet
                 }

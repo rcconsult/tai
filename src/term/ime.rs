@@ -72,15 +72,12 @@ pub fn layout(preedit: &str, start: u16, cols: u16) -> Vec<PreeditCell> {
 /// every move would drag the window around (wispterm `src/ime_caret.zig`,
 /// `docs/lessons/from-libghostty-projects.md` lesson 2).
 #[derive(Clone, Copy, Debug, Default)]
-// Until each front end places its candidate window (ADR 0015, parts 2-6).
-#[allow(dead_code)]
 pub struct Caret {
     seen: Option<(u16, u16)>,
     frames: u8,
     placed: Option<(u16, u16)>,
 }
 
-#[allow(dead_code)]
 impl Caret {
     /// This frame's cursor cell (column, row), or none when it's off the
     /// screen; returns the cell the candidate window should open at.

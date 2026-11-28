@@ -39,7 +39,13 @@ tai's root `Cargo.toml` uses this copy through `[patch.crates-io]`.
    `to_rgba8`, `save_buffer`, `ImageError`, `ImageFormat`) are the same in
    0.25, so no source changed. Upstream macroquad 0.4.16 still depends on
    0.24.
+6. `src/lib.rs`: the input method's preedit and commits that the vendored
+   miniquad reports (its patch 5, `ime_preedit_event` and
+   `ime_commit_event`) reach input subscribers as `ImePreedit` and
+   `ImeCommit` events, like the other input events, so tai gets them in
+   order with its keys (ADR 0015).
 
 Drop this vendored copy once a macroquad release includes the clipboard fix,
 a way to reset a font's glyph cache without parsing it again, a way to
-build a font from parsed font data, and `image` 0.25.
+build a font from parsed font data, `image` 0.25, and input-method
+events from miniquad.

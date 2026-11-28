@@ -45,6 +45,18 @@ pub struct MacosDisplay {
     native_requests: Receiver<Request>,
     update_requested: bool,
     last_paint_start_time: Instant,
+    // tai patch 5: the input method's state (NSTextInputClient).
+    /// The text being composed (marked text).
+    marked_text: String,
+    /// While keyDown runs interpretKeyEvents, the text insertText hands
+    /// over; None outside keyDown.
+    key_text: Option<Vec<String>>,
+    /// The cursor's cell for firstRectForCharacterRange, in client pixels
+    /// from the top-left (set_ime_area).
+    ime_area: (f64, f64, f64, f64),
+    /// A high surrogate insertText handed over alone, waiting for its low
+    /// half (the emoji picker can split a pair).
+    lead_surrogate: Option<u16>,
 }
 
 impl MacosDisplay {
@@ -259,8 +271,11 @@ impl MacosDisplay {
             ShowKeyboard(..) => {
                 // Not applicable on macOS desktop
             }
-            SetImePosition { .. } => {
-                // IME position control not implemented for macOS yet
+            SetImePosition { x, y } => {
+                self.ime_area = (x as f64, y as f64, 0., 0.);
+            }
+            SetImeArea { x, y, w, h } => {
+                self.ime_area = (x as f64, y as f64, w as f64, h as f64);
             }
             SetImeEnabled(..) => {
                 // IME enable/disable not implemented for macOS yet
@@ -626,22 +641,191 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         }
     }
 
+    // tai patch 5: keys go through macOS's text input system first
+    // (interpretKeyEvents), as Ghostty's keyDown does
+    // (macos/Sources/Ghostty/Surface View/SurfaceView_AppKit.swift at
+    // 108cacb1), so dead keys and input methods compose. A key that ends a
+    // composition sends only the committed text; keys while composing go
+    // to the input method and send nothing (as winit does); other keys
+    // send their key_down_event, then the text the system made for them
+    // (Option+a gives å), or their own characters as before.
     extern "C" fn key_down(this: &Object, _sel: Sel, event: ObjcId) {
         let payload = get_window_payload(this);
         let mods = get_event_key_modifier(event);
         let repeat: bool = unsafe { msg_send!(event, isARepeat) };
+        let marked_before = !payload.marked_text.is_empty();
+        payload.key_text = Some(Vec::new());
+        unsafe {
+            let events: ObjcId = msg_send![class!(NSArray), arrayWithObject: event];
+            let () = msg_send![this, interpretKeyEvents: events];
+        }
+        let texts = payload.key_text.take().unwrap_or_default();
+        let composing = marked_before || !payload.marked_text.is_empty();
+        if marked_before && !texts.is_empty() {
+            if let Some(event_handler) = payload.context() {
+                for text in &texts {
+                    // An input method's own Return or Backspace while
+                    // composing isn't the program's.
+                    if !text.chars().all(char::is_control) {
+                        event_handler.ime_commit_event(text);
+                    }
+                }
+            }
+            return;
+        }
+        if composing {
+            return;
+        }
         if let Some(key) = get_event_keycode(event) {
             if let Some(event_handler) = payload.context() {
                 event_handler.key_down_event(key, mods, repeat);
             }
         }
-
-        if let Some(character) = get_event_char(event) {
-            if let Some(event_handler) = payload.context() {
+        if texts.is_empty() {
+            if let Some(character) = get_event_char(event) {
+                if let Some(event_handler) = payload.context() {
+                    event_handler.char_event(character, mods, repeat);
+                }
+            }
+        } else if let Some(event_handler) = payload.context() {
+            for character in texts.iter().flat_map(|t| t.chars()) {
                 event_handler.char_event(character, mods, repeat);
             }
         }
     }
+
+    // tai patch 5: NSTextInputClient.
+    extern "C" fn has_marked_text(this: &Object, _sel: Sel) -> BOOL {
+        let payload = get_window_payload(this);
+        if payload.marked_text.is_empty() {
+            NO
+        } else {
+            YES
+        }
+    }
+
+    extern "C" fn marked_range(this: &Object, _sel: Sel) -> NSRange {
+        let payload = get_window_payload(this);
+        let len = payload.marked_text.encode_utf16().count() as u64;
+        if len == 0 {
+            NSRange::new(NS_NOT_FOUND, 0)
+        } else {
+            NSRange::new(0, len)
+        }
+    }
+
+    extern "C" fn selected_range(_this: &Object, _sel: Sel) -> NSRange {
+        NSRange::new(NS_NOT_FOUND, 0)
+    }
+
+    extern "C" fn set_marked_text(
+        this: &Object,
+        _sel: Sel,
+        string: ObjcId,
+        _selected: NSRange,
+        _replacement: NSRange,
+    ) {
+        let payload = get_window_payload(this);
+        payload.marked_text = input_string(string);
+        let text = payload.marked_text.clone();
+        if let Some(event_handler) = payload.context() {
+            event_handler.ime_preedit_event(&text);
+        }
+    }
+
+    extern "C" fn unmark_text(this: &Object, _sel: Sel) {
+        let payload = get_window_payload(this);
+        if !payload.marked_text.is_empty() {
+            payload.marked_text.clear();
+            if let Some(event_handler) = payload.context() {
+                event_handler.ime_preedit_event("");
+            }
+        }
+    }
+
+    extern "C" fn valid_attributes_for_marked_text(_this: &Object, _sel: Sel) -> ObjcId {
+        unsafe { msg_send![class!(NSArray), array] }
+    }
+
+    extern "C" fn attributed_substring(
+        _this: &Object,
+        _sel: Sel,
+        _range: NSRange,
+        _actual: *mut c_void,
+    ) -> ObjcId {
+        nil
+    }
+
+    extern "C" fn character_index_for_point(_this: &Object, _sel: Sel, _point: NSPoint) -> u64 {
+        NS_NOT_FOUND
+    }
+
+    extern "C" fn first_rect_for_character_range(
+        this: &Object,
+        _sel: Sel,
+        _range: NSRange,
+        _actual: *mut c_void,
+    ) -> NSRect {
+        let payload = get_window_payload(this);
+        let scale = native_display().lock().unwrap().dpi_scale as f64;
+        let (x, y, w, h) = payload.ime_area;
+        unsafe {
+            let bounds: NSRect = msg_send![this, bounds];
+            // Client pixels from the top-left to the view's points from the
+            // bottom-left, then to the screen.
+            let in_view = NSRect {
+                origin: NSPoint {
+                    x: x / scale,
+                    y: bounds.size.height - (y + h) / scale,
+                },
+                size: NSSize {
+                    width: w / scale,
+                    height: h / scale,
+                },
+            };
+            let in_window: NSRect = msg_send![this, convertRect: in_view toView: nil];
+            let window: ObjcId = msg_send![this, window];
+            msg_send![window, convertRectToScreen: in_window]
+        }
+    }
+
+    extern "C" fn insert_text(this: &Object, _sel: Sel, string: ObjcId, _replacement: NSRange) {
+        let payload = get_window_payload(this);
+        let text = unsafe {
+            let units: Vec<u16> = input_utf16(string);
+            match (payload.lead_surrogate.take(), units.as_slice()) {
+                (_, [high]) if (0xD800..0xDC00).contains(high) => {
+                    payload.lead_surrogate = Some(*high);
+                    return;
+                }
+                (Some(high), [low]) if (0xDC00..0xE000).contains(low) => {
+                    String::from_utf16_lossy(&[high, *low])
+                }
+                _ => String::from_utf16_lossy(&units),
+            }
+        };
+        let was_marked = !payload.marked_text.is_empty();
+        payload.marked_text.clear();
+        if was_marked {
+            if let Some(event_handler) = payload.context() {
+                event_handler.ime_preedit_event("");
+            }
+        }
+        match &mut payload.key_text {
+            Some(texts) => texts.push(text),
+            // Text with no key: the emoji picker, dictation.
+            None => {
+                if let Some(event_handler) = payload.context() {
+                    event_handler.ime_commit_event(&text);
+                }
+            }
+        }
+    }
+
+    // Commands the text system has no text for (moveLeft:, cancel:, a Ctrl
+    // chord): the key goes on as a key. Swallowing them here keeps AppKit
+    // from beeping.
+    extern "C" fn do_command_by_selector(_this: &Object, _sel: Sel, _command: Sel) {}
 
     extern "C" fn key_up(this: &Object, _sel: Sel, event: ObjcId) {
         let payload = get_window_payload(this);
@@ -874,6 +1058,52 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         flags_changed as extern "C" fn(&Object, Sel, ObjcId),
     );
     decl.add_method(sel!(keyUp:), key_up as extern "C" fn(&Object, Sel, ObjcId));
+    // tai patch 5: NSTextInputClient.
+    if let Some(protocol) = objc::runtime::Protocol::get("NSTextInputClient") {
+        decl.add_protocol(protocol);
+    }
+    decl.add_method(
+        sel!(hasMarkedText),
+        has_marked_text as extern "C" fn(&Object, Sel) -> BOOL,
+    );
+    decl.add_method(
+        sel!(markedRange),
+        marked_range as extern "C" fn(&Object, Sel) -> NSRange,
+    );
+    decl.add_method(
+        sel!(selectedRange),
+        selected_range as extern "C" fn(&Object, Sel) -> NSRange,
+    );
+    decl.add_method(
+        sel!(setMarkedText:selectedRange:replacementRange:),
+        set_marked_text as extern "C" fn(&Object, Sel, ObjcId, NSRange, NSRange),
+    );
+    decl.add_method(sel!(unmarkText), unmark_text as extern "C" fn(&Object, Sel));
+    decl.add_method(
+        sel!(validAttributesForMarkedText),
+        valid_attributes_for_marked_text as extern "C" fn(&Object, Sel) -> ObjcId,
+    );
+    decl.add_method(
+        sel!(attributedSubstringForProposedRange:actualRange:),
+        attributed_substring as extern "C" fn(&Object, Sel, NSRange, *mut c_void) -> ObjcId,
+    );
+    decl.add_method(
+        sel!(characterIndexForPoint:),
+        character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
+    );
+    decl.add_method(
+        sel!(firstRectForCharacterRange:actualRange:),
+        first_rect_for_character_range
+            as extern "C" fn(&Object, Sel, NSRange, *mut c_void) -> NSRect,
+    );
+    decl.add_method(
+        sel!(insertText:replacementRange:),
+        insert_text as extern "C" fn(&Object, Sel, ObjcId, NSRange),
+    );
+    decl.add_method(
+        sel!(doCommandBySelector:),
+        do_command_by_selector as extern "C" fn(&Object, Sel, Sel),
+    );
     decl.add_method(
         sel!(draggingEntered:),
         dragging_entered as extern "C" fn(&Object, Sel, ObjcId) -> NSDragOperation,
@@ -973,6 +1203,33 @@ pub fn define_metal_view_class() -> *const Class {
     }
 
     decl.register()
+}
+
+// tai patch 5.
+const NS_NOT_FOUND: u64 = i64::MAX as u64;
+
+/// The text of an NSString or NSAttributedString the text system hands
+/// over.
+fn input_string(string: ObjcId) -> String {
+    String::from_utf16_lossy(&unsafe { input_utf16(string) })
+}
+
+/// Its UTF-16 code units, so a lone surrogate survives.
+unsafe fn input_utf16(string: ObjcId) -> Vec<u16> {
+    let is_attributed: BOOL =
+        msg_send![string, isKindOfClass: class!(NSAttributedString)];
+    let string: ObjcId = if is_attributed == YES {
+        msg_send![string, string]
+    } else {
+        string
+    };
+    let len: u64 = msg_send![string, length];
+    (0..len)
+        .map(|i| {
+            let unit: u16 = msg_send![string, characterAtIndex: i];
+            unit
+        })
+        .collect()
 }
 
 fn get_window_payload(this: &Object) -> &mut MacosDisplay {
@@ -1327,6 +1584,10 @@ where
         modifiers: Modifiers::default(),
         update_requested: true,
         last_paint_start_time: Instant::now(),
+        marked_text: String::new(),
+        key_text: None,
+        ime_area: (0., 0., 0., 0.),
+        lead_surrogate: None,
     };
 
     let app_delegate_class = define_app_delegate();

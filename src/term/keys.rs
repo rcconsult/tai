@@ -66,8 +66,6 @@ impl Keys {
 
     /// The input method's preedit changed; empty or none ends it. Returns
     /// whether it changed, so the front end repaints.
-    // Until each front end reports its input method (ADR 0015, parts 2-6).
-    #[allow(dead_code)]
     pub fn set_preedit(&mut self, text: Option<&str>) -> bool {
         let text = text.filter(|t| !t.is_empty()).map(str::to_owned);
         let changed = text != self.preedit;
@@ -91,7 +89,6 @@ impl Keys {
     /// it the way Ghostty's programs do. It ends the composition. Control
     /// characters on their own (an input method's Backspace or Enter while
     /// composing) aren't the program's.
-    #[allow(dead_code)]
     pub fn commit(
         &mut self,
         terminal: &Terminal<'_, '_>,

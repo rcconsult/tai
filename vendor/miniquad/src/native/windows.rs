@@ -1140,6 +1140,7 @@ impl WindowsDisplay {
                     IME_USER_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            SetImeArea { x, y, .. } => self.set_ime_position(x, y),
             SetImePosition { x, y } => {
                 self.set_ime_position(x, y);
             }

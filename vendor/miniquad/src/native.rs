@@ -77,6 +77,8 @@ pub(crate) enum Request {
     SetFullscreen(bool),
     ShowKeyboard(bool),
     SetImePosition { x: i32, y: i32 },
+    // tai patch 5.
+    SetImeArea { x: i32, y: i32, w: i32, h: i32 },
     SetImeEnabled(bool),
 }
 

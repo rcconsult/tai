@@ -402,6 +402,25 @@ pub mod window {
         }
     }
 
+    /// tai patch 5: the text cursor's cell, in window client pixels from
+    /// the top-left corner: the composition starts there and the input
+    /// method's candidate window opens beside it. Where a platform only
+    /// takes a point, it is the cell's top-left.
+    pub fn set_ime_area(x: i32, y: i32, w: i32, h: i32) {
+        let d = native_display().lock().unwrap();
+        #[cfg(target_os = "android")]
+        {
+            let _ = (x, y, w, h);
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            d.native_requests
+                .send(native::Request::SetImeArea { x, y, w, h })
+                .unwrap();
+        }
+    }
+
     /// Enable or disable IME (Input Method Editor) for the window.
     /// When enabled, the IME will process keyboard input for CJK text input.
     /// When disabled, keyboard events are sent directly to the application,

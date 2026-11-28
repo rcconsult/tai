@@ -45,16 +45,6 @@ log-impl = []
 name = "miniquad"
 path = "src/lib.rs"
 
-[dev-dependencies.fontdue]
-version = "0.8"
-
-[dev-dependencies.glam]
-version = "0.24"
-features = ["scalar-math"]
-
-[dev-dependencies.quad-rand]
-version = "0.1"
-
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.objc]
 version = "0.2"
 package = "objc-rs"
@@ -94,3 +84,6 @@ panic = "abort"
 overflow-checks = false
 incremental = false
 strip = true
+
+[lints.rust]
+warnings = "allow"

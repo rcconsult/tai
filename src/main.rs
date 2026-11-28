@@ -425,6 +425,7 @@ async fn main() -> Result<()> {
             input.keys.preedit(),
             mouse_active || selection_cleared,
         )?;
+        input.place_ime(renderer.cursor(), dims);
         if let Some(badge) = &selection_badge {
             renderer.draw_selection_badge(badge, dims, &coverage);
         }
@@ -603,6 +604,11 @@ struct Frame {
 }
 
 impl<'alloc> Renderer<'alloc> {
+    /// The cursor's cell as last drawn, if it was.
+    fn cursor(&self) -> Option<(u16, u16)> {
+        self.frame.as_ref().and_then(|f| f.cursor)
+    }
+
     fn new() -> Result<Self> {
         Ok(Self {
             render_state: RenderState::new()?,
@@ -1134,6 +1140,11 @@ enum KeyInput {
         mods: key::Mods,
     },
     Char(char),
+    /// The text an input method or a dead key is composing (ADR 0015),
+    /// empty when it ends: vendored miniquad's patch 5.
+    Preedit(String),
+    /// Text an input method committed, or text with no key.
+    Commit(String),
 }
 
 /// Collects the keyboard events macroquad replays to an input subscriber
@@ -1167,6 +1178,12 @@ impl EventHandler for KeyEvents {
     }
     fn char_event(&mut self, character: char, _keymods: KeyMods, _repeat: bool) {
         self.keys.push(KeyInput::Char(character));
+    }
+    fn ime_preedit_event(&mut self, text: &str) {
+        self.keys.push(KeyInput::Preedit(text.to_owned()));
+    }
+    fn ime_commit_event(&mut self, text: &str) {
+        self.keys.push(KeyInput::Commit(text.to_owned()));
     }
     fn mouse_wheel_event(&mut self, _x: f32, y: f32) {
         self.wheel += wheel_notches(y);
@@ -1247,6 +1264,10 @@ struct Input {
     mouse_captured: bool,
     /// This frame's wheel travel in notches, from the input stream.
     wheel: f32,
+    /// Where the input method's candidate window opens (ADR 0015), and
+    /// the area last given to the window, so it's sent only on a change.
+    caret: term::ime::Caret,
+    ime_area: Option<(i32, i32, i32, i32)>,
 }
 impl Input {
     fn new() -> Result<Self> {
@@ -1272,6 +1293,8 @@ impl Input {
             #[cfg(windows)]
             mouse_captured: false,
             wheel: 0.0,
+            caret: Default::default(),
+            ime_area: None,
         })
     }
 
@@ -1386,6 +1409,19 @@ impl Input {
                         self.keys.encode(terminal, k, &mut self.response)?;
                     }
                 }
+                // The input method's text being composed, drawn at the
+                // cursor (src/term/rows.rs); an empty one ends it.
+                KeyInput::Preedit(text) => {
+                    self.keys.set_preedit(Some(&text));
+                }
+                // Its result: typed input, through the encoder as Ghostty
+                // sends it (src/term/keys.rs). The key that ended the
+                // composition sent nothing of its own.
+                KeyInput::Commit(text) => {
+                    self.flush_pending_key(terminal)?;
+                    self.flush_lead_text();
+                    self.keys.commit(terminal, &text, &mut self.response)?;
+                }
                 KeyInput::Char(ch) => {
                     // Windows also reports Ctrl+letter, Enter, Tab and
                     // Backspace as control characters (Ctrl+C as U+0003).
@@ -1442,6 +1478,28 @@ impl Input {
             }
         }
         Ok(())
+    }
+
+    /// Tell the window where the input method's candidate window opens:
+    /// the cursor's cell, once the cursor has settled there
+    /// (src/term/ime.rs), in client pixels. Sent only when it moves:
+    /// moving it while an input method forwards keys garbles them on X11
+    /// (winit #4777, seen in tai-gui).
+    fn place_ime(&mut self, cursor: Option<(u16, u16)>, dims: Dimensions) {
+        let Some((col, row)) = self.caret.update(cursor) else {
+            return;
+        };
+        let px = |v: f32| (v * dims.dpi_scale).round() as i32;
+        let area = (
+            px(PADDING + f32::from(col) * dims.cell_width),
+            px(PADDING + f32::from(row) * dims.cell_height),
+            px(dims.cell_width),
+            px(dims.cell_height),
+        );
+        if self.ime_area != Some(area) {
+            self.ime_area = Some(area);
+            macroquad::miniquad::window::set_ime_area(area.0, area.1, area.2, area.3);
+        }
     }
 
     /// Characters with no key press after them (a key reported only as a

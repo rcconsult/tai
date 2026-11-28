@@ -233,4 +233,15 @@ pub trait EventHandler {
     /// `ctx.dropped_file_path()`, and for wasm targets the file bytes
     /// can be requested with `ctx.dropped_file_bytes()`.
     fn files_dropped_event(&mut self) {}
+
+    /// tai patch 5: the text an input method or a dead key is composing,
+    /// to show at the cursor; empty when the composition ends. Never input
+    /// on its own. Implemented on macOS.
+    fn ime_preedit_event(&mut self, _text: &str) {}
+
+    /// tai patch 5: text an input method committed when a composition
+    /// ended, or text with no key (the emoji picker, dictation): typed
+    /// input, sent instead of the key that ended the composition, which
+    /// gets no key_down_event. Implemented on macOS.
+    fn ime_commit_event(&mut self, _text: &str) {}
 }

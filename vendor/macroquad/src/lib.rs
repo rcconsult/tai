@@ -275,6 +275,10 @@ enum MiniquadInputEvent {
     },
     WindowMinimized,
     WindowRestored,
+    // tai patch 6: the input method's preedit and commits (miniquad's
+    // tai patch 5).
+    ImePreedit(String),
+    ImeCommit(String),
 }
 
 impl MiniquadInputEvent {
@@ -299,6 +303,8 @@ impl MiniquadInputEvent {
             Touch { phase, id, x, y } => t.touch_event(*phase, *id, *x, *y),
             WindowMinimized => t.window_minimized_event(),
             WindowRestored => t.window_restored_event(),
+            ImePreedit(text) => t.ime_preedit_event(text),
+            ImeCommit(text) => t.ime_commit_event(text),
         }
     }
 }
@@ -690,6 +696,21 @@ impl EventHandler for Stage {
                 modifiers,
                 repeat,
             });
+        });
+    }
+
+    // tai patch 6.
+    fn ime_preedit_event(&mut self, text: &str) {
+        let context = get_context();
+        context.input_events.iter_mut().for_each(|arr| {
+            arr.push(MiniquadInputEvent::ImePreedit(text.to_owned()));
+        });
+    }
+
+    fn ime_commit_event(&mut self, text: &str) {
+        let context = get_context();
+        context.input_events.iter_mut().for_each(|arr| {
+            arr.push(MiniquadInputEvent::ImeCommit(text.to_owned()));
         });
     }
 

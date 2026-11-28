@@ -118,6 +118,7 @@ impl MainThreadState {
             ScheduleUpdate => {
                 self.update_requested = true;
             }
+            SetImeArea { .. } => {}
             SetImePosition { .. } => {
                 // IME position control not applicable on iOS
             }

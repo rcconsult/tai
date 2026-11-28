@@ -281,6 +281,7 @@ impl MainThreadState {
                 let env = attach_jni_env();
                 ndk_utils::call_void_method!(env, ACTIVITY, "showKeyboard", "(Z)V", show as i32);
             },
+            SetImeArea { .. } => {}
             SetImePosition { .. } => {
                 // IME position control not applicable on Android
             }
