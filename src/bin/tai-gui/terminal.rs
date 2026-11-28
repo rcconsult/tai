@@ -482,10 +482,16 @@ impl TerminalPane {
         // they'd reach the shell unseen. A one-line text box gives up the
         // focus on Enter, which would otherwise hand it to the terminal.
         let under_dialog = !ui.ctx().memory(|m| m.allows_interaction(ui.layer_id()));
+        // Only when the pane doesn't have the keyboard: a focus request
+        // interrupts the input method's composition, and on X11 winit does
+        // that by recreating the input context, losing a key still inside
+        // the input method (ADR 0015). egui also reports Space and Enter on
+        // a focused clickable widget as a click (context.rs,
+        // FAKE_PRIMARY_CLICKED), so typing them asked again every time.
+        let want_focus = std::mem::take(&mut self.want_focus);
         if !under_dialog
-            && (std::mem::take(&mut self.want_focus)
-                || response.clicked()
-                || !ui.ctx().memory(|m| m.focused().is_some()))
+            && !response.has_focus()
+            && (want_focus || response.clicked() || !ui.ctx().memory(|m| m.focused().is_some()))
         {
             response.request_focus();
         }
