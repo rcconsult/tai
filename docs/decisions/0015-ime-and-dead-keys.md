@@ -1,8 +1,9 @@
 # ADR 0015: IME and dead keys in tai and tai-gui, through one input model
 
 - **Status:** Accepted 2026-11-28 (owner), with the no-replay rule of
-  decision 1 confirmed. Wayland for tai (decision 5) is open: both ways
-  are tried and the owner picks after a live Linux session. Proposed
+  decision 1 confirmed. Wayland for tai (decision 5): X11 only for now
+  (owner, 2026-11-28: it builds and tests on Linux today); the native
+  way stays on its branch. Proposed
   2026-11-28. The owner asked for it ("we go for
   it") after the macOS session found that dead keys don't compose in
   either app. The macOS session reviewed it the same day; its
@@ -253,7 +254,14 @@ reference)
      IME. XIM's preedit callbacks give the preedit where the input method
      supports on-the-spot style (`XIMPreeditCallbacks`); otherwise the
      input method keeps its own window.
-   - **Wayland: open, two ways tried.** tai doesn't start on miniquad
+   - **Wayland: X11 only for now** (owner, 2026-11-28), so Linux builds
+     and tests today. tai runs through XWayland on a Wayland session and
+     part 4's XIM covers it. Native Wayland stays on branch
+     `tai-wayland-native` (patches 2-4 there: desktop OpenGL through EGL,
+     the libdecor fallback, the drawable size), where it started and drew
+     sharp at 2x on nested mutter; its input methods (compose tables,
+     `zwp_text_input_v3`) are for when it's taken up. Why it was needed:
+     tai doesn't start on miniquad
      0.4.11's native Wayland backend today (Linux session, nested mutter,
      2026-11-28):
      - with no server-side decorations and no libdecor plugin, libdecor
@@ -264,7 +272,7 @@ reference)
        asks for `EGL_CONTEXT_CLIENT_VERSION 2`, and tai needs desktop
        OpenGL 3.2 (ADR 0012).
 
-     The two ways, each on its own branch for the owner's live test:
+     The two ways tried, each on its own branch:
      - **X11 only** (`LinuxBackend::X11Only`): a Wayland session reaches
        tai through XWayland, and the X11 patch above covers it.
      - **Native Wayland:** the vendored miniquad gets the decoration
@@ -286,7 +294,7 @@ reference)
    2. tai-gui on all three platforms.
    3. tai on macOS (vendored miniquad, `NSTextInputClient`).
    4. tai on X11 (XIM).
-   5. tai on Wayland, by the way the owner picks.
+   5. tai on Wayland: X11 only for now (`tai-wayland-x11`).
    6. tai on Windows (inline preedit and candidate position).
 7. **What the checks cover:**
    - **Dead keys:**
