@@ -330,14 +330,16 @@ decisions above.
     xterm on Linux, legacy and Kitty flags 11.
   - Part 4 (tai on X11): the same Linux checks, byte-identical to
     tai-gui and xterm.
-- **tai-gui loses fast-typed keys through IBus on X11** (15 ms per key;
-  40 ms is clean). A trace in winit 0.30.13 shows a key press going into
-  `XFilterEvent` and never coming back from ibus-x11, while the keys
-  around it do. xterm and tai's own XIM (part 4), plain Xlib loops,
-  get every key, so the loss is in how winit drives XIM, not in IBus.
-  It isn't winit #4777: with the cursor area never re-sent while typing,
-  keys are still lost. Without IME allowed (main), tai-gui loses
-  nothing. Open: a winit fix or patch.
+- **tai-gui lost fast-typed keys through IBus on X11** (15 ms per key),
+  fixed in `b580b7c`. egui reports Space and Enter on a focused clickable
+  widget as a click (`FAKE_PRIMARY_CLICKED`); the pane took that click
+  as a reason to request focus; a focus request interrupts the
+  composition, which egui-winit does with `set_ime_allowed(false)` then
+  `(true)`, and winit 0.30.13 then recreates the X input context,
+  losing the key ibus-x11 still held. The pane now asks for focus only
+  when it doesn't have it. Any other focus request while typing would do
+  the same, so the rule is: nothing requests focus for a pane that has
+  it. (Not winit #4777: re-sending the cursor area was ruled out.)
 - **The candidate window on X11** opens at the bottom-left of the
   window in both apps with IBus: with on-the-spot preedit callbacks,
   ibus-x11 seems to ignore the spot location; xterm, over-the-spot, gets
