@@ -422,6 +422,7 @@ async fn main() -> Result<()> {
             &terminal,
             dims,
             &coverage,
+            input.keys.preedit(),
             mouse_active || selection_cleared,
         )?;
         if let Some(badge) = &selection_badge {
@@ -597,6 +598,8 @@ struct Frame {
     /// Whether the cursor was drawn, and where. The render state's dirty
     /// flags track cell contents, so the cursor is compared separately.
     cursor: Option<(u16, u16)>,
+    /// The preedit drawn at the cursor (ADR 0015), compared the same way.
+    preedit: Option<String>,
 }
 
 impl<'alloc> Renderer<'alloc> {
@@ -628,6 +631,7 @@ impl<'alloc> Renderer<'alloc> {
         terminal: &Terminal<'alloc, '_>,
         dims: Dimensions,
         coverage: &Coverage,
+        preedit: Option<&str>,
         force: bool,
     ) -> Result<()> {
         let grid = &mut self.cells;
@@ -639,10 +643,9 @@ impl<'alloc> Renderer<'alloc> {
         };
         let unchanged = !force
             && snapshot.dirty()? == Dirty::Clean
-            && self
-                .frame
-                .as_ref()
-                .is_some_and(|f| f.dims == dims && f.cursor == cursor);
+            && self.frame.as_ref().is_some_and(|f| {
+                f.dims == dims && f.cursor == cursor && f.preedit.as_deref() == preedit
+            });
         if unchanged {
             if let Some(frame) = &self.frame {
                 Self::present(frame, &self.present_material);
@@ -679,10 +682,12 @@ impl<'alloc> Renderer<'alloc> {
                 target,
                 dims,
                 cursor,
+                preedit: None,
             });
         }
         let frame = self.frame.as_mut().expect("frame was just created");
         frame.cursor = cursor;
+        frame.preedit = preedit.map(str::to_owned);
         let mut camera =
             Camera2D::from_display_rect(Rect::new(0.0, 0.0, dims.window_width, dims.window_height));
         // A render target is drawn upside down compared with the screen.
@@ -702,6 +707,7 @@ impl<'alloc> Renderer<'alloc> {
         } = grid;
 
         let cursor_color = colors.cursor.unwrap_or(colors.foreground);
+        let cols = snapshot.cols()?;
         let mut row_it = self.row_it.update(&snapshot)?;
         let mut text = String::with_capacity(16);
         let mut row_index = 0;
@@ -730,8 +736,20 @@ impl<'alloc> Renderer<'alloc> {
                     col,
                     color: cursor_color,
                 });
-            built.read =
-                term::rows::read_row(row, &mut self.cell_it, &colors, coverage, on_row, &mut text)?;
+            // The preedit, laid out on the cursor's row (src/term/ime.rs).
+            let preedit_cells = match (on_row, preedit) {
+                (Some(c), Some(p)) => term::ime::layout(p, c.col, cols),
+                _ => Vec::new(),
+            };
+            built.read = term::rows::read_row(
+                row,
+                &mut self.cell_it,
+                &colors,
+                coverage,
+                on_row,
+                &preedit_cells,
+                &mut text,
+            )?;
             built.bg.clear();
             built.bg.extend(
                 built
@@ -846,6 +864,13 @@ impl<'alloc> Renderer<'alloc> {
         // Images below the text, Unicode placeholder images among them, go
         // before the glyphs, as in Ghostty and tai-gui. The text pass
         // flushes macroquad's batch first (cells.rs), so they're under it.
+        // Lines under cells: the preedit's (src/term/rows.rs).
+        for (rect, line) in
+            term::rows::underline_rects(rows, dims.cell_width, dims.cell_height, dims.baseline)
+        {
+            draw_rectangle(rect[0], rect[1], rect[2], rect[3], color(line));
+        }
+
         draw_stage(term::images::Stage::BelowText)?;
 
         instances.clear();
@@ -1356,6 +1381,7 @@ impl Input {
                             ucp,
                             mods,
                             text: None,
+                            composing: false,
                         };
                         self.keys.encode(terminal, k, &mut self.response)?;
                     }
@@ -1470,6 +1496,7 @@ impl Input {
             ucp: pending.ucp,
             mods: pending.mods,
             text,
+            composing: false,
         };
         self.keys.encode(terminal, k, &mut self.response)
     }

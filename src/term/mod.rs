@@ -4,6 +4,7 @@
 //! tai-gui through `#[path]`.
 
 pub mod images;
+pub mod ime;
 pub mod keys;
 pub mod pointer;
 pub mod rows;

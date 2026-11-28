@@ -11,6 +11,9 @@
 //! padding in the edge cells' colours (Ghostty's window-padding-color =
 //! extend), so a full-screen app's background reaches the window's edge.
 //! Both now do what tai-gui did.
+//!
+//! The preedit of an input method or a dead key (ADR 0015) is drawn here
+//! too, over the cursor's row, so both apps show it the same way.
 
 use libghostty_vt::{
     color::Rgb,
@@ -23,7 +26,7 @@ use crate::{
     cells::{GlyphAtlas, Instance},
     fonts::{Coverage, Face, SymbolSpan},
     placeholders,
-    term::PADDING,
+    term::{PADDING, ime::PreeditCell},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -58,6 +61,16 @@ pub struct Row {
     pub virtual_runs: Vec<placeholders::Placement>,
     /// Whether the padding above or below may take this row's colours.
     pub extend: bool,
+    /// Lines under cells: the preedit's.
+    pub underlines: Vec<Underline>,
+}
+
+/// A line under `cells` cells from `col`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Underline {
+    pub col: u16,
+    pub cells: u16,
+    pub color: Rgb,
 }
 
 /// The cursor, when it's on the row being read: its column and colour.
@@ -71,14 +84,21 @@ pub struct Cursor {
 /// and background; the cursor's cell takes the cursor colour, its glyph the
 /// default background. Each glyph's face is the one `coverage` picks for
 /// its whole cluster, trimmed to what tai draws without a shaper.
+///
+/// `preedit` is the text being composed, laid out on this row
+/// (`ime::layout`), or empty. It covers the cells under it, in the
+/// terminal's colours and underlined, and hides the cursor, as Ghostty
+/// draws it (`renderer/generic.zig`, `addPreeditCell`, at 108cacb1).
 pub fn read_row<'alloc>(
     row: &RowIteration<'alloc, '_>,
     cell_it: &mut CellIterator<'alloc>,
     colors: &Colors,
     coverage: &Coverage,
     cursor: Option<Cursor>,
+    preedit: &[PreeditCell],
     text: &mut String,
 ) -> Result<Row> {
+    let cursor = if preedit.is_empty() { cursor } else { None };
     let raw = row.raw_row()?;
     let prompt = !matches!(raw.semantic_prompt(), Ok(RowSemanticPrompt::None) | Err(_));
     let placeholder_row = raw.has_kitty_virtual_placeholder()?;
@@ -175,7 +195,74 @@ pub fn read_row<'alloc>(
     if placeholder_row {
         out.virtual_runs = placeholders::row_placements(placeholder_cells);
     }
+    overlay_preedit(&mut out, preedit, colors, coverage);
     Ok(out)
+}
+
+/// The preedit over a read row: its cells take the terminal's background,
+/// the glyphs under them go, and its clusters are drawn in the terminal's
+/// foreground, underlined.
+fn overlay_preedit(row: &mut Row, preedit: &[PreeditCell], colors: &Colors, coverage: &Coverage) {
+    let (Some(first), Some(last)) = (preedit.first(), preedit.last()) else {
+        return;
+    };
+    let start = first.col;
+    let end = last.col + u16::from(last.cells);
+    row.glyphs
+        .retain(|g| g.col + u16::from(g.cells) <= start || g.col >= end);
+    for col in start..end {
+        if let Some(bg) = row.bg.get_mut(usize::from(col)) {
+            *bg = Some(colors.background);
+        }
+    }
+    for cell in preedit {
+        let mut text = cell.text.clone();
+        let face = coverage.cluster_face(&mut text);
+        if face != Face::Blank && !text.is_empty() {
+            row.glyphs.push(Glyph {
+                col: cell.col,
+                text,
+                face,
+                fg: colors.foreground,
+                bold: false,
+                cells: cell.cells,
+            });
+        }
+    }
+    row.underlines.push(Underline {
+        col: start,
+        cells: end - start,
+        color: colors.foreground,
+    });
+}
+
+/// Every row's underlines as rectangles (x, y, width, height in logical
+/// units from the pane's corner) with their colours: just below the
+/// baseline, a pixel-ish thick, inside the cell.
+pub fn underline_rects(
+    rows: &[impl AsRef<Row>],
+    cell_width: f32,
+    cell_height: f32,
+    baseline: f32,
+) -> Vec<([f32; 4], Rgb)> {
+    let thickness = (cell_height / 16.0).round().max(1.0);
+    let below = (baseline + thickness).min(cell_height - thickness);
+    let mut out = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let y = PADDING + i as f32 * cell_height + below;
+        for line in &row.as_ref().underlines {
+            out.push((
+                [
+                    PADDING + f32::from(line.col) * cell_width,
+                    y,
+                    f32::from(line.cells) * cell_width,
+                    thickness,
+                ],
+                line.color,
+            ));
+        }
+    }
+    out
 }
 
 /// The glyph instances of a row whose top is at `y`, each glyph placed in
@@ -292,11 +379,16 @@ impl AsRef<Row> for Row {
 mod tests {
     use libghostty_vt::color::Rgb;
 
-    use super::{Cursor, Row, extends, padding_rects, read_row};
+    use super::{Cursor, Row, Underline, extends, padding_rects, read_row, underline_rects};
     use crate::{fonts::Face, term::PADDING};
 
     /// The first row after `line`, read with the cursor where it is.
     fn first_row(line: &[u8]) -> (Row, Rgb, Rgb) {
+        first_row_with(line, "")
+    }
+
+    /// The same, with `preedit` laid out at the cursor.
+    fn first_row_with(line: &[u8], preedit: &str) -> (Row, Rgb, Rgb) {
         use libghostty_vt::{
             Terminal,
             render::{CellIterator, RenderState, RowIterator},
@@ -320,8 +412,48 @@ mod tests {
         let mut row_it = rows.update(&snapshot).unwrap();
         let row = row_it.next().unwrap();
         let mut text = String::new();
-        let read = read_row(row, &mut cells, &colors, &coverage, cursor, &mut text).unwrap();
+        let preedit = match cursor {
+            Some(c) if !preedit.is_empty() => crate::term::ime::layout(preedit, c.col, 10),
+            _ => Vec::new(),
+        };
+        let read = read_row(
+            row, &mut cells, &colors, &coverage, cursor, &preedit, &mut text,
+        )
+        .unwrap();
         (read, colors.foreground, colors.background)
+    }
+
+    /// A preedit at the cursor covers the cells under it in the
+    /// terminal's colours, hides the cursor, and is underlined.
+    #[test]
+    fn a_preedit_covers_its_cells_and_hides_the_cursor() {
+        // "abcd", the cursor back on the "b", composing "にx".
+        let (row, fg, bg) = first_row_with(b"abcd\x1b[2G", "にx");
+        let cursor = Rgb { r: 9, g: 9, b: 9 };
+        assert!(!row.bg.contains(&Some(cursor)));
+        assert_eq!(row.bg[..5], [None, Some(bg), Some(bg), Some(bg), None]);
+        let glyphs: Vec<_> = row
+            .glyphs
+            .iter()
+            .map(|g| (g.col, g.text.as_str(), g.fg, g.cells))
+            .collect();
+        assert_eq!(glyphs[0], (0, "a", fg, 1));
+        assert!(glyphs.contains(&(1, "に", fg, 2)));
+        assert!(glyphs.contains(&(3, "x", fg, 1)));
+        assert!(!glyphs.iter().any(|g| ["b", "c", "d"].contains(&g.1)));
+        assert_eq!(
+            row.underlines,
+            [Underline {
+                col: 1,
+                cells: 3,
+                color: fg
+            }]
+        );
+        let rects = underline_rects(&[row], 10.0, 20.0, 15.0);
+        assert_eq!(rects.len(), 1);
+        let ([x, y, w, h], color) = rects[0];
+        assert_eq!((x, w, color), (crate::term::PADDING + 10.0, 30.0, fg));
+        assert!(y > crate::term::PADDING + 15.0 && y + h <= crate::term::PADDING + 20.0);
     }
 
     /// Inverse swaps a cell's colours, and the cursor's cell takes the

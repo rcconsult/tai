@@ -169,6 +169,8 @@ pub struct TerminalPane {
     /// Translates Sixel in the pty's output into Kitty images (ADR 0006).
     sixel: crate::sixel::Translator,
     built_for: Option<(Dimensions, Option<(u16, u16)>)>,
+    /// The preedit the instances were built with (ADR 0015).
+    built_preedit: Option<String>,
     /// Each viewport row's instances as last built, so a frame rebuilds
     /// only the rows that changed, as Ghostty's `rebuildRow` does
     /// (src/renderer/generic.zig at a887df42) and the macroquad build's
@@ -306,6 +308,7 @@ impl TerminalPane {
             images_held: Default::default(),
             sixel: crate::sixel::Translator::new(),
             built_for: None,
+            built_preedit: None,
             rows: Vec::new(),
             response: Vec::new(),
             wake_pending,
@@ -739,9 +742,16 @@ impl TerminalPane {
         };
         let dirty = snapshot.dirty()?;
         let key = Some((self.dims, cursor));
-        if !force && dirty == Dirty::Clean && self.built_for == key {
+        let preedit = self.keys.preedit();
+        if !force
+            && dirty == Dirty::Clean
+            && self.built_for == key
+            && self.built_preedit.as_deref() == preedit
+        {
             return Ok(false);
         }
+        self.built_preedit = preedit.map(str::to_owned);
+        let cols = snapshot.cols()?;
         let old_cursor_row = self.built_for.and_then(|(_, c)| c).map(|(_, y)| y);
         let full = force
             || dirty == Dirty::Full
@@ -775,12 +785,18 @@ impl TerminalPane {
                         color: cursor_color,
                     }
                 });
+                // The preedit, laid out on the cursor's row (src/term/ime.rs).
+                let preedit_cells = match (on_row, self.built_preedit.as_deref()) {
+                    (Some(c), Some(p)) => crate::term::ime::layout(p, c.col, cols),
+                    _ => Vec::new(),
+                };
                 cached.read = crate::term::rows::read_row(
                     row,
                     &mut self.cell_it,
                     &colors,
                     &self.coverage,
                     on_row,
+                    &preedit_cells,
                     &mut text,
                 )?;
                 cached.bg.clear();
@@ -842,6 +858,17 @@ impl TerminalPane {
         for row in &self.rows {
             out.extend_from_slice(&row.bg);
         }
+        // Lines under cells: the preedit's (src/term/rows.rs).
+        out.extend(
+            crate::term::rows::underline_rects(
+                &self.rows,
+                dims.cell_width,
+                dims.cell_height,
+                dims.baseline,
+            )
+            .into_iter()
+            .map(|(rect, color)| Instance::solid(rect, rgba(color))),
+        );
         self.text_start = out.len() as u32;
         for row in &self.rows {
             out.extend_from_slice(&row.text);
@@ -1022,6 +1049,7 @@ impl TerminalPane {
             ucp,
             mods,
             text,
+            composing: false,
         };
         self.keys.encode(&self.terminal, k, &mut self.response)
     }
