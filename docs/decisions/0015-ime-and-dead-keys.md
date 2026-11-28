@@ -249,7 +249,10 @@ CJK through an input method fails in both apps on every platform
        (the accent menu, whose choice may replace a letter already sent);
      - a layout switch while a dead key is pending;
      - Ctrl+/, Ctrl+Return and Cmd+.;
-     - Cmd shortcuts pressed during a composition.
+     - Cmd shortcuts pressed during a composition (they don't fire),
+       and Cmd+C, Cmd+V and Cmd+= with no composition (they still fire,
+       including when `interpretKeyEvents` ends in
+       `doCommandBySelector`).
    - **Edge cases:** Backspace and Escape inside a composition cancel it
      without reaching the program, and the candidate window sits at the
      cursor.
