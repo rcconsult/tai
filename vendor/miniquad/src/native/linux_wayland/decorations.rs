@@ -228,6 +228,13 @@ unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, h
             window_height -=
                 (fallback::Decorations::BAR_HEIGHT + fallback::Decorations::WIDTH) * dpi_scale;
             fallback.resize(&mut payload.client, width, height);
+            // tai patch 4: the app draws into the EGL window, which is the
+            // configured size less the decorations. Reporting the whole
+            // configured size made the app draw a frame taller than its
+            // buffer, and the top rows fell off its top edge.
+            let mut d = crate::native_display().lock().unwrap();
+            d.screen_width = window_width;
+            d.screen_height = window_height;
         }
         (payload.egl.wl_egl_window_resize)(payload.egl_window, window_width, window_height, 0, 0);
         // We need to ensure that the buffer has been correctly resized before setting the
@@ -244,13 +251,14 @@ unsafe extern "C" fn handle_configure(data: *mut std::ffi::c_void, width: i32, h
         // probably don't want to fire the resize event for every one of them
         // So if we still have a Resize event in the queue, instead of pushing a new one, we batch
         // them by modifying the dimension
+        // tai patch 4: the drawable size, as above.
         if let Some(WaylandEvent::Resize(width, height)) = payload.events.last_mut() {
-            *width = screen_width as _;
-            *height = screen_height as _;
+            *width = window_width as _;
+            *height = window_height as _;
         } else {
             payload
                 .events
-                .push(WaylandEvent::Resize(screen_width as _, screen_height as _));
+                .push(WaylandEvent::Resize(window_width as _, window_height as _));
         }
     }
 }

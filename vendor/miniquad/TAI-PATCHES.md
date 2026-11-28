@@ -30,3 +30,9 @@ need changes miniquad doesn't have.
    toplevel (`linux_wayland.rs`, `assert!(!display.xdg_toplevel
    .is_null())`). Seen on nested mutter with libdecor 0.1.0 and no
    plugin.
+4. `src/native/linux_wayland/decorations.rs`, `handle_configure`: with
+   miniquad's own decorations, the screen size and the resize event are
+   the EGL window's size, the configured size less the decorations.
+   Upstream shrank the EGL window but reported the whole configured
+   size, so the app drew a frame taller than its buffer and lost the top
+   of its first row (the Linux session, nested mutter, 2026-11-28).
