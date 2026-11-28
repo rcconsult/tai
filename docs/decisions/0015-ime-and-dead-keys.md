@@ -1,13 +1,15 @@
 # ADR 0015: IME and dead keys in tai and tai-gui, through one input model
 
-- **Status:** Proposed 2026-11-28. The owner asked for it ("we go for
+- **Status:** Accepted 2026-11-28 (owner), with the no-replay rule of
+  decision 1 confirmed. Wayland for tai (decision 5) is open: both ways
+  are tried and the owner picks after a live Linux session. Proposed
+  2026-11-28. The owner asked for it ("we go for
   it") after the macOS session found that dead keys don't compose in
   either app. The macOS session reviewed it the same day; its
   corrections are folded in: commits, clearing the preedit, shortcuts
   while composing, and the AppKit details. The Linux session reviewed
   it too and probed X11 live (dead keys, Compose, IBus); its findings are
-  folded in, including tai's native Wayland backend. It waits for the
-  owner's acceptance.
+  folded in, including tai's native Wayland backend.
 - **Deciders:** owner. Written by the Claude session on the Windows dev
   host.
 - **Supersedes:** decision 7 of [ADR 0012](0012-cjk-font-fallback.md)
@@ -248,10 +250,24 @@ reference)
      IME. XIM's preedit callbacks give the preedit where the input method
      supports on-the-spot style (`XIMPreeditCallbacks`); otherwise the
      input method keeps its own window.
-   - **Wayland:** miniquad's native Wayland backend, which tai uses on a
-     Wayland session, gets xkbcommon's compose tables (dead keys and
-     Compose, as winit does) and `zwp_text_input_v3` (input methods,
-     preedit and the cursor rectangle), as winit has for tai-gui.
+   - **Wayland: open, two ways tried.** tai doesn't start on miniquad
+     0.4.11's native Wayland backend today (Linux session, nested mutter,
+     2026-11-28):
+     - with no server-side decorations and no libdecor plugin, libdecor
+       leaves no `xdg_toplevel` and miniquad asserts
+       (`linux_wayland.rs`, around line 1181);
+     - with `ServerWithMiniquadFallback` it gets past that, but its EGL
+       context is OpenGL ES 2: `egl.rs` never calls `eglBindAPI` and
+       asks for `EGL_CONTEXT_CLIENT_VERSION 2`, and tai needs desktop
+       OpenGL 3.2 (ADR 0012).
+
+     The two ways, each on its own branch for the owner's live test:
+     - **X11 only** (`LinuxBackend::X11Only`): a Wayland session reaches
+       tai through XWayland, and the X11 patch above covers it.
+     - **Native Wayland:** the vendored miniquad gets the decoration
+       fallback, a desktop OpenGL 3.2 core context
+       (`eglBindAPI(EGL_OPENGL_API)`), and then xkbcommon's compose
+       tables and `zwp_text_input_v3`, as winit has for tai-gui.
    - **Windows:** the preedit from `GCS_COMPSTR`, and the candidate
      window from `set_ime_position` instead of the caret.
    - **How the reports reach tai:** through the input subscriber stream
@@ -267,7 +283,7 @@ reference)
    2. tai-gui on all three platforms.
    3. tai on macOS (vendored miniquad, `NSTextInputClient`).
    4. tai on X11 (XIM).
-   5. tai on Wayland (compose tables and text-input-v3).
+   5. tai on Wayland, by the way the owner picks.
    6. tai on Windows (inline preedit and candidate position).
 7. **What the checks cover:**
    - **Dead keys:**
@@ -311,7 +327,9 @@ reference)
 - **Running tai on X11 only** (`LinuxBackend::X11Only`), so a Wayland
   session reaches it through XWayland's XIM. One patch fewer, but it
   changes how tai runs on Wayland (scaling, the window), for a gap
-  tai-gui fills natively.
+  tai-gui fills natively. Once tai turned out not to start on the
+  native backend at all, this became one of the two ways tried
+  (decision 5).
 - **Waiting for upstream miniquad.** It has IME on Windows only, and
   nothing on macOS or X11 is planned that we know of.
 - **Moving tai onto winit (one renderer).** That would remove the
