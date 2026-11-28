@@ -1037,12 +1037,19 @@ impl TerminalPane {
             }
             egui::Event::Key {
                 key,
+                physical_key,
                 pressed,
                 repeat,
                 modifiers,
                 ..
             } => {
-                let Some((k, ucp)) = key_for(*key) else {
+                // egui names some shifted keys by their character (Shift+=
+                // is Plus, Shift+; is Colon), which have no key of their
+                // own: the physical key is the one pressed, as tai and
+                // Ghostty identify it (the key, its unshifted character,
+                // Shift in the modifiers).
+                let Some((k, ucp)) = key_for(*key).or_else(|| physical_key.and_then(key_for))
+                else {
                     return Ok(());
                 };
                 let mods = mods_from(*modifiers);
