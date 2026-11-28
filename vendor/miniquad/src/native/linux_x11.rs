@@ -8,6 +8,8 @@ pub mod libx11;
 mod libx11_ex;
 mod x_cursor;
 mod xi_input;
+// tai patch 7.
+mod xim;
 
 use crate::{
     event::EventHandler,
@@ -53,17 +55,58 @@ pub struct X11Display {
     cursor_visible: bool,
     update_requested: bool,
     drag_n_drop: drag_n_drop::X11DnD,
+    // tai patch 7: the window's input method, if there is one.
+    xim: Option<Box<xim::XInput>>,
 }
 
 impl X11Display {
     unsafe fn process_event(&mut self, event: &mut XEvent, event_handler: &mut dyn EventHandler) {
+        // tai patch 7: every event goes to the input method first, as Xlib
+        // requires; it takes the keys it composes with, and reports its
+        // preedit meanwhile.
+        if let Some(input) = self.xim.as_mut() {
+            let filtered = input.filter(event);
+            for out in input.take() {
+                match out {
+                    xim::ImeOut::Preedit(text) => event_handler.ime_preedit_event(&text),
+                }
+            }
+            if filtered {
+                return;
+            }
+        }
         match event.type_0 {
             2 => {
                 let keycode = event.xkey.keycode as libc::c_int;
+                // tai patch 7: a key press the input method made (keycode
+                // 0) carries its commit: the end of a composition, a dead
+                // key's or the Compose key's result.
+                if keycode == 0 {
+                    if let Some(input) = self.xim.as_mut() {
+                        let text = input.lookup(&mut event.xkey);
+                        if !text.is_empty() {
+                            event_handler.ime_commit_event(&text);
+                        }
+                    }
+                    return;
+                }
                 let key = keycodes::translate_key(&mut self.libx11, self.display, keycode);
                 let repeat = self.repeated_keycodes[(keycode & 0xff) as usize];
                 self.repeated_keycodes[(keycode & 0xff) as usize] = true;
                 let mods = keycodes::translate_mod(event.xkey.state as libc::c_int);
+                // tai patch 7: a key the input method passed on types the
+                // text it gives; keys whose text is a control character
+                // (Ctrl chords) keep the keysym's character as before.
+                if let Some(input) = self.xim.as_mut() {
+                    let text = input.lookup(&mut event.xkey);
+                    if !text.is_empty() && !text.chars().all(char::is_control) {
+                        for chr in text.chars() {
+                            event_handler.char_event(chr, mods, repeat);
+                        }
+                        event_handler.key_down_event(key, mods, repeat);
+                        return;
+                    }
+                }
                 let mut keysym: KeySym = 0;
                 (self.libx11.XLookupString)(
                     &mut event.xkey,
@@ -144,9 +187,15 @@ impl X11Display {
                 event_handler.mouse_leave_event();
             }
             9 => {
+                if let Some(input) = self.xim.as_mut() {
+                    input.focus(true);
+                }
                 event_handler.window_restored_event();
             }
             10 => {
+                if let Some(input) = self.xim.as_mut() {
+                    input.focus(false);
+                }
                 event_handler.window_minimized_event();
             }
             22 => {
@@ -429,9 +478,15 @@ impl X11Display {
                 ShowKeyboard(..) => {
                     eprintln!("Not implemented for X11")
                 }
-                SetImeArea { .. } => {}
-                SetImePosition { .. } => {
-                    // IME position control not implemented for X11 yet
+                SetImeArea { x, y, w, h } => {
+                    if let Some(input) = self.xim.as_mut() {
+                        input.set_area(x, y, w, h);
+                    }
+                }
+                SetImePosition { x, y } => {
+                    if let Some(input) = self.xim.as_mut() {
+                        input.set_area(x, y, 0, 0);
+                    }
                 }
                 SetImeEnabled(..) => {
                     // IME enable/disable not implemented for X11 yet
@@ -460,6 +515,7 @@ where
         display
             .libx11
             .create_window(display.root, display.display, visual, depth, conf);
+    display.xim = xim::XInput::open(display.display, display.window);
 
     let (glx_context, glx_window) = glx.create_context(display.display, display.window);
     glx.swap_interval(
@@ -554,6 +610,7 @@ where
         display
             .libx11
             .create_window(display.root, display.display, std::ptr::null_mut(), 0, conf);
+    display.xim = xim::XInput::open(display.display, display.window);
 
     let (context, config, egl_display) = egl::create_egl_context(
         &mut egl_lib,
@@ -692,6 +749,7 @@ where
             drag_n_drop: Default::default(),
             cursor_icon: CursorIcon::Default,
             cursor_visible: true,
+            xim: None,
         };
 
         display

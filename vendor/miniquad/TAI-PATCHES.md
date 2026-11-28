@@ -34,3 +34,16 @@ need changes miniquad doesn't have.
      surrogate pair split over two calls; `firstRectForCharacterRange`
      answers with the `set_ime_area` cell; `doCommandBySelector`
      swallows commands so AppKit doesn't beep.
+7. X11 input method (ADR 0015 part 4), `src/native/linux_x11/xim.rs` and
+   `src/native/linux_x11.rs`, set up as winit 0.30 does: `LC_CTYPE` from
+   the environment (restored if Xlib can't use it), `XOpenIM` with the
+   user's input method or Xlib's own (`@im=none`, which still composes
+   dead keys and the Compose key), and an input context with on-the-spot
+   preedit callbacks when the method offers them, else `PreeditNothing`.
+   Every event goes through `XFilterEvent` first, as Xlib requires; a
+   key press with keycode 0 carries a commit (`ime_commit_event`); other
+   presses type `Xutf8LookupString`'s text, or the keysym's character as
+   before when that text is a control character; FocusIn/FocusOut set
+   the context's focus; `set_ime_area` sets the spot (the cell's
+   bottom-left), only when it moves. The variadic Xlib calls are looked
+   up with `dlsym`.

@@ -11,9 +11,11 @@
 //! map probe lengths without tombstones (#13294)"). Like Ghostty it builds
 //! `LANG` from the macOS system locale when none is set, and validates
 //! every candidate, because a value such as `en_CH.UTF-8` can name a
-//! locale macOS doesn't have. Unlike Ghostty it never calls `setlocale`
-//! on tai itself: it checks candidates with `newlocale` and changes only
-//! the child's environment.
+//! locale macOS doesn't have. Unlike Ghostty it doesn't call `setlocale`
+//! for this: it checks candidates with `newlocale` and changes only the
+//! child's environment. (On X11 the vendored miniquad sets tai's own
+//! `LC_CTYPE` from the environment for its input method, as winit does
+//! for tai-gui: XIM can't commit without it. ADR 0015.)
 //!
 //! Windows needs none of this (ConPTY always delivers UTF-8), but the
 //! decision logic and its tests are built there too.
